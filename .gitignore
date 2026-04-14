@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Training artifacts
+checkpoints/
+logs/
+exports/
+wandb/
+
+# Data (large, downloaded separately)
+data/raw/
+data/processed/
+
+# ONNX / TensorRT
+*.onnx
+*.engine
+*.trt
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OMC internal state
+.omc/
+
+# Secrets
+.env
+*.pem
+*.key
