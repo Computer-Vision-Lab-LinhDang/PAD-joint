@@ -1,5 +1,5 @@
 """
-identity_head.py — MRL Identity Head (v2: Stage 3+4 Input, 7x7 RPE)
+identity_head.py — MRL Identity Head (v3: 14x14 token grid, 1 decoder block)
 
 Input: {
     'stage3_feat': (B, 160, 14, 14),
@@ -15,6 +15,24 @@ Output: {
     },
 }
 
+v3 rationale:
+    v2 ran AdaptiveAvgPool2d(7) on stage3 before fusion so it could be
+    concatenated with the native 7x7 stage4 grid, yielding only 49 tokens.
+    Two problems:
+
+      1. Pooling 14x14 -> 7x7 averages 2x2 windows of stage3. Fingerprint
+         minutiae (ridge endings, bifurcations) occupy a handful of pixels
+         at this resolution; averaging them away removes the very signal
+         the identity head needs to separate close-looking prints.
+      2. With only 49 tokens, a single attention layer already gives every
+         token a global receptive field. Stacking 3 decoder blocks adds
+         redundant depth and inflates gradient norms (a known contributor
+         to the ArcFace gradient explosion observed in Phase 2/3).
+
+    v3 upsamples stage4 (7x7 -> 14x14) instead, keeps 196 tokens at the
+    stage3 resolution, and runs a single StructuralAttentionBlock over
+    the 14x14 grid.
+
 ArcFace classifiers are NOT in this head — they live in ArcFaceLoss.
 This avoids weight duplication and simplifies ONNX export.
 """
@@ -27,17 +45,17 @@ from typing import Dict, Optional
 
 class RelativePositionEncoding(nn.Module):
     """
-    Learned RPE for 7x7 spatial grid.
+    Learned RPE for a square spatial grid.
 
-    Table: (num_heads, 13, 13) indexed by (dx+6, dy+6)
-    where dx, dy in [-6, +6].
+    Table: (num_heads, 2G-1, 2G-1) indexed by (dy+G-1, dx+G-1)
+    where dx, dy in [-(G-1), +(G-1)].
     """
 
-    def __init__(self, grid_size: int = 7, num_heads: int = 8):
+    def __init__(self, grid_size: int = 14, num_heads: int = 8):
         super().__init__()
         self.grid_size = grid_size
         self.num_heads = num_heads
-        table_size = 2 * grid_size - 1  # 13
+        table_size = 2 * grid_size - 1
         self.rpe_table = nn.Parameter(torch.zeros(num_heads, table_size, table_size))
         nn.init.trunc_normal_(self.rpe_table, std=0.02)
 
@@ -46,30 +64,30 @@ class RelativePositionEncoding(nn.Module):
         grid_y, grid_x = torch.meshgrid(coords, coords, indexing='ij')
         self.register_buffer(
             'token_coords',
-            torch.stack([grid_y.flatten(), grid_x.flatten()], dim=1),  # (49, 2)
+            torch.stack([grid_y.flatten(), grid_x.flatten()], dim=1),  # (G*G, 2)
         )
 
     def get_bias(self) -> torch.Tensor:
         """
         Returns:
-            bias: (num_heads, 49, 49) — RPE bias for all token pairs
+            bias: (num_heads, G*G, G*G) — RPE bias for all token pairs
         """
-        coords = self.token_coords  # (49, 2)
-        delta = coords.unsqueeze(0) - coords.unsqueeze(1)  # (49, 49, 2)
-        dy = delta[..., 0] + self.grid_size - 1  # shift to [0, 12]
+        coords = self.token_coords                              # (G*G, 2)
+        delta = coords.unsqueeze(0) - coords.unsqueeze(1)       # (G*G, G*G, 2)
+        dy = delta[..., 0] + self.grid_size - 1                 # shift to [0, 2G-2]
         dx = delta[..., 1] + self.grid_size - 1
-        return self.rpe_table[:, dy, dx]  # (num_heads, 49, 49)
+        return self.rpe_table[:, dy, dx]                        # (num_heads, G*G, G*G)
 
 
 class StructuralAttentionBlock(nn.Module):
     """
-    Multi-head self-attention with RPE on 7x7 token grid.
+    Multi-head self-attention with RPE on a square token grid.
 
     Single layer: Pre-LN attention + FFN with residual connections.
     8 heads, head_dim = 256/8 = 32.
     """
 
-    def __init__(self, embed_dim: int = 256, num_heads: int = 8, grid_size: int = 7):
+    def __init__(self, embed_dim: int = 256, num_heads: int = 8, grid_size: int = 14):
         super().__init__()
         assert embed_dim % num_heads == 0
         self.num_heads = num_heads
@@ -95,9 +113,9 @@ class StructuralAttentionBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: (B, 49, 256)
+            x: (B, N, C) — N = G*G spatial tokens
         Returns:
-            x: (B, 49, 256)
+            x: (B, N, C)
         """
         B, N, C = x.shape
 
@@ -124,7 +142,7 @@ class AttentivePooling(nn.Module):
     """
     Multi-query attentive pooling with M=4 learned query seeds.
 
-    4 query vectors each attend over all 49 tokens -> (B, 4, 256)
+    4 query vectors each attend over all N tokens -> (B, 4, 256)
     -> flatten -> Linear(1024, 256) -> (B, 256)
     """
 
@@ -140,7 +158,7 @@ class AttentivePooling(nn.Module):
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            tokens: (B, N, C) — N=49 spatial tokens
+            tokens: (B, N, C) — N spatial tokens
         Returns:
             pooled: (B, C) — single vector
         """
@@ -156,14 +174,15 @@ class AttentivePooling(nn.Module):
 
 class IdentityHead(nn.Module):
     """
-    Structural Attention on 49 tokens (7x7) + MRL embedding.
+    Structural Attention on 196 tokens (14x14) + MRL embedding.
 
-    Architecture:
-        stage3_feat (B,160,14,14) -> AdaptiveAvgPool(7,7) -> reshape -> (B,49,160)
-        stage4_feat (B,320,7,7) -> reshape -> (B,49,320)
-        -> concat -> (B, 49, 480)
-        -> Linear(480, 256) -> (B, 49, 256)
-        -> StructuralAttentionBlock (8 heads, RPE 7x7)
+    Architecture (v3):
+        stage3_feat (B,160,14,14) -> reshape -> (B,196,160)    [resolution preserved]
+        stage4_feat (B,320,7,7)   -> bilinear upsample 14x14
+                                  -> reshape -> (B,196,320)
+        -> concat -> (B, 196, 480)
+        -> Linear(480, 256) -> (B, 196, 256)
+        -> StructuralAttentionBlock (8 heads, RPE 14x14) x 1
         -> AttentivePooling (4 query seeds) -> (B, 256)
         -> LayerNorm -> L2Norm -> identity_embedding (B, 256)
         -> MRL: slice at {64, 128, 256}, re-normalize each
@@ -174,10 +193,11 @@ class IdentityHead(nn.Module):
     Args:
         embed_dim: identity embedding dimension (256)
         num_heads: structural attention heads (8)
-        grid_size: spatial grid size for RPE (7)
+        grid_size: spatial grid size for RPE (14 — matches stage3)
         num_queries: attentive pooling query seeds (4)
         stage3_dim: stage 3 feature dimension (160)
         stage4_dim: stage 4 feature dimension (320)
+        num_decoder_blocks: number of structural attention blocks (1)
     """
 
     MRL_DIMS = [64, 128, 256]
@@ -186,27 +206,24 @@ class IdentityHead(nn.Module):
         self,
         embed_dim: int = 256,
         num_heads: int = 8,
-        grid_size: int = 7,
+        grid_size: int = 14,
         num_queries: int = 4,
         stage3_dim: int = 160,
         stage4_dim: int = 320,
-        num_decoder_blocks: int = 3,
+        num_decoder_blocks: int = 1,
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.grid_size = grid_size
 
-        # Spatial pooling for stage3 (14x14 -> 7x7)
-        self.pool_s3 = nn.AdaptiveAvgPool2d(grid_size)
-
         # Project concatenated features to embed_dim
         concat_dim = stage3_dim + stage4_dim  # 480
         self.input_proj = nn.Linear(concat_dim, embed_dim)
 
-        # Stack of structural attention blocks with shared RPE depth.
-        # Deeper decoder (3 blocks) gives the head enough capacity to learn
-        # discriminative identity representations on par with face-recognition
-        # baselines (ArcFace/AdaFace use ≥2 FC + conv decoders).
+        # A single structural attention block is enough: with 14x14 = 196
+        # tokens, one layer already gives every position a global receptive
+        # field. Extra depth was found to inflate gradient norms (ArcFace
+        # explosion in Phase 2/3) without adding discriminative capacity.
         self.struct_attn = nn.ModuleList([
             StructuralAttentionBlock(
                 embed_dim=embed_dim,
@@ -244,24 +261,26 @@ class IdentityHead(nn.Module):
         s3 = inputs['stage3_feat']  # (B, 160, 14, 14)
         s4 = inputs['stage4_feat']  # (B, 320, 7, 7)
         B = s3.shape[0]
-        G = self.grid_size  # 7
+        G = self.grid_size  # 14
 
-        # Pool stage3 to 7x7, reshape to token sequence
-        s3_pooled = self.pool_s3(s3)                              # (B, 160, 7, 7)
-        s3_tokens = s3_pooled.flatten(2).transpose(1, 2)          # (B, 49, 160)
+        # Upsample stage4 to stage3's resolution so fine-grained minutiae
+        # in stage3 are preserved (no 14x14 -> 7x7 averaging).
+        s4_up = F.interpolate(
+            s4, size=(G, G), mode='bilinear', align_corners=False,
+        )                                                          # (B, 320, 14, 14)
 
-        # Stage4 is already 7x7
-        s4_tokens = s4.flatten(2).transpose(1, 2)                 # (B, 49, 320)
+        s3_tokens = s3.flatten(2).transpose(1, 2)                  # (B, 196, 160)
+        s4_tokens = s4_up.flatten(2).transpose(1, 2)               # (B, 196, 320)
 
         # Concat features per spatial position
-        tokens = torch.cat([s3_tokens, s4_tokens], dim=-1)        # (B, 49, 480)
+        tokens = torch.cat([s3_tokens, s4_tokens], dim=-1)         # (B, 196, 480)
 
         # Project to embed_dim
-        tokens = self.input_proj(tokens)                          # (B, 49, 256)
+        tokens = self.input_proj(tokens)                           # (B, 196, 256)
 
-        # Structural attention with RPE — stacked decoder blocks
+        # Structural attention with RPE — single decoder block suffices
         for block in self.struct_attn:
-            tokens = block(tokens)                                # (B, 49, 256)
+            tokens = block(tokens)                                 # (B, 196, 256)
 
         # Attentive pooling -> single vector
         pooled = self.attn_pool(tokens)                           # (B, 256)

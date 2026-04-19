@@ -1,5 +1,5 @@
 """
-pad_head.py — PAD Branch Head (v2: Multi-Scale TinyViT Input)
+pad_head.py — PAD Branch Head (v3: Depthwise-Separable Conv + GAP)
 
 Input: {
     'stage1_feat':       (B, 64, 56, 56),
@@ -15,9 +15,22 @@ Output: {
     'pad_features':  (B, 128),   # Pre-projection features for SupCon
 }
 
-Key novelty: PAD branch exploits both multi-scale features AND MoE routing
-statistics. Live images show diverse routing (rich micro-texture), spoofs
-show uniform routing (synthetic/print texture).
+v3 rationale:
+    The previous (v2) feature path used AdaptiveAvgPool2d(7) + Flatten +
+    Linear(3136/6272 -> 256) per stage. Two failure modes:
+
+      1. Param explosion (~2.4M in proj_s1 + proj_s2 alone) driving severe
+         overfit — BCE tracks ~0.03 on train but EER stays ~50% on held-out
+         sensors.
+      2. The 8x8 spatial averaging destroys the very micro-texture that
+         separates live vs. spoof (print noise, pores, silicon grain).
+
+    v3 replaces both Linear projections with depthwise-separable conv
+    blocks (DW3x3 + PW1x1 + DW3x3) that KEEP full spatial resolution
+    (56x56 / 28x28) and rely on Global Average Pooling at the very END
+    to produce the per-stage 128-D vector. This preserves translation
+    invariance and high-frequency detail while cutting the feature-path
+    param budget by ~40x.
 """
 
 import torch
@@ -26,15 +39,59 @@ import torch.nn.functional as F
 from typing import Dict
 
 
+class PADConvBlock(nn.Module):
+    """
+    Depthwise-separable conv block preserving spatial resolution.
+
+    Flow: DW3x3 -> GN -> GELU -> PW1x1 -> GN -> GELU -> DW3x3 -> GN -> GELU
+
+    Uses GroupNorm instead of BatchNorm: PAD data spans multiple sensors
+    and datasets, so BN running stats drift between train and test
+    distributions. GN is batch-size and distribution independent.
+    """
+
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        gn_in = self._pick_groups(in_ch)
+        gn_out = self._pick_groups(out_ch)
+
+        self.block = nn.Sequential(
+            # DW 3x3 on input channels
+            nn.Conv2d(in_ch, in_ch, kernel_size=3, padding=1,
+                      groups=in_ch, bias=False),
+            nn.GroupNorm(gn_in, in_ch),
+            nn.GELU(),
+            # PW 1x1 to change channel count
+            nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False),
+            nn.GroupNorm(gn_out, out_ch),
+            nn.GELU(),
+            # DW 3x3 to refine on new channel basis
+            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1,
+                      groups=out_ch, bias=False),
+            nn.GroupNorm(gn_out, out_ch),
+            nn.GELU(),
+        )
+
+    @staticmethod
+    def _pick_groups(channels: int) -> int:
+        for g in (8, 4, 2, 1):
+            if channels % g == 0:
+                return g
+        return 1
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
 class PADHead(nn.Module):
     """
     Multi-scale feature aggregation + MoE routing stats fusion.
 
-    Architecture:
-        -- Feature path --
-        stage1_feat (B,64,56,56)  -> AdaptiveAvgPool(7,7) -> flatten -> Linear(64*49, 256)
-        stage2_feat (B,128,28,28) -> AdaptiveAvgPool(7,7) -> flatten -> Linear(128*49, 256)
-        -> concat -> (B, 512)
+    Architecture (v3):
+        -- Feature path (spatial-preserving) --
+        stage1_feat (B,64,56,56)  -> PADConvBlock(64->128)  -> GAP -> (B,128)
+        stage2_feat (B,128,28,28) -> PADConvBlock(128->128) -> GAP -> (B,128)
+        -> concat -> (B, 256)
 
         -- Routing path (8 features per MoE layer x 3 layers = 24) --
         Per MoE layer:
@@ -43,20 +100,18 @@ class PADHead(nn.Module):
         -> concat all 3 layers -> (B, 24)
 
         -- Fusion --
-        concat(feature_512, routing_24) -> (B, 536)
-        -> LayerNorm -> Linear(536, 256) -> GELU -> Dropout
-        -> Linear(256, 128) -> pad_features
+        concat(feature_256, routing_24) -> (B, 280)
+        -> LayerNorm -> MLP -> pad_features (B, 128)
 
         -- Two PARALLEL output branches --
-        pad_features -> Linear(128, 32) -> L2Norm -> pad_embedding (SupCon + L_orth)
-        pad_features -> Linear(128, 1) -> pad_logit (BCE)
+        pad_features -> Linear(128, 32) -> L2Norm -> pad_embedding
+        pad_features -> Linear(128, 1) -> pad_logit
     """
 
-    POOL_SIZE = 7
-    FEAT_PROJ_DIM = 256
-    ROUTE_DIM_PER_LAYER = 8  # 4 expert mean + 4 entropy stats
+    FEAT_CH_PER_STAGE = 128
+    ROUTE_DIM_PER_LAYER = 8   # 4 expert mean + 4 entropy stats
     NUM_MOE_LAYERS = 3
-    ROUTE_DIM = ROUTE_DIM_PER_LAYER * NUM_MOE_LAYERS  # 24
+    ROUTE_DIM = ROUTE_DIM_PER_LAYER * NUM_MOE_LAYERS   # 24
     PAD_FEATURES_DIM = 128
     PAD_EMBEDDING_DIM = 32
 
@@ -68,20 +123,15 @@ class PADHead(nn.Module):
     ):
         super().__init__()
 
-        # Feature path: spatial pooling + projection per stage
-        self.pool = nn.AdaptiveAvgPool2d(self.POOL_SIZE)
+        # Feature path: depthwise-separable blocks keep spatial layout
+        # intact; GAP is deferred to the very end of each stage.
+        self.block_s1 = PADConvBlock(stage1_dim, self.FEAT_CH_PER_STAGE)
+        self.block_s2 = PADConvBlock(stage2_dim, self.FEAT_CH_PER_STAGE)
+        self.gap = nn.AdaptiveAvgPool2d(1)
 
-        flat1 = stage1_dim * self.POOL_SIZE * self.POOL_SIZE  # 64*49 = 3136
-        flat2 = stage2_dim * self.POOL_SIZE * self.POOL_SIZE  # 128*49 = 6272
-        self.proj_s1 = nn.Linear(flat1, self.FEAT_PROJ_DIM)
-        self.proj_s2 = nn.Linear(flat2, self.FEAT_PROJ_DIM)
+        feat_dim = self.FEAT_CH_PER_STAGE * 2              # 256
+        fusion_in = feat_dim + self.ROUTE_DIM              # 280
 
-        feat_dim = self.FEAT_PROJ_DIM * 2  # 512
-        fusion_in = feat_dim + self.ROUTE_DIM  # 536
-
-        # Fusion MLP: (B, 536) -> (B, 128). Deeper than the original 2-layer
-        # projection so the head can learn richer interactions between the
-        # multi-scale features and the MoE routing statistics.
         self.fusion_mlp = nn.Sequential(
             nn.LayerNorm(fusion_in),
             nn.Linear(fusion_in, 512),
@@ -143,12 +193,12 @@ class PADHead(nn.Module):
         s1 = inputs['stage1_feat']    # (B, 64, 56, 56)
         s2 = inputs['stage2_feat']    # (B, 128, 28, 28)
 
-        # -- Feature path --
-        f1 = self.pool(s1).flatten(1)  # (B, 64*49)
-        f2 = self.pool(s2).flatten(1)  # (B, 128*49)
-        f1 = self.proj_s1(f1)          # (B, 256)
-        f2 = self.proj_s2(f2)          # (B, 256)
-        feat_combined = torch.cat([f1, f2], dim=-1)  # (B, 512)
+        # -- Feature path: conv blocks at full resolution, GAP at the end --
+        f1 = self.block_s1(s1)                 # (B, 128, 56, 56)
+        f2 = self.block_s2(s2)                 # (B, 128, 28, 28)
+        f1 = self.gap(f1).flatten(1)           # (B, 128)
+        f2 = self.gap(f2).flatten(1)           # (B, 128)
+        feat_combined = torch.cat([f1, f2], dim=-1)  # (B, 256)
 
         # -- Routing path --
         r_s2 = self._extract_routing_features(inputs['routing_stats_s2'])    # (B, 8)
@@ -157,7 +207,7 @@ class PADHead(nn.Module):
         route_combined = torch.cat([r_s2, r_s3a, r_s3b], dim=-1)  # (B, 24)
 
         # -- Fusion --
-        all_features = torch.cat([feat_combined, route_combined], dim=-1)  # (B, 536)
+        all_features = torch.cat([feat_combined, route_combined], dim=-1)  # (B, 280)
         pad_features = self.fusion_mlp(all_features)  # (B, 128)
 
         # -- Parallel output branches --
