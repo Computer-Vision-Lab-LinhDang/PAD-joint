@@ -1,14 +1,24 @@
 """
 moe_ffn.py — Frequency-Gated Mixture-of-Experts FFN Block
 
-Input:  tokens (B, 196, 192) — attention output
-Output: tokens (B, 196, 192) — same shape (residual added outside in ViT block)
-Side:   routing_stats dict {
-            'expert_weights': (B, 196, 4),
-            'token_entropy':  (B, 196),
-            'balance_loss':   scalar,
-        }
+Drop-in replacement for standard FFN in TinyViT blocks.
+Adapts to variable embed_dim and spatial resolution per stage.
+
+Config:
+    num_experts: 4
+    top_k:       2 (sparse routing)
+    temperature: controlled by PhaseScheduler (2.0 → 1.0 → 0.5)
+
+Balance loss uses Switch Transformer's f·P formulation for proper
+gradient flow through soft routing probabilities.
+
+I/O
+---
+    Input:  tokens (B, N, D), spatial_h, spatial_w
+    Output: (output (B, N, D), routing_stats dict)
 """
+
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
@@ -19,43 +29,28 @@ from .frequency_gate import FrequencyGate
 
 class FreqGatedMoEFFN(nn.Module):
     """
-    Frequency-Gated MoE-FFN — replaces standard FFN at ViT layers {3, 7, 10}.
-
-    Config:
-        num_experts:  4
-        top_k:        2   (sparse routing — top-2 of 4 experts active per token)
-        embed_dim:    192
-        ffn_hidden:   768 (mlp_ratio = 4.0)
-
-    Parameter budget (per MoE layer):
-        Standard FFN: 192×768×2 ≈ 295K params
-        MoE-FFN:      4 × 295K + gate Linear(3→4) ≈ 1.18M params
-
-    FLOPs per token: ~2× standard FFN (top-2 of 4 experts active)
+    Frequency-Gated MoE-FFN with temperature-controlled routing.
 
     Routing pipeline:
-        1. gate_input = FrequencyGate(tokens)               (B, 196, 3)
-        2. gate_logits = Linear(3→4)(gate_input)            (B, 196, 4)
-        3. expert_weights = Softmax(gate_logits)            (B, 196, 4)
-        4. top2_indices, top2_weights = TopK(expert_weights, k=2)
-        5. output = Σ_{k∈top2} weight_k × Expert_k(tokens) (B, 196, 192)
-        6. token_entropy = -Σ p_k · log(p_k + ε)          (B, 196)
-        7. balance_loss = CV²(expert_load)                  scalar
+        1. gate_input = FrequencyGate(tokens, H, W)    → (B, N, 3)
+        2. gate_logits = Linear(3, E)(gate_input)       → (B, N, E)
+        3. expert_weights = softmax(logits / τ)         → (B, N, E)
+        4. top2 selection + renormalization
+        5. output = Σ weight_k × Expert_k(tokens)
+        6. balance_loss = E · Σ(f_e · P_e)  (Switch Transformer)
 
-    Expert load: fraction of tokens routed to each expert (target ≈ 25%).
-    L_balance penalizes coefficient of variation → uniform expert utilization.
-
-    I/O:
-        Input:  tokens (B, 196, 192)
-        Output: (output_tokens, routing_stats)
-            output_tokens  — (B, 196, 192)
-            routing_stats  — dict with 'expert_weights', 'token_entropy', 'balance_loss'
+    Args:
+        embed_dim:   token embedding dimension (128 for Stage 2, 160 for Stage 3)
+        ffn_hidden:  FFN hidden dimension (embed_dim × mlp_ratio)
+        num_experts: number of experts (default 4)
+        top_k:       experts active per token (default 2)
+        drop:        dropout rate
     """
 
     def __init__(
         self,
-        embed_dim: int = 192,
-        ffn_hidden: int = 768,
+        embed_dim: int,
+        ffn_hidden: int,
         num_experts: int = 4,
         top_k: int = 2,
         drop: float = 0.0,
@@ -65,14 +60,21 @@ class FreqGatedMoEFFN(nn.Module):
         self.ffn_hidden = ffn_hidden
         self.num_experts = num_experts
         self.top_k = top_k
+        self.temperature = 1.0  # Controlled by PhaseScheduler
 
-        # Frequency-based gating network
-        self.freq_gate = FrequencyGate(embed_dim=embed_dim)
+        # Frequency-based gating — 2-layer router so the gate can learn a
+        # richer mapping from the 3-band energy features to E experts.
+        self.freq_gate = FrequencyGate()
+        self.gate_proj = nn.Sequential(
+            nn.Linear(3, 16),
+            nn.GELU(),
+            nn.Linear(16, num_experts, bias=True),
+        )
+        # Noisy top-k exploration (Shazeer et al., 2017) — prevents early
+        # monopoly by one or two experts. Disabled in eval.
+        self.noisy_gate_std = 0.3
 
-        # Gate projection: band energies (3) → expert logits (num_experts)
-        self.gate_proj = nn.Linear(3, num_experts, bias=False)
-
-        # Expert FFNs: Linear(D, 4D) -> GELU -> Linear(4D, D)
+        # Expert FFNs
         self.experts = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(embed_dim, ffn_hidden),
@@ -86,90 +88,95 @@ class FreqGatedMoEFFN(nn.Module):
 
     def _balance_loss(self, expert_weights: torch.Tensor) -> torch.Tensor:
         """
-        Compute load-balancing loss = CV²(expert_load).
+        Switch Transformer balance loss: L = E · Σ(f_e · P_e).
 
-        expert_load[e] = fraction of (B*N) tokens where expert e is in top-k.
+        f_e = fraction of tokens dispatched to expert e (hard, non-differentiable)
+        P_e = mean routing probability for expert e (soft, differentiable)
 
-        Args:
-            expert_weights: (B, N, E) — full softmax distribution over experts
-
-        Returns:
-            scalar balance loss
+        Gradient flows through P_e, enabling the gate to learn balanced routing.
+        Minimized when each expert handles ~25% of tokens.
         """
         B, N, E = expert_weights.shape
-        # Top-k indicator: (B, N, E) binary — 1 if expert is selected
-        _, top_indices = expert_weights.topk(self.top_k, dim=-1)  # (B, N, top_k)
+
+        # f: hard dispatch fraction per expert
+        _, top_indices = expert_weights.topk(self.top_k, dim=-1)
         indicator = torch.zeros_like(expert_weights)
-        indicator.scatter_(-1, top_indices, 1.0)  # (B, N, E)
+        indicator.scatter_(-1, top_indices, 1.0)
+        f = indicator.float().mean(dim=(0, 1))  # (E,)
 
-        # Expert load = mean over all tokens
-        expert_load = indicator.mean(dim=(0, 1))  # (E,)
+        # P: soft routing probability per expert (differentiable)
+        P = expert_weights.mean(dim=(0, 1))  # (E,)
 
-        # Coefficient of variation squared: Var / Mean²
-        mean_load = expert_load.mean()
-        var_load = expert_load.var()
-        cv2 = var_load / (mean_load ** 2 + 1e-8)
-        return cv2
+        return E * (f * P).sum()
 
-    def forward(self, tokens: torch.Tensor):
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        spatial_h: int,
+        spatial_w: int,
+    ) -> tuple[torch.Tensor, dict]:
         """
         Args:
-            tokens: (B, 196, 192) — input token sequence (after self-attention)
+            tokens:    (B, N, D) — input tokens
+            spatial_h: spatial grid height
+            spatial_w: spatial grid width
 
         Returns:
-            output:        (B, 196, 192) — MoE FFN output (residual added in ViT block)
-            routing_stats: dict {
-                'expert_weights': (B, 196, 4),
-                'token_entropy':  (B, 196),
-                'balance_loss':   scalar tensor,
-            }
+            output:        (B, N, D) — MoE FFN output
+            routing_stats: dict with expert_weights, token_entropy, balance_loss
         """
         B, N, D = tokens.shape
 
-        # --- Gating ---
-        gate_input = self.freq_gate(tokens)              # (B, 196, 3)
-        gate_logits = self.gate_proj(gate_input)         # (B, 196, 4)
-        expert_weights = F.softmax(gate_logits, dim=-1)  # (B, 196, 4)
+        # Gating
+        gate_input = self.freq_gate(tokens, spatial_h, spatial_w)  # (B, N, 3)
+        gate_logits = self.gate_proj(gate_input)  # (B, N, E)
 
-        # Top-k selection
+        # Noisy top-k: add Gaussian noise in training for exploration.
+        if self.training and self.noisy_gate_std > 0.0:
+            gate_logits = gate_logits + torch.randn_like(gate_logits) * self.noisy_gate_std
+
+        # Promote to fp32 for softmax/renorm stability under AMP fp16.
+        expert_weights = F.softmax(
+            gate_logits.float() / self.temperature, dim=-1,
+        ).to(gate_logits.dtype)
+
+        # Top-k selection + renormalization. Use a larger epsilon to stay
+        # well above fp16's smallest positive (~6e-8).
         top_weights, top_indices = expert_weights.topk(self.top_k, dim=-1)
-        # Renormalize top-k weights so they sum to 1
-        top_weights = top_weights / (top_weights.sum(dim=-1, keepdim=True) + 1e-8)
+        top_weights = top_weights / (top_weights.sum(dim=-1, keepdim=True) + 1e-4)
 
-        # --- Expert computation (token-by-token sparse dispatch) ---
-        # Flatten tokens for easier indexing
-        tokens_flat = tokens.reshape(B * N, D)         # (B*N, D)
-        top_indices_flat = top_indices.reshape(B * N, self.top_k)  # (B*N, top_k)
-        top_weights_flat = top_weights.reshape(B * N, self.top_k)  # (B*N, top_k)
+        # Expert computation (sparse dispatch) — writes go through
+        # index_add_ rather than in-place slice add to stay AMP-safe.
+        tokens_flat = tokens.reshape(B * N, D)
+        top_indices_flat = top_indices.reshape(B * N, self.top_k)
+        top_weights_flat = top_weights.reshape(B * N, self.top_k)
 
-        output_flat = torch.zeros_like(tokens_flat)  # (B*N, D)
+        output_flat = torch.zeros_like(tokens_flat)
 
         for k_idx in range(self.top_k):
-            expert_idx = top_indices_flat[:, k_idx]   # (B*N,)
-            weight_k = top_weights_flat[:, k_idx]     # (B*N,)
+            expert_idx = top_indices_flat[:, k_idx]
+            weight_k = top_weights_flat[:, k_idx]
 
             for e_idx in range(self.num_experts):
-                # Mask tokens routed to expert e
-                mask = (expert_idx == e_idx)  # (B*N,) bool
+                mask = expert_idx == e_idx
                 if not mask.any():
                     continue
-                tokens_e = tokens_flat[mask]                     # (m, D)
-                expert_out = self.experts[e_idx](tokens_e)       # (m, D)
-                weight_e = weight_k[mask].unsqueeze(-1)          # (m, 1)
-                output_flat[mask] += weight_e * expert_out
+                idx = mask.nonzero(as_tuple=False).squeeze(-1)
+                expert_out = self.experts[e_idx](tokens_flat.index_select(0, idx))
+                weighted = weight_k.index_select(0, idx).unsqueeze(-1) * expert_out
+                output_flat = output_flat.index_add(0, idx, weighted)
 
-        output = output_flat.reshape(B, N, D)  # (B, 196, 192)
+        output = output_flat.reshape(B, N, D)
 
-        # --- Routing statistics ---
-        # Token entropy: H(p) = -Σ p_k · log(p_k)
-        token_entropy = -(expert_weights * (expert_weights + 1e-8).log()).sum(dim=-1)  # (B, 196)
-
-        # Balance loss
+        # Routing statistics
+        token_entropy = -(
+            expert_weights * (expert_weights + 1e-8).log()
+        ).sum(dim=-1)  # (B, N)
         balance_loss = self._balance_loss(expert_weights)
 
         routing_stats = {
-            "expert_weights": expert_weights,  # (B, 196, 4)
-            "token_entropy": token_entropy,    # (B, 196)
+            "expert_weights": expert_weights,  # (B, N, E)
+            "token_entropy": token_entropy,    # (B, N)
             "balance_loss": balance_loss,      # scalar
         }
 

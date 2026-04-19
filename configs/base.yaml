@@ -1,23 +1,23 @@
-# configs/base.yaml — OMFR Base Configuration
+# configs/base.yaml — OMFR v2 Base Configuration (TinyViT-5M)
 # All hyperparameters for OMFRModule, OMFRDataModule, Trainer, and evaluation.
-# Override individual keys in phase-specific configs.
 
 # ─────────────────────────────────────────────────────────────────
-# Model — Backbone
+# Model — Backbone (TinyViT-5M)
 # ─────────────────────────────────────────────────────────────────
 backbone:
-  img_size: 224
-  patch_size: 16
-  in_chans: 3          # input to ViT after Gabor stem
-  embed_dim: 192
-  depth: 12
-  num_heads: 3
-  mlp_ratio: 4.0
-  qkv_bias: true
-  drop_rate: 0.0
-  attn_drop_rate: 0.0
-  drop_path_rate: 0.1
-  moe_layers: [3, 7, 10]    # 1-indexed transformer layers with MoE-FFN
+  name: tiny_vit_5m_224
+  pretrained: true           # Load ImageNet-22k pretrained weights
+  in_chans: 8                # 8-channel Gabor stem input
+  # TinyViT-5M architecture (fixed, from timm):
+  #   embed_dims: [64, 128, 160, 320]
+  #   depths: [2, 2, 6, 2]
+  #   num_heads: [2, 4, 5, 10]
+  #   window_sizes: [7, 7, 14, 7]
+
+  # MoE insertion points (stage_idx, block_idx):
+  #   Stage 1 block 1: 28×28 tokens, 128-ch
+  #   Stage 2 block 2: 14×14 tokens, 160-ch
+  #   Stage 2 block 5: 14×14 tokens, 160-ch
   num_experts: 4
   top_k: 2
 
@@ -26,26 +26,28 @@ backbone:
 # ─────────────────────────────────────────────────────────────────
 gabor:
   n_orientations: 8
-  n_frequencies: 4
   kernel_size: 31
-  learnable: true
+  init_frequency: 0.12       # ~5 cycles/mm at 500 DPI
 
 # ─────────────────────────────────────────────────────────────────
 # Model — Identity Head
 # ─────────────────────────────────────────────────────────────────
 identity_head:
-  embed_dim: 256
-  num_heads: 4
-  grid_size: 14          # 14×14 token grid from 224/16
-  token_dim: 192         # ViT embed_dim
+  embed_dim: 256             # identity embedding dimension
+  num_heads: 8               # structural attention heads
+  grid_size: 7               # 7×7 token grid (49 tokens)
+  num_queries: 4             # attentive pooling query seeds
+  stage3_dim: 160            # TinyViT Stage 2 output dim
+  stage4_dim: 320            # TinyViT Stage 3 output dim
   mrl_dims: [64, 128, 256]
-  num_classes: 5000      # Number of training identities (update per dataset)
+  num_classes: 5000          # Number of training identities (auto-detected)
 
 # ─────────────────────────────────────────────────────────────────
 # Model — PAD Head
 # ─────────────────────────────────────────────────────────────────
 pad_head:
-  token_dim: 192
+  stage1_dim: 64             # TinyViT Stage 0 output dim
+  stage2_dim: 128            # TinyViT Stage 1 output dim
   dropout: 0.1
   pad_features_dim: 128
   pad_embedding_dim: 32
@@ -56,8 +58,8 @@ pad_head:
 losses:
   arcface:
     margin: 0.5
-    scale_phase1: 32.0   # gentle scale for Phase 1
-    scale_final: 64.0    # full scale reached by end of Phase 2 warmup
+    scale_phase1: 32.0       # gentle scale for Phase 1
+    scale_final: 64.0        # full scale reached by end of Phase 2 warmup
     easy_margin: false
   supcon:
     temperature: 0.07
@@ -66,78 +68,98 @@ losses:
   orthogonality:
     eps: 1.0e-8
   # Loss weights
-  alpha: 0.0             # PAD loss weight (ramped in Phase 2)
-  beta: 0.0              # Orthogonality loss weight (ramped in Phase 2)
-  gamma: 0.01            # Load-balance loss weight (fixed, always active)
+  alpha: 0.0                 # PAD loss weight (ramped in Phase 2)
+  beta: 0.0                  # Orthogonality loss weight (ramped in Phase 2)
+  gamma: 0.05                # Load-balance loss weight (up from 0.01 to combat imbalance)
+  # Hybrid identity loss — SupCon (open-set) + ArcFace (closed-set).
+  # SupCon dominates so embeddings generalize to unseen FVC identities.
+  identity_supcon_weight: 0.7
+  identity_arcface_weight: 0.3
 
 # ─────────────────────────────────────────────────────────────────
 # Optimizer
 # ─────────────────────────────────────────────────────────────────
 optimizer:
   name: AdamW
-  lr: 1.0e-4             # base learning rate
+  lr: 1.0e-4                 # base learning rate
   weight_decay: 0.05
   betas: [0.9, 0.999]
   # Differential LR multipliers per param group
   lr_multipliers:
-    gabor: 0.1           # stable Gabor filters — low LR
-    backbone_early: 1.0  # ViT layers 1-6
-    backbone_late: 1.0   # ViT layers 7-12
-    moe_experts: 2.0     # new params, need to catch up
+    gabor: 0.1               # stable Gabor filters — low LR
+    backbone_embed: 1.0      # patch embedding
+    backbone_early: 1.0      # stages 0-1
+    backbone_late: 1.0       # stages 2-3
+    moe_experts: 2.0         # new params, need to catch up
     identity_head: 1.0
     pad_head_phase1: 1.0
-    pad_head_phase2: 2.0 # higher LR in Phase 2
-    arcface: 10.0        # large, sparse gradients
+    pad_head_phase2: 2.0     # higher LR in Phase 2
+    arcface: 1.0             # reduced from 10x to prevent gradient explosion
 
 scheduler:
   name: CosineAnnealingLR
-  T_max: 60              # total training epochs
+  T_max: 60                  # total training epochs
   eta_min: 1.0e-6
 
 # ─────────────────────────────────────────────────────────────────
 # Training Phases
 # ─────────────────────────────────────────────────────────────────
 phases:
-  phase1_epochs: 20      # Identity Foundation: epochs 0-19
-  phase2_epochs: 20      # PAD Integration: epochs 20-39
-  phase3_epochs: 20      # Joint Refinement: epochs 40-59
+  phase1_epochs: 20          # Identity Foundation: epochs 0-19
+  phase2_epochs: 20          # PAD Integration: epochs 20-39
+  phase3_epochs: 20          # Joint Refinement: epochs 40-59
   total_epochs: 60
 
+  # Phase 1 ArcFace warmup (prevents gradient explosion with many classes)
+  phase1_warmup_delay: 5     # hold s=1, m=0 for first N epochs while LR warms up
+  phase1_warmup_epochs: 5    # then ramp scale 1→32, margin 0→0.5 over next 5 epochs
+  arcface_scale_init: 1.0    # gentle start
+  arcface_margin_init: 0.0   # no angular margin initially
+  arcface_margin_target: 0.5 # full margin by end of Phase 1 warmup
+
   # Phase 2 warmup for alpha/beta/arcface_scale ramps
-  warmup_epochs: 5       # over first 5 epochs of Phase 2
+  warmup_epochs: 5           # over first 5 epochs of Phase 2
   alpha_target: 1.0
   beta_target: 0.1
   arcface_scale_start: 32.0
   arcface_scale_end: 64.0
 
+  # MoE temperature schedule
+  moe_temp_phase1: 2.0       # soft routing (exploration)
+  moe_temp_phase2_end: 1.0   # gradual sharpening
+  moe_temp_phase3_end: 0.5   # sharp routing (specialization)
+
 # ─────────────────────────────────────────────────────────────────
 # DataModule
 # ─────────────────────────────────────────────────────────────────
 data:
-  # Dataset roots — set via environment or override in local config
-  identity_data_root: /data/fingerprint/identity
-  pad_data_root: /data/fingerprint/pad
-  joint_data_root: /data/fingerprint/joint
+  # Dataset roots
+  identity_data_root: /home/linhdang/workspace2/NIST-300-ds/combined_nist
+  pad_data_root: /home/linhdang/workspace2/PAD-joint
+  joint_data_root: ""
 
   # Supported identity datasets: fvc2004, nist_sd302, nist_sd300, nist_sd302a
-  identity_datasets: [fvc2004, nist_sd302]
+  identity_datasets: [nist_sd300]
   # Supported PAD datasets: livdet2013, livdet2015, livdet2017
-  pad_datasets: [livdet2015, livdet2017]
+  pad_datasets: [LivDet2013, LivDet2015]
   # Supported joint datasets: msu_fpad
-  joint_datasets: [msu_fpad]
+  joint_datasets: []
 
   image_size: 224
-  grayscale: true        # load as single-channel
+  grayscale: true            # load as single-channel
+  # Group NIST SD300 folders by subject (merge frgp_01..10 per subject)
+  # to reduce class count from ~10,300 → ~1,030 with ~20 samples/class.
+  group_by_subject: true
 
   # PKSampler settings (Phase 1 / Phase 2 identity loader)
-  pk_p: 32               # identities per batch
-  pk_k: 4                # samples per identity → batch_size = 128
+  pk_p: 32                   # identities per batch
+  pk_k: 4                    # samples per identity → batch_size = 128
   # BalancedPADSampler (Phase 2 PAD loader)
-  pad_batch_size: 128    # 50/50 live/spoof
+  pad_batch_size: 128        # 50/50 live/spoof
 
   num_workers: 8
   pin_memory: true
-  val_split: 0.1         # fraction of data held out for validation
+  val_split: 0.1             # fraction of data held out for validation
 
 # ─────────────────────────────────────────────────────────────────
 # Trainer
@@ -166,17 +188,21 @@ checkpoint:
   save_last: true
 
 logging:
-  # TensorBoard by default; set name/version as needed
   name: omfr
   save_dir: logs/
-  version: null          # null → auto-increment
+  version: null              # null → auto-increment
+  wandb:
+    enabled: true
+    project: omfr
+    name: null                # null → auto-generated run name
+    log_model: false          # set true to upload checkpoints to wandb
 
 # ─────────────────────────────────────────────────────────────────
 # Evaluation
 # ─────────────────────────────────────────────────────────────────
 evaluation:
   pad_threshold: 0.5
-  far: 1.0e-4            # FAR target for TAR@FAR (= 0.01%)
+  far: 1.0e-4                # FAR target for TAR@FAR (= 0.01%)
   cmc_max_rank: 10
   mrl_eval_dims: [64, 128, 256]
 

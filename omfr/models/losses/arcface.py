@@ -109,6 +109,14 @@ class ArcFaceLoss(nn.Module):
         """Update the scale parameter (called by PhaseSchedulerCallback during ramp)."""
         self.s = s
 
+    def set_margin(self, margin: float) -> None:
+        """Update the margin and recompute derived constants (called during warmup)."""
+        self.margin = margin
+        self.cos_m = math.cos(margin)
+        self.sin_m = math.sin(margin)
+        self.threshold = math.cos(math.pi - margin)
+        self.mm = math.sin(math.pi - margin) * margin
+
     def extra_repr(self) -> str:
         return (
             f"embedding_dim={self.embedding_dim}, num_classes={self.num_classes}, "

@@ -8,13 +8,47 @@ Returns: {'images': (1, 224, 224), 'liveness_labels': LongTensor scalar}
 """
 
 import csv
+import os
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+import re
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
+import torchvision.transforms as T
 import torchvision.transforms.functional as TF
+
+
+def make_pad_train_transform(image_size: int = 224) -> T.Compose:
+    """
+    Strong augmentation pipeline for PAD training.
+
+    Combats cross-sensor overfit by simulating intra-class variability
+    (sensor noise, brightness/contrast drift, mild geometric jitter) so
+    the head cannot memorise per-image pixel statistics. Operates on
+    1-channel tensors already loaded by PADDataset._load_image.
+    """
+    return T.Compose([
+        T.RandomHorizontalFlip(p=0.5),
+        T.RandomVerticalFlip(p=0.3),
+        T.RandomApply(
+            [T.RandomRotation(degrees=15, fill=0.0)],
+            p=0.7,
+        ),
+        T.RandomResizedCrop(
+            image_size, scale=(0.85, 1.0), ratio=(0.9, 1.1),
+            antialias=True,
+        ),
+        T.ColorJitter(brightness=0.3, contrast=0.3),
+        T.RandomApply(
+            [T.GaussianBlur(kernel_size=5, sigma=(0.1, 1.5))],
+            p=0.3,
+        ),
+        T.RandomErasing(
+            p=0.25, scale=(0.02, 0.15), ratio=(0.3, 3.3), value=0.0,
+        ),
+    ])
 
 
 class PADDataset(Dataset):
@@ -52,10 +86,19 @@ class PADDataset(Dataset):
 
     LABEL_LIVE  = 1
     LABEL_SPOOF = 0
+    SPLIT_DIR_ALIASES = {
+        'train': ('Training', 'Train', 'train'),
+        'val': ('Validation', 'Val', 'val', 'Testing', 'Test'),
+        'test': ('Testing', 'Test', 'test', 'Val', 'val'),
+    }
+    SPLIT_FALLBACKS = {
+        'test': ('val',),
+        'val': ('test',),
+    }
 
     def __init__(
         self,
-        root: str,
+        root: Union[str, Sequence[str]],
         split: str = 'train',
         transform: Optional[Callable] = None,
         image_size: int = 224,
@@ -63,7 +106,12 @@ class PADDataset(Dataset):
         sensor: Optional[str] = None,
     ):
         super().__init__()
-        self.root = Path(root)
+        if isinstance(root, (str, Path)):
+            self.roots = [Path(root)]
+        else:
+            self.roots = [Path(item) for item in root]
+
+        self.root = self.roots[0]
         self.split = split
         self.transform = transform
         self.image_size = image_size
@@ -76,51 +124,113 @@ class PADDataset(Dataset):
     # ------------------------------------------------------------------
 
     def _load_samples(self):
-        csv_file = self.root / f'labels_{self.split}.csv'
-        if csv_file.exists():
-            self._load_from_csv(csv_file)
-        else:
-            self._load_from_directory()
+        for root in self.roots:
+            if not root.exists():
+                raise FileNotFoundError(
+                    f"PADDataset root does not exist: {root}"
+                )
 
-    def _load_from_csv(self, csv_file: Path):
+            csv_file = root / f'labels_{self.split}.csv'
+            if csv_file.exists():
+                self._load_from_csv(root, csv_file)
+            else:
+                self._load_from_directory(root)
+
+        if not self.samples:
+            roots = ", ".join(str(root) for root in self.roots)
+            raise RuntimeError(
+                f"PADDataset found no samples for split={self.split!r} under: {roots}"
+            )
+
+    def _load_from_csv(self, root: Path, csv_file: Path):
         with open(csv_file, newline='') as f:
             reader = csv.DictReader(f)
             for row in reader:
                 rel_path = row.get('relative_path') or row.get('path', '')
                 label_str = row.get('label', '0')
-                path = self.root / rel_path
+                path = root / rel_path
                 label = self.LABEL_LIVE if label_str.lower() in {'live', '1', 'alive'} else self.LABEL_SPOOF
-                if path.suffix.lower() in self.IMG_EXTS:
+                if path.is_file() and path.suffix.lower() in self.IMG_EXTS:
                     self.samples.append((path, label))
 
-    def _load_from_directory(self):
-        split_dir_name = 'Train' if self.split == 'train' else 'Test'
-        split_dir = self.root / split_dir_name
+    def _load_from_directory(self, root: Path):
+        scan_root = self._resolve_split_root(root)
 
-        if not split_dir.exists():
-            # Flat layout fallback: root/Live/, root/Fake/
-            split_dir = self.root
+        for dirpath, dirnames, filenames in os.walk(scan_root, followlinks=True):
+            dirnames[:] = [name for name in dirnames if not name.startswith('.')]
+            current_dir = Path(dirpath)
 
-        # Optionally filter by sensor subdirectory
-        search_dirs = [split_dir]
-        if self.sensor:
-            sensor_dir = split_dir / self.sensor
-            if sensor_dir.exists():
-                search_dirs = [sensor_dir]
-
-        for base_dir in search_dirs:
-            for subdir in sorted(base_dir.iterdir()):
-                if not subdir.is_dir():
+            for filename in filenames:
+                img_path = current_dir / filename
+                if img_path.suffix.lower() not in self.IMG_EXTS:
                     continue
-                if subdir.name in self.LIVE_DIRS:
-                    label = self.LABEL_LIVE
-                elif subdir.name in self.SPOOF_DIRS:
-                    label = self.LABEL_SPOOF
-                else:
+
+                label = self._infer_label(img_path, scan_root)
+                if label is None:
                     continue
-                for img_path in sorted(subdir.iterdir()):
-                    if img_path.suffix.lower() in self.IMG_EXTS:
-                        self.samples.append((img_path, label))
+
+                if self.sensor and not self._matches_sensor(img_path, scan_root):
+                    continue
+
+                self.samples.append((img_path, label))
+
+    def _resolve_split_root(self, root: Path) -> Path:
+        for split_name in self._iter_split_candidates():
+            if root.name.lower() == split_name.lower():
+                return root
+
+            candidate = root / split_name
+            if candidate.is_dir():
+                return candidate
+
+        return root
+
+    def _iter_split_candidates(self):
+        requested = [self.split.lower(), *self.SPLIT_FALLBACKS.get(self.split.lower(), ())]
+        seen = set()
+        for key in requested:
+            for alias in self.SPLIT_DIR_ALIASES.get(key, (key,)):
+                alias_lc = alias.lower()
+                if alias_lc in seen:
+                    continue
+                seen.add(alias_lc)
+                yield alias
+
+    def _infer_label(self, path: Path, scan_root: Path) -> Optional[int]:
+        for ancestor in self._ancestors_until(path.parent, scan_root):
+            if ancestor.name in self.LIVE_DIRS:
+                return self.LABEL_LIVE
+            if ancestor.name in self.SPOOF_DIRS:
+                return self.LABEL_SPOOF
+        return None
+
+    def _matches_sensor(self, path: Path, scan_root: Path) -> bool:
+        sensor = self._normalize_sensor_name(self.sensor or '')
+        if not sensor:
+            return True
+
+        for ancestor in self._ancestors_until(path.parent, scan_root):
+            if self._normalize_sensor_name(ancestor.name) == sensor:
+                return True
+
+        return False
+
+    @staticmethod
+    def _ancestors_until(path: Path, stop_at: Path):
+        current = path
+        while True:
+            yield current
+            if current == stop_at or current.parent == current:
+                break
+            current = current.parent
+
+    @staticmethod
+    def _normalize_sensor_name(name: str) -> str:
+        cleaned = re.sub(r'[^a-z0-9]+', '', name.lower())
+        for suffix in ('train', 'test'):
+            if cleaned.endswith(suffix):
+                cleaned = cleaned[:-len(suffix)]
+        return cleaned
 
     def _load_image(self, path: Path) -> torch.Tensor:
         img = Image.open(path).convert('L')
@@ -134,7 +244,11 @@ class PADDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         path, label = self.samples[idx]
-        image = self._load_image(path)
+        try:
+            image = self._load_image(path)
+        except (OSError, IOError):
+            # Corrupt image — return a random valid sample instead
+            return self.__getitem__((idx + 1) % len(self.samples))
 
         if self.transform is not None:
             image = self.transform(image)
@@ -151,3 +265,6 @@ class PADDataset(Dataset):
     @property
     def num_spoof(self) -> int:
         return sum(1 for _, l in self.samples if l == self.LABEL_SPOOF)
+
+    def get_liveness_labels(self) -> List[int]:
+        return [label for _, label in self.samples]

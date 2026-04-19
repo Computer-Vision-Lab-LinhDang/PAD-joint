@@ -1,16 +1,16 @@
 """
-omfr.py — Main OMFR Lightning Module
+omfr.py — Main OMFR Lightning Module (v2: TinyViT-5M Backbone)
 
 Orchestrates:
-    LearnableGaborStem → ViTTinyBackbone (MoE) → IdentityHead + PADHead
+    LearnableGaborStem → TinyViTBackbone (MoE) → IdentityHead + PADHead
 
 Phase-aware training:
-    Phase 1 (epochs  1–20): Identity only — MRL-ArcFace + L_balance
-    Phase 2 (epochs 20–40): Alternating ID/PAD — all losses, α/β ramp
-    Phase 3 (epochs 40–60): Joint refinement — all losses fixed, spoof-masked ArcFace
+    Phase 1 (epochs  0-19): Identity only — MRL-ArcFace + L_balance
+    Phase 2 (epochs 20-39): Alternating ID/PAD — all losses, alpha/beta ramp
+    Phase 3 (epochs 40-59): Joint refinement — all losses fixed, spoof-masked ArcFace
 
 Loss total:
-    L = L_Identity + α·L_PAD + β·L_orth + γ·L_balance
+    L = L_Identity + alpha * L_PAD + beta * L_orth + gamma * L_balance
 
 Config dict keys:
     num_classes:   int    — number of training identities
@@ -18,11 +18,12 @@ Config dict keys:
     weight_decay:  float  — AdamW weight decay (default 0.05)
     total_epochs:  int    — total training epochs (default 60)
     gamma:         float  — MoE balance loss weight (default 0.01)
+    pretrained:    bool   — load pretrained TinyViT (default True)
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List
 
 import torch
 import torch.nn as nn
@@ -30,7 +31,7 @@ import torch.nn.functional as F
 import lightning as L
 
 from omfr.models.backbone.gabor_stem import LearnableGaborStem
-from omfr.models.backbone.vit_tiny import ViTTinyBackbone
+from omfr.models.backbone.tiny_vit import TinyViTBackbone
 from omfr.models.heads.identity_head import IdentityHead
 from omfr.models.heads.pad_head import PADHead
 from omfr.models.losses.arcface import ArcFaceLoss
@@ -40,7 +41,7 @@ from omfr.models.losses.orthogonal import OrthogonalityLoss
 
 class OMFRModule(L.LightningModule):
     """
-    OMFR main Lightning module.
+    OMFR main Lightning module with TinyViT-5M backbone.
 
     Args:
         config: dict with training and model hyperparameters.
@@ -54,59 +55,96 @@ class OMFRModule(L.LightningModule):
         self.save_hyperparameters(config)
 
         num_classes: int = config["num_classes"]
+        pretrained: bool = config.get("pretrained", True)
 
-        # ── Model components ──────────────────────────────────────────────
-        self.gabor         = LearnableGaborStem()
-        self.backbone      = ViTTinyBackbone()
-        self.pad_head      = PADHead()
-        self.identity_head = IdentityHead(num_classes=num_classes)
+        # -- Model components --
+        self.gabor = LearnableGaborStem()
+        self.backbone = TinyViTBackbone(
+            pretrained=pretrained,
+            in_chans=8,
+            num_experts=4,
+            top_k=2,
+        )
+        self.pad_head = PADHead()
+        self.identity_head = IdentityHead()
 
-        # ── Losses ────────────────────────────────────────────────────────
-        # ArcFace: one per MRL dim, initial scale=32 (gentle Phase 1)
+        # -- Losses --
+        # ArcFace: one per MRL dim, weights stored HERE (not in IdentityHead)
+        # Init with s=1.0, margin=0.0 — PhaseSchedulerCallback warms up to s=32, m=0.5
         self.arcface_losses = nn.ModuleDict({
-            "64":  ArcFaceLoss(64,  num_classes=num_classes, s=32.0, margin=0.5),
-            "128": ArcFaceLoss(128, num_classes=num_classes, s=32.0, margin=0.5),
-            "256": ArcFaceLoss(256, num_classes=num_classes, s=32.0, margin=0.5),
+            "64":  ArcFaceLoss(64,  num_classes=num_classes, s=1.0, margin=0.0),
+            "128": ArcFaceLoss(128, num_classes=num_classes, s=1.0, margin=0.0),
+            "256": ArcFaceLoss(256, num_classes=num_classes, s=1.0, margin=0.0),
         })
         self.supcon_loss = SupConLoss(temperature=0.07)
+        # Dedicated SupCon for identity embeddings — higher temperature so
+        # the contrastive signal is smoother across many identities.
+        self.supcon_identity_loss = SupConLoss(temperature=0.1)
         self.bce_loss    = nn.BCEWithLogitsLoss()
         self.orth_loss   = OrthogonalityLoss()
 
-        # ── Loss weights ──────────────────────────────────────────────────
-        self.alpha: float = 0.0   # PAD weight  — ramped in Phase 2, fixed 1.0 in Phase 3
-        self.beta:  float = 0.0   # Orth weight — ramped in Phase 2, fixed 0.1 in Phase 3
-        self.gamma: float = float(config.get("gamma", 0.01))   # balance (always active)
+        # -- Loss weights --
+        self.alpha: float = 0.0   # PAD weight — ramped in Phase 2
+        self.beta:  float = 0.0   # Orth weight — ramped in Phase 2
+        self.gamma: float = float(config.get("gamma", 0.01))
+        # Hybrid identity loss: weighted mix of SupCon (open-set) and
+        # ArcFace (class discriminative). SupCon dominates so embeddings
+        # generalize across unseen identities (FVC open-set scenario).
+        self.identity_supcon_weight: float = float(
+            config.get("identity_supcon_weight", 0.7)
+        )
+        self.identity_arcface_weight: float = float(
+            config.get("identity_arcface_weight", 0.3)
+        )
 
-        # ── Phase state ───────────────────────────────────────────────────
+        # -- Phase state --
         self.current_phase: int = 1
 
-        # ── Validation accumulators (cleared each epoch) ──────────────────
+        # -- Validation accumulators --
         self._val_id_embeddings:   List[torch.Tensor] = []
         self._val_id_labels:       List[torch.Tensor] = []
+        self._val_id_pad_logits:   List[torch.Tensor] = []  # PAD logits for identity samples (cascaded_IM)
         self._val_pad_logits:      List[torch.Tensor] = []
         self._val_liveness_labels: List[torch.Tensor] = []
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # Internal forward helpers
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     def _run_backbone(self, images: torch.Tensor) -> Dict:
-        """Gabor stem → ViT backbone. Returns backbone output dict."""
-        enhanced = self.gabor(images)   # (B, 3, 224, 224)
+        """Gabor stem -> TinyViT backbone. Returns backbone output dict."""
+        enhanced = self.gabor(images)          # (B, 8, 224, 224)
         return self.backbone(enhanced)
 
     def _run_identity(self, backbone_out: Dict) -> Dict:
+        """Identity head using stage3 + stage4 features."""
         return self.identity_head({
-            "layer12_tokens": backbone_out["layer12_tokens"],
-            "cls_token":      backbone_out["cls_token"],
+            "stage3_feat": backbone_out["stage3_feat"],
+            "stage4_feat": backbone_out["stage4_feat"],
         })
 
     def _run_pad(self, backbone_out: Dict) -> Dict:
+        """PAD head using stage1 + stage2 features + routing stats.
+
+        Routing tensors fed to the PAD head are detached so the PAD
+        objective cannot back-propagate into the MoE gate. Otherwise the
+        gate learns to encode liveness in routing patterns — a sensor
+        fingerprint that fails cross-split (see EER ≈ 50% on test).
+        """
+        rs = backbone_out["routing_stats"]
+
+        def _detach_stats(stats: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+            return {
+                "expert_weights": stats["expert_weights"].detach(),
+                "token_entropy":  stats["token_entropy"].detach(),
+            }
+
         return self.pad_head({
-            "layer3_tokens":   backbone_out["layer3_tokens"],
-            "layer7_tokens":   backbone_out["layer7_tokens"],
-            "routing_stats_3": backbone_out["routing_stats"][3],
-            "routing_stats_7": backbone_out["routing_stats"][7],
+            "stage1_feat":       backbone_out["stage1_feat"],
+            "stage2_feat":       backbone_out["stage2_feat"],
+            "routing_stats_s2":  _detach_stats(rs["s2"]),
+            "routing_stats_s3a": _detach_stats(rs["s3a"]),
+            "routing_stats_s3b": _detach_stats(rs["s3b"]),
         })
 
     def _arcface_loss(
@@ -121,73 +159,90 @@ class OMFRModule(L.LightningModule):
         )
         return total / len(mrl_embeddings)
 
-    # ─────────────────────────────────────────────────────────────────────────
+    def _identity_loss(
+        self,
+        mrl_embeddings: Dict[int, torch.Tensor],
+        identity_labels: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Hybrid identity loss: SupCon (open-set) + ArcFace (closed-set).
+
+        SupCon drives open-set generalization (important for FVC where test
+        IDs are disjoint from train IDs). ArcFace adds class-discriminative
+        structure without dominating.
+
+        Returns a dict so each component can be logged separately.
+        """
+        l_arcface = self._arcface_loss(mrl_embeddings, identity_labels)
+        # SupCon is computed on the full 256-D embedding — the MRL prefixes
+        # inherit the same geometry via truncation + re-normalization.
+        l_supcon = self.supcon_identity_loss(
+            mrl_embeddings[self.MRL_DIMS[-1]], identity_labels,
+        )
+        total = (
+            self.identity_arcface_weight * l_arcface
+            + self.identity_supcon_weight * l_supcon
+        )
+        return {"arcface": l_arcface, "supcon": l_supcon, "total": total}
+
+    # -------------------------------------------------------------------------
     # Phase-specific training steps
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     def _phase1_step(self, batch: Any) -> torch.Tensor:
-        """
-        Phase 1 — identity only.
-        Gradients: Gabor + full backbone + Identity Head + ArcFace.
-        Loss: (1/3)·Σ L_ArcFace_dim + γ·L_balance
-        """
+        """Phase 1 — identity only."""
         images, identity_labels = self._unpack_identity_batch(batch)
 
         backbone_out = self._run_backbone(images)
         id_out       = self._run_identity(backbone_out)
 
-        l_id      = self._arcface_loss(id_out["mrl_embeddings"], identity_labels)
+        id_parts  = self._identity_loss(id_out["mrl_embeddings"], identity_labels)
         l_balance = sum(backbone_out["balance_losses"])
-        loss      = l_id + self.gamma * l_balance
+        loss      = id_parts["total"] + self.gamma * l_balance
 
-        self.log("train/identity_loss", l_id,      prog_bar=True, sync_dist=True)
-        self.log("train/balance_loss",  l_balance,               sync_dist=True)
-        self.log("train/total_loss",    loss,       prog_bar=True, sync_dist=True)
+        self.log("train/identity_loss",  id_parts["total"], prog_bar=True, sync_dist=True)
+        self.log("train/id_arcface",     id_parts["arcface"],                sync_dist=True)
+        self.log("train/id_supcon",      id_parts["supcon"],                 sync_dist=True)
+        self.log("train/balance_loss",   l_balance,                          sync_dist=True)
+        self.log("train/total_loss",     loss,              prog_bar=True, sync_dist=True)
         return loss
 
     def _phase2_identity_step(self, batch: Any) -> torch.Tensor:
-        """
-        Phase 2 — identity batch.
-        Gradients: full backbone + Identity Head (full) + PAD Head (orth only).
-        Loss: L_id + β·L_orth + γ·L_balance
-        """
+        """Phase 2 — identity batch. Full gradients to backbone + identity head."""
         images, identity_labels = self._unpack_identity_batch(batch)
 
         backbone_out = self._run_backbone(images)
         id_out       = self._run_identity(backbone_out)
         pad_out      = self._run_pad(backbone_out)
 
-        l_id      = self._arcface_loss(id_out["mrl_embeddings"], identity_labels)
+        id_parts  = self._identity_loss(id_out["mrl_embeddings"], identity_labels)
         l_orth    = self.orth_loss(pad_out["pad_embedding"], id_out["identity_embedding"])
         l_balance = sum(backbone_out["balance_losses"])
-        loss      = l_id + self.beta * l_orth + self.gamma * l_balance
+        loss      = id_parts["total"] + self.beta * l_orth + self.gamma * l_balance
 
-        self.log("train/identity_loss", l_id,   sync_dist=True)
-        self.log("train/orth_loss",     l_orth,  sync_dist=True)
-        self.log("train/balance_loss",  l_balance, sync_dist=True)
-        self.log("train/total_loss",    loss, prog_bar=True, sync_dist=True)
+        self.log("train/identity_loss", id_parts["total"], prog_bar=True, sync_dist=True)
+        self.log("train/id_arcface",    id_parts["arcface"],                sync_dist=True)
+        self.log("train/id_supcon",     id_parts["supcon"],                 sync_dist=True)
+        self.log("train/orth_loss",     l_orth,            sync_dist=True)
+        self.log("train/balance_loss",  l_balance,         sync_dist=True)
+        self.log("train/total_loss",    loss,              prog_bar=True, sync_dist=True)
         return loss
 
     def _phase2_pad_step(self, batch: Any) -> torch.Tensor:
         """
         Phase 2 — PAD batch.
-        Gradient isolation:
-          • Layers 1-7 + PAD Head: full gradient (L_PAD + L_orth + L_balance)
-          • Layers 8-12 + Identity Head: NO gradient from PAD batch
-            (layer12/CLS detached — identity features from Phase 1 preserved)
-        Loss: α·(L_SupCon + L_BCE) + β·L_orth + γ·L_balance
+        Gradient isolation: stage3/4 features detached so PAD loss doesn't
+        disturb identity-critical layers.
         """
         images, liveness_labels = self._unpack_pad_batch(batch)
 
         backbone_out = self._run_backbone(images)
         pad_out      = self._run_pad(backbone_out)
 
-        # Detach layer12/CLS: prevents L_PAD and L_orth from reaching layers 8-12
-        # and identity head. Identity features learned in Phase 1 are preserved;
-        # layers 8-12 only receive gradients from identity batches.
+        # Detach stage3/4: identity features learned in Phase 1 are preserved
         id_out = self.identity_head({
-            "layer12_tokens": backbone_out["layer12_tokens"].detach(),
-            "cls_token":      backbone_out["cls_token"].detach(),
+            "stage3_feat": backbone_out["stage3_feat"].detach(),
+            "stage4_feat": backbone_out["stage4_feat"].detach(),
         })
 
         l_supcon  = self.supcon_loss(pad_out["pad_features"], liveness_labels)
@@ -207,12 +262,7 @@ class OMFRModule(L.LightningModule):
         return loss
 
     def _phase3_step(self, batch: Any) -> torch.Tensor:
-        """
-        Phase 3 — joint refinement.
-        All modules receive full gradients.
-        ArcFace masked: spoof samples excluded if liveness labels present.
-        Loss: (opt) L_id + α·(L_SupCon + L_BCE) + β·L_orth + γ·L_balance
-        """
+        """Phase 3 — joint refinement. Spoof-masked ArcFace."""
         images = batch["images"] if isinstance(batch, dict) else batch[0]
 
         backbone_out = self._run_backbone(images)
@@ -233,9 +283,15 @@ class OMFRModule(L.LightningModule):
                         dim: emb[live_mask]
                         for dim, emb in id_out["mrl_embeddings"].items()
                     }
-                    loss = loss + self._arcface_loss(masked_embs, id_labels[live_mask])
+                    id_parts = self._identity_loss(masked_embs, id_labels[live_mask])
+                    loss = loss + id_parts["total"]
+                    self.log("train/id_arcface", id_parts["arcface"], sync_dist=True)
+                    self.log("train/id_supcon",  id_parts["supcon"],  sync_dist=True)
             else:
-                loss = loss + self._arcface_loss(id_out["mrl_embeddings"], id_labels)
+                id_parts = self._identity_loss(id_out["mrl_embeddings"], id_labels)
+                loss = loss + id_parts["total"]
+                self.log("train/id_arcface", id_parts["arcface"], sync_dist=True)
+                self.log("train/id_supcon",  id_parts["supcon"],  sync_dist=True)
 
         # PAD loss
         if isinstance(batch, dict) and "liveness_labels" in batch:
@@ -251,62 +307,99 @@ class OMFRModule(L.LightningModule):
         self.log("train/total_loss",   loss, prog_bar=True, sync_dist=True)
         return loss
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # LightningModule interface
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
         if self.current_phase == 1:
             return self._phase1_step(batch)
 
         elif self.current_phase == 2:
-            # CombinedLoader delivers {"identity": id_batch, "pad": pad_batch}
-            # Alternate: even steps → identity, odd steps → PAD
             if isinstance(batch, dict) and "identity" in batch and "pad" in batch:
                 if batch_idx % 2 == 0:
                     return self._phase2_identity_step(batch["identity"])
                 else:
                     return self._phase2_pad_step(batch["pad"])
-            # Single-loader fallback
             if isinstance(batch, dict) and "liveness_labels" in batch:
                 return self._phase2_pad_step(batch)
             return self._phase2_identity_step(batch)
 
         else:  # phase 3
-            # CombinedLoader delivers {"identity": ..., "pad": ..., "joint": ...}
             if isinstance(batch, dict) and any(
                 k in batch for k in ("identity", "pad", "joint")
             ):
-                # Round-robin: 0→identity, 1→pad, 2→joint
-                key_order = ["identity", "pad", "joint"]
-                key = key_order[batch_idx % 3]
+                key_order = [k for k in ("identity", "pad", "joint") if batch.get(k) is not None]
+                key = key_order[batch_idx % len(key_order)]
                 sub = batch.get(key)
                 if sub is not None:
                     return self._phase3_step(sub)
-                # Fallback to first available
                 for k in key_order:
                     if k in batch:
                         return self._phase3_step(batch[k])
             return self._phase3_step(batch)
 
-    def validation_step(self, batch: Any, batch_idx: int) -> None:
+    # -------------------------------------------------------------------------
+    # Checkpoint persistence for phase-schedule state
+    # -------------------------------------------------------------------------
+    #
+    # current_phase, ArcFace scale/margin, alpha/beta, and MoE temperature are
+    # plain Python attributes mutated by PhaseSchedulerCallback. Without these
+    # hooks they reset to __init__ defaults when the checkpoint is reloaded,
+    # making resume-training restart at Phase 1 with s=1, m=0.
+
+    def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        arc = {
+            k: {"s": float(v.s), "margin": float(v.margin)}
+            for k, v in self.arcface_losses.items()
+        }
+        moe_temps = []
+        if hasattr(self.backbone, "_moe_wrappers"):
+            moe_temps = [float(w.temperature) for w in self.backbone._moe_wrappers]
+        checkpoint["omfr_phase_state"] = {
+            "current_phase": int(self.current_phase),
+            "alpha": float(self.alpha),
+            "beta": float(self.beta),
+            "arcface": arc,
+            "moe_temperatures": moe_temps,
+        }
+
+    def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        st = checkpoint.get("omfr_phase_state")
+        if not st:
+            return
+        self.current_phase = int(st.get("current_phase", self.current_phase))
+        self.alpha = float(st.get("alpha", self.alpha))
+        self.beta  = float(st.get("beta",  self.beta))
+        for k, params in st.get("arcface", {}).items():
+            if k in self.arcface_losses:
+                self.arcface_losses[k].set_scale(float(params["s"]))
+                self.arcface_losses[k].set_margin(float(params["margin"]))
+        moe_temps = st.get("moe_temperatures", [])
+        if hasattr(self.backbone, "_moe_wrappers") and moe_temps:
+            for w, t in zip(self.backbone._moe_wrappers, moe_temps):
+                w.temperature = float(t)
+
+    def validation_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0) -> None:
         images = batch["images"] if isinstance(batch, dict) else batch[0]
 
         backbone_out = self._run_backbone(images)
         id_out       = self._run_identity(backbone_out)
         pad_out      = self._run_pad(backbone_out)
 
-        self._val_id_embeddings.append(id_out["identity_embedding"].detach().cpu())
-        self._val_pad_logits.append(pad_out["pad_logit"].detach().cpu())
-
         if isinstance(batch, dict):
-            if "liveness_labels" in batch:
-                self._val_liveness_labels.append(batch["liveness_labels"].detach().cpu())
             if "identity_labels" in batch:
+                self._val_id_embeddings.append(id_out["identity_embedding"].detach().cpu())
                 self._val_id_labels.append(batch["identity_labels"].detach().cpu())
+                # Store PAD logit for same identity samples → cascaded_IM
+                self._val_id_pad_logits.append(pad_out["pad_logit"].detach().cpu())
+
+            if "liveness_labels" in batch:
+                self._val_pad_logits.append(pad_out["pad_logit"].detach().cpu())
+                self._val_liveness_labels.append(batch["liveness_labels"].detach().cpu())
 
     def on_validation_epoch_end(self) -> None:
-        # ── PAD accuracy ─────────────────────────────────────────────────
+        # ── PAD accuracy (from PAD or joint val samples) ──
         if self._val_pad_logits and self._val_liveness_labels:
             logits = torch.cat(self._val_pad_logits,      dim=0).squeeze(-1)
             labels = torch.cat(self._val_liveness_labels, dim=0).float()
@@ -314,39 +407,50 @@ class OMFRModule(L.LightningModule):
             pad_acc = (preds == labels).float().mean()
             self.log("val/pad_accuracy", pad_acc, sync_dist=True, prog_bar=True)
 
-        # ── Identity rank-1 accuracy (256-D cosine) ───────────────────────
+            # Detailed PAD metrics
+            live_mask  = labels == 1
+            spoof_mask = labels == 0
+            if live_mask.any():
+                bpcer = 1.0 - (preds[live_mask] == labels[live_mask]).float().mean()
+                self.log("val/bpcer", bpcer, sync_dist=True)
+            if spoof_mask.any():
+                apcer = 1.0 - (preds[spoof_mask] == labels[spoof_mask]).float().mean()
+                self.log("val/apcer", apcer, sync_dist=True)
+
+        # ── Identity rank-1 accuracy (256-D cosine) ──
         cascaded_im = torch.tensor(0.0)
         if self._val_id_embeddings and self._val_id_labels:
-            embs   = torch.cat(self._val_id_embeddings, dim=0)  # (N, 256)
-            labels = torch.cat(self._val_id_labels,     dim=0)  # (N,)
+            embs   = torch.cat(self._val_id_embeddings, dim=0)
+            labels = torch.cat(self._val_id_labels,     dim=0)
             embs_n = F.normalize(embs, p=2, dim=-1)
 
-            sim = embs_n @ embs_n.T                              # (N, N)
+            sim = embs_n @ embs_n.T
             sim.fill_diagonal_(-float("inf"))
             rank1_acc = (labels[sim.argmax(dim=1)] == labels).float().mean()
-            self.log("val/identity_rank1", rank1_acc, sync_dist=True)
+            self.log("val/identity_rank1", rank1_acc, sync_dist=True, prog_bar=True)
 
-            # Cascaded IM: rank-1 on PAD-accepted (predicted-live) samples
-            if self._val_pad_logits:
-                logits   = torch.cat(self._val_pad_logits, dim=0).squeeze(-1)
-                live_mask = torch.sigmoid(logits) > 0.5
+            # ── Cascaded IM: PAD-filtered rank-1 on identity samples ──
+            # Phase 1: PAD head not trained → use raw rank-1
+            # Phase 2+: filter identity samples through PAD predictions
+            cascaded_im = rank1_acc
+            if self.current_phase >= 2 and self._val_id_pad_logits:
+                id_pad_logits = torch.cat(self._val_id_pad_logits, dim=0).squeeze(-1)
+                live_mask = torch.sigmoid(id_pad_logits) > 0.5
                 if live_mask.sum() > 1:
                     live_embs   = embs_n[live_mask]
                     live_labels = labels[live_mask]
                     live_sim    = live_embs @ live_embs.T
                     live_sim.fill_diagonal_(-float("inf"))
-                    live_rank1  = (live_labels[live_sim.argmax(dim=1)] == live_labels)
-                    cascaded_im = live_rank1.float().mean()
-                else:
-                    cascaded_im = rank1_acc
-            else:
-                cascaded_im = rank1_acc
+                    cascaded_im = (live_labels[live_sim.argmax(dim=1)] == live_labels).float().mean()
+                # Log PAD acceptance rate on identity samples (should be ~100% for live prints)
+                accept_rate = live_mask.float().mean()
+                self.log("val/pad_accept_rate", accept_rate, sync_dist=True)
 
         self.log("val/cascaded_IM", cascaded_im, prog_bar=True, sync_dist=True)
 
-        # Clear accumulators
         self._val_id_embeddings.clear()
         self._val_id_labels.clear()
+        self._val_id_pad_logits.clear()
         self._val_pad_logits.clear()
         self._val_liveness_labels.clear()
 
@@ -355,47 +459,46 @@ class OMFRModule(L.LightningModule):
         weight_decay  = float(self.cfg.get("weight_decay", 0.05))
         total_epochs  = int(  self.cfg.get("total_epochs", 60))
 
-        # Deduplicate: MoE params must not appear in backbone layer groups
+        # MoE params need separate group — exclude from backbone groups
         moe_ids = {id(p) for p in self.backbone.get_moe_params()}
 
+        # Stage 0+1 = early (PAD branch reads these)
         backbone_early = [
-            p for p in self.backbone.get_layer_params(list(range(1, 7)))
+            p for p in self.backbone.get_stage_params([0, 1])
             if id(p) not in moe_ids
         ]
+        # Stage 2+3 = late (identity branch reads these)
         backbone_late = [
-            p for p in self.backbone.get_layer_params(list(range(7, 13)))
+            p for p in self.backbone.get_stage_params([2, 3])
             if id(p) not in moe_ids
         ]
-        # Include final backbone LayerNorm (applied after all 12 blocks)
-        backbone_late += list(self.backbone.norm.parameters())
-        stem_embed = list(self.backbone.get_stem_and_embed_params())
 
         param_groups = [
-            # Gabor stem — very low LR (stable learned filters)
+            # Gabor stem — low LR
             {
                 "params": list(self.gabor.parameters()),
                 "lr":     lr * 0.1,
                 "name":   "gabor",
             },
-            # ViT patch embed + pos embed + CLS token — standard LR
+            # Patch embed — standard LR
             {
-                "params": stem_embed,
+                "params": list(self.backbone.get_embed_params()),
                 "lr":     lr,
                 "name":   "backbone_embed",
             },
-            # ViT layers 1–6 (PAD tap: layer 3) — standard LR
+            # Backbone stages 0+1 (early, PAD-relevant) — standard LR
             {
                 "params": backbone_early,
                 "lr":     lr,
                 "name":   "backbone_early",
             },
-            # ViT layers 7–12 (identity tap: layers 7, 10, 12) — standard LR
+            # Backbone stages 2+3 (late, identity-relevant) — standard LR
             {
                 "params": backbone_late,
                 "lr":     lr,
                 "name":   "backbone_late",
             },
-            # MoE experts + gates — higher LR (newly initialized)
+            # MoE experts + gates — 2x LR (newly initialized)
             {
                 "params": list(self.backbone.get_moe_params()),
                 "lr":     lr * 2.0,
@@ -407,17 +510,17 @@ class OMFRModule(L.LightningModule):
                 "lr":     lr,
                 "name":   "identity_head",
             },
-            # PAD Head — 2× in Phase 2 (catch up to backbone), 1× otherwise
+            # PAD Head — 2x in Phase 2 to catch up, 1x otherwise
             {
                 "params": list(self.pad_head.parameters()),
                 "lr":     lr * (2.0 if self.current_phase == 2 else 1.0),
                 "name":   "pad_head",
             },
-            # ArcFace classifiers — 10× LR (large, sparse gradients)
+            # ArcFace classifiers — 1x LR (reduced from 10x to prevent gradient explosion)
             {
                 "params": [p for af in self.arcface_losses.values()
                            for p in af.parameters()],
-                "lr":     lr * 10.0,
+                "lr":     lr * 1.0,
                 "name":   "arcface",
             },
         ]
@@ -429,10 +532,22 @@ class OMFRModule(L.LightningModule):
             betas=(0.9, 0.999),
         )
 
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        warmup_epochs = int(self.cfg.get("warmup_epochs", 5))
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
             optimizer,
-            T_max=total_epochs,
+            start_factor=0.01,   # 1% of target LR at epoch 0
+            end_factor=1.0,
+            total_iters=warmup_epochs,
+        )
+        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=total_epochs - warmup_epochs,
             eta_min=1e-6,
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[warmup_epochs],
         )
 
         return {
@@ -443,25 +558,22 @@ class OMFRModule(L.LightningModule):
             },
         }
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # Batch unpacking helpers
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     @staticmethod
     def _unpack_identity_batch(
         batch: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Extract (images, identity_labels) from various batch formats."""
         if isinstance(batch, dict):
             return batch["images"], batch["identity_labels"]
-        # (images, labels) tuple
         return batch[0], batch[1]
 
     @staticmethod
     def _unpack_pad_batch(
         batch: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Extract (images, liveness_labels) from various batch formats."""
         if isinstance(batch, dict):
             return batch["images"], batch["liveness_labels"]
         return batch[0], batch[1]

@@ -49,5 +49,5 @@ data/processed/
 .env
 *.pem
 *.key
-./LivDet2013
-./LivDet2015
+LivDet2013
+LivDet2015

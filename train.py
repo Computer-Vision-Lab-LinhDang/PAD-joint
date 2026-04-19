@@ -29,7 +29,7 @@ from lightning.pytorch.callbacks import (
     ModelCheckpoint,
     RichProgressBar,
 )
-from lightning.pytorch.loggers import TensorBoardLogger
+from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
 
 from omfr.models.omfr import OMFRModule
 from omfr.data.datamodule import OMFRDataModule
@@ -64,6 +64,75 @@ def _deep_get(d: Dict, *keys: str, default: Any = None) -> Any:
     return d if d != {} else default
 
 
+def _prepare_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    runtime = dict(config)
+    data_cfg = config.get("data", {})
+    losses_cfg = config.get("losses", {})
+    optimizer_cfg = config.get("optimizer", {})
+    phases_cfg = config.get("phases", {})
+    identity_head_cfg = config.get("identity_head", {})
+
+    runtime["identity_root"] = data_cfg.get(
+        "identity_data_root", config.get("identity_root", "")
+    )
+    runtime["pad_root"] = data_cfg.get(
+        "pad_data_root", config.get("pad_root", "")
+    )
+    runtime["joint_root"] = data_cfg.get(
+        "joint_data_root", config.get("joint_root", "")
+    )
+    runtime["identity_datasets"] = data_cfg.get(
+        "identity_datasets", config.get("identity_datasets", [])
+    )
+    runtime["pad_datasets"] = data_cfg.get(
+        "pad_datasets", config.get("pad_datasets", [])
+    )
+    runtime["joint_datasets"] = data_cfg.get(
+        "joint_datasets", config.get("joint_datasets", [])
+    )
+    runtime["num_workers"] = data_cfg.get("num_workers", config.get("num_workers", 8))
+    runtime["pk_P"] = data_cfg.get("pk_p", config.get("pk_P", 32))
+    runtime["pk_K"] = data_cfg.get("pk_k", config.get("pk_K", 4))
+    runtime["pad_batch_size"] = data_cfg.get(
+        "pad_batch_size", config.get("pad_batch_size", 128)
+    )
+    runtime["val_batch_size"] = data_cfg.get(
+        "val_batch_size", config.get("val_batch_size", 64)
+    )
+    runtime["pin_memory"] = data_cfg.get("pin_memory", config.get("pin_memory", True))
+
+    runtime["num_classes"] = identity_head_cfg.get(
+        "num_classes", config.get("num_classes", 0)
+    )
+    runtime["lr"] = optimizer_cfg.get("lr", config.get("lr", 1e-4))
+    runtime["weight_decay"] = optimizer_cfg.get(
+        "weight_decay", config.get("weight_decay", 0.05)
+    )
+    runtime["total_epochs"] = phases_cfg.get(
+        "total_epochs", config.get("total_epochs", 60)
+    )
+    runtime["gamma"] = losses_cfg.get("gamma", config.get("gamma", 0.01))
+    runtime["identity_supcon_weight"] = losses_cfg.get(
+        "identity_supcon_weight", config.get("identity_supcon_weight", 0.7)
+    )
+    runtime["identity_arcface_weight"] = losses_cfg.get(
+        "identity_arcface_weight", config.get("identity_arcface_weight", 0.3)
+    )
+    runtime["warmup_epochs"] = phases_cfg.get("warmup_epochs", 5)
+    backbone_cfg = config.get("backbone", {})
+    runtime["pretrained"] = backbone_cfg.get("pretrained", True)
+    return runtime
+
+
+def _infer_num_classes(datamodule: OMFRDataModule) -> int:
+    counts = []
+    if datamodule.identity_ds is not None:
+        counts.append(int(datamodule.identity_ds.num_classes))
+    if datamodule.joint_ds is not None:
+        counts.append(int(datamodule.joint_ds.num_classes))
+    return max(counts, default=0)
+
+
 # ---------------------------------------------------------------------------
 # Build objects from config
 # ---------------------------------------------------------------------------
@@ -79,53 +148,78 @@ def build_datamodule(config: Dict[str, Any]) -> OMFRDataModule:
 def build_callbacks(config: Dict[str, Any]) -> list:
     phase_cfg = config.get("phases", {})
     ckpt_cfg  = config.get("checkpoint", {})
+    tr_cfg    = config.get("trainer", {})
 
     phase_scheduler = PhaseSchedulerCallback(
-        phase1_epochs=phase_cfg.get("phase1_epochs", 20),
-        phase2_epochs=phase_cfg.get("phase2_epochs", 20),
-        phase3_epochs=phase_cfg.get("phase3_epochs", 20),
+        phase1_epochs=phase_cfg.get("phase1_epochs", 50),
+        phase2_epochs=phase_cfg.get("phase2_epochs", 50),
+        phase3_epochs=phase_cfg.get("phase3_epochs", 30),
         warmup_epochs=phase_cfg.get("warmup_epochs", 5),
+        phase1_warmup_epochs=phase_cfg.get("phase1_warmup_epochs", 5),
+        phase1_warmup_delay=phase_cfg.get("phase1_warmup_delay", 5),
         alpha_target=phase_cfg.get("alpha_target", 1.0),
         beta_target=phase_cfg.get("beta_target", 0.1),
+        arcface_scale_init=phase_cfg.get("arcface_scale_init", 1.0),
         arcface_scale_start=phase_cfg.get("arcface_scale_start", 32.0),
         arcface_scale_end=phase_cfg.get("arcface_scale_end", 64.0),
+        arcface_margin_init=phase_cfg.get("arcface_margin_init", 0.0),
+        arcface_margin_target=phase_cfg.get("arcface_margin_target", 0.5),
+        moe_temp_phase1=phase_cfg.get("moe_temp_phase1", 2.0),
+        moe_temp_phase2_end=phase_cfg.get("moe_temp_phase2_end", 1.0),
+        moe_temp_phase3_end=phase_cfg.get("moe_temp_phase3_end", 0.5),
     )
 
     gradient_monitor = GradientMonitor(log_every_n_steps=50)
 
-    checkpoint = ModelCheckpoint(
-        dirpath=ckpt_cfg.get("dirpath", "checkpoints/"),
-        filename=ckpt_cfg.get(
-            "filename", "omfr-{epoch:03d}-{val/cascaded_IM:.4f}"
-        ),
-        monitor=ckpt_cfg.get("monitor", "val/cascaded_IM"),
-        mode=ckpt_cfg.get("mode", "max"),
-        save_top_k=ckpt_cfg.get("save_top_k", 3),
-        save_last=ckpt_cfg.get("save_last", True),
-    )
-
     lr_monitor = LearningRateMonitor(logging_interval="epoch")
     progress   = RichProgressBar()
 
-    return [phase_scheduler, gradient_monitor, checkpoint, lr_monitor, progress]
+    callbacks = [phase_scheduler, gradient_monitor, lr_monitor, progress]
+    if tr_cfg.get("enable_checkpointing", True):
+        callbacks.insert(2, ModelCheckpoint(
+            dirpath=ckpt_cfg.get("dirpath", "checkpoints/"),
+            filename=ckpt_cfg.get(
+                "filename", "omfr-{epoch:03d}-{val/cascaded_IM:.4f}"
+            ),
+            monitor=ckpt_cfg.get("monitor", "val/cascaded_IM"),
+            mode=ckpt_cfg.get("mode", "max"),
+            save_top_k=ckpt_cfg.get("save_top_k", 3),
+            save_last=ckpt_cfg.get("save_last", True),
+        ))
+
+    return callbacks
 
 
-def build_logger(config: Dict[str, Any]) -> TensorBoardLogger:
+def build_logger(config: Dict[str, Any]) -> list:
     log_cfg = config.get("logging", {})
-    return TensorBoardLogger(
+    loggers = []
+
+    loggers.append(TensorBoardLogger(
         save_dir=log_cfg.get("save_dir", "logs/"),
         name=log_cfg.get("name", "omfr"),
         version=log_cfg.get("version", None),
-    )
+    ))
+
+    wandb_cfg = log_cfg.get("wandb", {})
+    if wandb_cfg.get("enabled", True):
+        loggers.append(WandbLogger(
+            project=wandb_cfg.get("project", "omfr"),
+            name=wandb_cfg.get("name", None),
+            save_dir=log_cfg.get("save_dir", "logs/"),
+            log_model=wandb_cfg.get("log_model", False),
+            config=config,
+        ))
+
+    return loggers
 
 
 def build_trainer(
     config: Dict[str, Any],
     callbacks: list,
-    logger: Any,
+    logger: list,
 ) -> L.Trainer:
     tr_cfg = config.get("trainer", {})
-    return L.Trainer(
+    trainer_kwargs = dict(
         accelerator=tr_cfg.get("accelerator", "gpu"),
         devices=tr_cfg.get("devices", 1),
         precision=tr_cfg.get("precision", "16-mixed"),
@@ -139,6 +233,17 @@ def build_trainer(
         callbacks=callbacks,
         logger=logger,
     )
+    optional_keys = (
+        "fast_dev_run",
+        "limit_train_batches",
+        "limit_val_batches",
+        "num_sanity_val_steps",
+        "enable_checkpointing",
+    )
+    for key in optional_keys:
+        if key in tr_cfg:
+            trainer_kwargs[key] = tr_cfg[key]
+    return L.Trainer(**trainer_kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -182,14 +287,10 @@ def _parse_overrides(override_list: list[str]) -> Dict[str, Any]:
         if "=" not in item:
             raise ValueError(f"Override must be key=value, got: {item!r}")
         key, raw_val = item.split("=", 1)
-        # Attempt numeric conversion
         try:
-            val: Any = int(raw_val)
-        except ValueError:
-            try:
-                val = float(raw_val)
-            except ValueError:
-                val = raw_val
+            val: Any = yaml.safe_load(raw_val)
+        except yaml.YAMLError:
+            val = raw_val
         result[key] = val
     return result
 
@@ -208,9 +309,17 @@ def main() -> None:
     if args.overrides:
         _apply_overrides(config, _parse_overrides(args.overrides))
 
+    runtime_config = _prepare_runtime_config(config)
+
     # ── Build components ──
-    model      = build_module(config)
-    datamodule = build_datamodule(config)
+    datamodule = build_datamodule(runtime_config)
+    datamodule.setup("fit")
+    inferred_num_classes = _infer_num_classes(datamodule)
+    if inferred_num_classes > 0:
+        runtime_config["num_classes"] = inferred_num_classes
+        config.setdefault("identity_head", {})["num_classes"] = inferred_num_classes
+
+    model      = build_module(runtime_config)
     callbacks  = build_callbacks(config)
     logger     = build_logger(config)
     trainer    = build_trainer(config, callbacks, logger)

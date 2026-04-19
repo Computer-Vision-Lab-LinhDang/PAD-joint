@@ -47,6 +47,15 @@ class JointDataset(Dataset):
     IMG_EXTS    = {'.bmp', '.png', '.jpg', '.jpeg', '.tif', '.tiff'}
     LIVE_DIRS   = {'live', 'Live', 'LIVE'}
     SPOOF_DIRS  = {'fake', 'Fake', 'spoof', 'Spoof'}
+    SPLIT_DIR_ALIASES = {
+        'train': ('train', 'Train', 'Training'),
+        'val': ('val', 'Val', 'Validation', 'valid', 'Valid'),
+        'test': ('test', 'Test', 'Testing'),
+    }
+    SPLIT_FALLBACKS = {
+        'test': ('val',),
+        'val': ('test',),
+    }
 
     def __init__(
         self,
@@ -72,11 +81,38 @@ class JointDataset(Dataset):
     # ------------------------------------------------------------------
 
     def _load_samples(self):
+        if not self.root.exists():
+            raise FileNotFoundError(
+                f"JointDataset root does not exist: {self.root}"
+            )
+
         csv_file = self.root / f'labels_{self.split}.csv'
         if csv_file.exists():
             self._load_from_csv(csv_file)
         else:
-            self._load_from_directory()
+            self._load_from_directory(self._resolve_split_root())
+
+    def _resolve_split_root(self) -> Path:
+        for split_name in self._iter_split_candidates():
+            if self.root.name.lower() == split_name.lower():
+                return self.root
+
+            candidate = self.root / split_name
+            if candidate.is_dir():
+                return candidate
+
+        return self.root
+
+    def _iter_split_candidates(self):
+        requested = [self.split.lower(), *self.SPLIT_FALLBACKS.get(self.split.lower(), ())]
+        seen = set()
+        for key in requested:
+            for alias in self.SPLIT_DIR_ALIASES.get(key, (key,)):
+                alias_lc = alias.lower()
+                if alias_lc in seen:
+                    continue
+                seen.add(alias_lc)
+                yield alias
 
     def _load_from_csv(self, csv_file: Path):
         rows = []
@@ -97,8 +133,10 @@ class JointDataset(Dataset):
             liveness = int(row.get('liveness_label', 1))
             self.samples.append((path, identity_idx, liveness))
 
-    def _load_from_directory(self):
-        subject_dirs = sorted(d for d in self.root.iterdir() if d.is_dir())
+    def _load_from_directory(self, scan_root: Path):
+        subject_dirs = sorted(
+            d for d in scan_root.iterdir() if d.is_dir() and not d.name.startswith('.')
+        )
         self.class_to_idx = {d.name: i for i, d in enumerate(subject_dirs)}
 
         for subject_dir in subject_dirs:
@@ -113,7 +151,7 @@ class JointDataset(Dataset):
                 else:
                     continue
                 for img_path in sorted(liveness_dir.iterdir()):
-                    if img_path.suffix.lower() in self.IMG_EXTS:
+                    if img_path.is_file() and img_path.suffix.lower() in self.IMG_EXTS:
                         self.samples.append((img_path, identity_idx, liveness))
 
     def _load_image(self, path: Path) -> torch.Tensor:
@@ -142,3 +180,9 @@ class JointDataset(Dataset):
     @property
     def num_classes(self) -> int:
         return len(self.class_to_idx)
+
+    def get_labels(self) -> List[int]:
+        return [identity for _, identity, _ in self.samples]
+
+    def get_liveness_labels(self) -> List[int]:
+        return [liveness for _, _, liveness in self.samples]
