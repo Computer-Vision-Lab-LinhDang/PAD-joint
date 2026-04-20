@@ -124,12 +124,28 @@ class OMFRModule(L.LightningModule):
         })
 
     def _run_pad(self, backbone_out: Dict) -> Dict:
-        """PAD head using stage1 + stage2 features + routing stats.
+        """PAD head reading stage1 + stage2 features + routing stats.
 
-        Routing tensors fed to the PAD head are detached so the PAD
-        objective cannot back-propagate into the MoE gate. Otherwise the
-        gate learns to encode liveness in routing patterns — a sensor
-        fingerprint that fails cross-split (see EER ≈ 50% on test).
+        ALL tensors coming out of the backbone are detached before they
+        reach the PAD head. Rationale:
+
+          * stage1/stage2 feature maps — without the detach, PAD
+            BCE/SupCon back-propagates through the 5.4 M-param TinyViT
+            backbone. LivDet datasets have strong sensor signatures, so
+            the backbone quickly memorizes sensor -> class shortcuts.
+            Observed symptoms: identity_loss jumps from ~5 to ~12 at
+            the Phase 2 boundary (backbone features shift away from
+            what identity head expects), val BPCER climbs to ~80% on
+            held-out sensors (test prints look "alien", head defaults
+            to spoof). The fix is to make the PAD head a pure read-only
+            classifier on top of identity-shaped features.
+          * routing_stats — same reason for the MoE gate: if PAD loss
+            could shape routing, the gate would encode liveness as a
+            sensor fingerprint and fail cross-split.
+
+        Net effect: the backbone is shaped only by L_identity (Phase 1,
+        2-identity, 3-joint) + balance loss. PAD head trains its own
+        ~340K params from a frozen view of the backbone.
         """
         rs = backbone_out["routing_stats"]
 
@@ -140,8 +156,8 @@ class OMFRModule(L.LightningModule):
             }
 
         return self.pad_head({
-            "stage1_feat":       backbone_out["stage1_feat"],
-            "stage2_feat":       backbone_out["stage2_feat"],
+            "stage1_feat":       backbone_out["stage1_feat"].detach(),
+            "stage2_feat":       backbone_out["stage2_feat"].detach(),
             "routing_stats_s2":  _detach_stats(rs["s2"]),
             "routing_stats_s3a": _detach_stats(rs["s3a"]),
             "routing_stats_s3b": _detach_stats(rs["s3b"]),
