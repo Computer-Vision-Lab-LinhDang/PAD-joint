@@ -31,6 +31,7 @@ import torch.nn.functional as F
 import lightning as L
 
 from omfr.models.backbone.gabor_stem import LearnableGaborStem
+from omfr.models.backbone.pad_stem import PADStem
 from omfr.models.backbone.tiny_vit import TinyViTBackbone
 from omfr.models.heads.identity_head import IdentityHead
 from omfr.models.heads.pad_head import PADHead
@@ -56,15 +57,25 @@ class OMFRModule(L.LightningModule):
 
         num_classes: int = config["num_classes"]
         pretrained: bool = config.get("pretrained", True)
+        grad_checkpoint: bool = bool(config.get("grad_checkpoint", False))
 
         # -- Model components --
         self.gabor = LearnableGaborStem()
+        # Separate Gabor bank for PAD — initialized at a higher base
+        # frequency (~0.35 cycles/px) so its filter bank covers pore-
+        # and micro-texture scales, while the identity Gabor stays on
+        # ridge frequencies (~0.12 cycles/px). Each bank has its own
+        # σ/γ params, so identity and PAD never interfere at the
+        # preprocessing stage (each objective shapes its own bank).
+        self.gabor_pad = LearnableGaborStem(init_frequency=0.35)
         self.backbone = TinyViTBackbone(
             pretrained=pretrained,
             in_chans=8,
             num_experts=4,
             top_k=2,
+            use_grad_checkpoint=grad_checkpoint,
         )
+        self.pad_stem = PADStem()
         self.pad_head = PADHead()
         self.identity_head = IdentityHead()
 
@@ -112,9 +123,21 @@ class OMFRModule(L.LightningModule):
     # -------------------------------------------------------------------------
 
     def _run_backbone(self, images: torch.Tensor) -> Dict:
-        """Gabor stem -> TinyViT backbone. Returns backbone output dict."""
-        enhanced = self.gabor(images)          # (B, 8, 224, 224)
-        return self.backbone(enhanced)
+        """Gabor stem -> TinyViT backbone. Returns backbone output dict.
+
+        Two Gabor responses are computed:
+          * ``gabor_feat``     — identity Gabor (ridge-tuned), fed into
+            the TinyViT backbone and used downstream by identity_head.
+          * ``gabor_pad_feat`` — PAD Gabor (pore/micro-texture-tuned),
+            consumed by pad_stem inside _run_pad. Separate banks mean
+            identity grads never touch PAD σ/γ and vice-versa.
+        """
+        enhanced     = self.gabor(images)        # (B, 8, 224, 224)
+        enhanced_pad = self.gabor_pad(images)    # (B, 8, 224, 224)
+        out = self.backbone(enhanced)
+        out["gabor_feat"]     = enhanced
+        out["gabor_pad_feat"] = enhanced_pad
+        return out
 
     def _run_identity(self, backbone_out: Dict) -> Dict:
         """Identity head using stage3 + stage4 features."""
@@ -155,12 +178,46 @@ class OMFRModule(L.LightningModule):
                 "token_entropy":  stats["token_entropy"].detach(),
             }
 
+        def _gateonly_stats(stats: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+            # "Gate-only" routing copy — grad can reach gate_proj
+            # weights but stops at gate_input (see moe_ffn.forward).
+            return {
+                "expert_weights": stats["expert_weights_gateonly"],
+                "token_entropy":  stats["token_entropy_gateonly"],
+            }
+
+        # Phase-gated routing un-detach: from Phase 2 on, let PAD
+        # gradients flow back into the MoE gate projection only
+        # (~200 params/layer × 3 layers ≈ 600 params). Expert bodies,
+        # stage features, and the upstream tokens that feed FrequencyGate
+        # stay isolated — PAD can bias routing toward spoof-texture
+        # experts without reshaping the backbone.
+        # Phase 1: keep everything detached — backbone is still
+        # converging on identity and we don't want a noisy PAD head
+        # steering routing before it has a useful signal.
+        if self.current_phase >= 2:
+            rs_s2  = _gateonly_stats(rs["s2"])
+            rs_s3a = _gateonly_stats(rs["s3a"])
+            rs_s3b = _gateonly_stats(rs["s3b"])
+        else:
+            rs_s2  = _detach_stats(rs["s2"])
+            rs_s3a = _detach_stats(rs["s3a"])
+            rs_s3b = _detach_stats(rs["s3b"])
+
+        # Dedicated PAD stem runs on the PAD-specific Gabor bank
+        # (self.gabor_pad). Because it's a separate filter bank from
+        # the identity Gabor, PAD gradients never touch identity σ/γ —
+        # no detach needed. The PAD bank is free to learn pore- and
+        # texture-scale frequencies throughout all phases.
+        pad_stem_feat = self.pad_stem(backbone_out["gabor_pad_feat"])
+
         return self.pad_head({
+            "pad_stem_feat":     pad_stem_feat,
             "stage1_feat":       backbone_out["stage1_feat"].detach(),
             "stage2_feat":       backbone_out["stage2_feat"].detach(),
-            "routing_stats_s2":  _detach_stats(rs["s2"]),
-            "routing_stats_s3a": _detach_stats(rs["s3a"]),
-            "routing_stats_s3b": _detach_stats(rs["s3b"]),
+            "routing_stats_s2":  rs_s2,
+            "routing_stats_s3a": rs_s3a,
+            "routing_stats_s3b": rs_s3b,
         })
 
     def _arcface_loss(
@@ -490,11 +547,19 @@ class OMFRModule(L.LightningModule):
         ]
 
         param_groups = [
-            # Gabor stem — low LR
+            # Identity Gabor stem — low LR (only 16 params, stable)
             {
                 "params": list(self.gabor.parameters()),
                 "lr":     lr * 0.1,
                 "name":   "gabor",
+            },
+            # PAD Gabor stem — starts from scratch (pore frequencies),
+            # needs a higher LR than the identity bank to converge in
+            # the same number of epochs. Only 16 params.
+            {
+                "params": list(self.gabor_pad.parameters()),
+                "lr":     lr * 1.0,
+                "name":   "gabor_pad",
             },
             # Patch embed — standard LR
             {
@@ -526,10 +591,20 @@ class OMFRModule(L.LightningModule):
                 "lr":     lr,
                 "name":   "identity_head",
             },
-            # PAD Head — 2x in Phase 2 to catch up, 1x otherwise
+            # Dedicated PAD stem — always 2x. The previous conditional
+            # (2x only in Phase 2) was a bug: configure_optimizers runs
+            # once at fit start when current_phase is still 1, so the
+            # 2x multiplier never actually applied. Pinning to 2x keeps
+            # the PAD extractor converging fast throughout training.
+            {
+                "params": list(self.pad_stem.parameters()),
+                "lr":     lr * 2.0,
+                "name":   "pad_stem",
+            },
+            # PAD Head — always 2x (same reasoning as pad_stem).
             {
                 "params": list(self.pad_head.parameters()),
-                "lr":     lr * (2.0 if self.current_phase == 2 else 1.0),
+                "lr":     lr * 2.0,
                 "name":   "pad_head",
             },
             # ArcFace classifiers — 1x LR (reduced from 10x to prevent gradient explosion)

@@ -20,6 +20,10 @@ backbone:
   #   Stage 2 block 5: 14×14 tokens, 160-ch
   num_experts: 4
   top_k: 2
+  # Gradient checkpointing trades ~30% extra compute for ~2× lower
+  # activation memory. Needed to fit Phase 2 (two head forwards +
+  # orth loss) on a single GPU at batch 128.
+  grad_checkpoint: true
 
 # ─────────────────────────────────────────────────────────────────
 # Model — Gabor Stem
@@ -120,7 +124,12 @@ phases:
   # Phase 2 warmup for alpha/beta/arcface_scale ramps
   warmup_epochs: 5           # over first 5 epochs of Phase 2
   alpha_target: 1.0
-  beta_target: 0.1
+  # Orthogonality weight: reduced 0.1 -> 0.02 because β=0.1 was
+  # visibly distorting the 256-D identity embedding (MRL 256 < 128
+  # at eval). With separate Gabor banks and a beefed-up pad_stem,
+  # PAD and identity already share less representation, so a lighter
+  # decorrelation pressure suffices.
+  beta_target: 0.02
   arcface_scale_start: 32.0
   arcface_scale_end: 64.0
 

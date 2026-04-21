@@ -1,9 +1,10 @@
 """
-pad_head.py — PAD Branch Head (v3: Depthwise-Separable Conv + GAP)
+pad_head.py — PAD Branch Head (v4: Dedicated Stem + DS-Conv Aux + Routing)
 
 Input: {
-    'stage1_feat':       (B, 64, 56, 56),
-    'stage2_feat':       (B, 128, 28, 28),
+    'pad_stem_feat':     (B, 128),              # from PADStem (TRAINABLE)
+    'stage1_feat':       (B, 64, 56, 56),       # detached backbone feature
+    'stage2_feat':       (B, 128, 28, 28),      # detached backbone feature
     'routing_stats_s2':  {'expert_weights': (B, 784, 4), 'token_entropy': (B, 784)},
     'routing_stats_s3a': {'expert_weights': (B, 196, 4), 'token_entropy': (B, 196)},
     'routing_stats_s3b': {'expert_weights': (B, 196, 4), 'token_entropy': (B, 196)},
@@ -15,22 +16,27 @@ Output: {
     'pad_features':  (B, 128),   # Pre-projection features for SupCon
 }
 
-v3 rationale:
-    The previous (v2) feature path used AdaptiveAvgPool2d(7) + Flatten +
-    Linear(3136/6272 -> 256) per stage. Two failure modes:
+v4 rationale:
+    v3 introduced depthwise-separable conv blocks on stage1/stage2 and
+    killed the 2.4M Flatten+Linear explosion. On top of that, v4 adds a
+    dedicated PAD stem (see backbone/pad_stem.py) that reads the Gabor
+    output directly and produces a 128-D liveness vector. This is the
+    ONLY PAD feature path that remains connected to the autograd graph:
+    stage1/stage2 feature maps (and MoE routing stats) are detached in
+    OMFRModule._run_pad, so the TinyViT backbone is shaped exclusively
+    by L_identity. Without this parallel stem, PAD had to latch onto
+    identity-shaped features alone and collapsed on held-out sensors
+    (BPCER ~80%). With the stem, the PAD objective owns a small (~200K)
+    trainable extractor of its own while the detached backbone features
+    act as structural context.
 
-      1. Param explosion (~2.4M in proj_s1 + proj_s2 alone) driving severe
-         overfit — BCE tracks ~0.03 on train but EER stays ~50% on held-out
-         sensors.
-      2. The 8x8 spatial averaging destroys the very micro-texture that
-         separates live vs. spoof (print noise, pores, silicon grain).
-
-    v3 replaces both Linear projections with depthwise-separable conv
-    blocks (DW3x3 + PW1x1 + DW3x3) that KEEP full spatial resolution
-    (56x56 / 28x28) and rely on Global Average Pooling at the very END
-    to produce the per-stage 128-D vector. This preserves translation
-    invariance and high-frequency detail while cutting the feature-path
-    param budget by ~40x.
+    v3 feature-path rationale (still applies):
+      * DS conv blocks preserve spatial structure (no premature 8x8
+        averaging) so micro-texture cues (print noise, pores, silicon
+        grain) survive into fusion.
+      * Linear projection of 6272-D per stage would mean ~2.4M params
+        driving severe overfit. DS conv + deferred GAP cuts that to
+        ~30K per stage.
 """
 
 import torch
@@ -85,10 +91,13 @@ class PADConvBlock(nn.Module):
 
 class PADHead(nn.Module):
     """
-    Multi-scale feature aggregation + MoE routing stats fusion.
+    Multi-scale feature aggregation + dedicated PAD stem + MoE routing.
 
-    Architecture (v3):
-        -- Feature path (spatial-preserving) --
+    Architecture (v4):
+        -- PAD stem path (TRAINABLE, runs upstream in OMFRModule) --
+        pad_stem_feat (B, 128)
+
+        -- Aux feature path on detached backbone stages --
         stage1_feat (B,64,56,56)  -> PADConvBlock(64->128)  -> GAP -> (B,128)
         stage2_feat (B,128,28,28) -> PADConvBlock(128->128) -> GAP -> (B,128)
         -> concat -> (B, 256)
@@ -100,7 +109,7 @@ class PADHead(nn.Module):
         -> concat all 3 layers -> (B, 24)
 
         -- Fusion --
-        concat(feature_256, routing_24) -> (B, 280)
+        concat(pad_stem_128, feature_256, routing_24) -> (B, 408)
         -> LayerNorm -> MLP -> pad_features (B, 128)
 
         -- Two PARALLEL output branches --
@@ -109,6 +118,7 @@ class PADHead(nn.Module):
     """
 
     FEAT_CH_PER_STAGE = 128
+    PAD_STEM_DIM = 256
     ROUTE_DIM_PER_LAYER = 8   # 4 expert mean + 4 entropy stats
     NUM_MOE_LAYERS = 3
     ROUTE_DIM = ROUTE_DIM_PER_LAYER * NUM_MOE_LAYERS   # 24
@@ -119,18 +129,21 @@ class PADHead(nn.Module):
         self,
         stage1_dim: int = 64,
         stage2_dim: int = 128,
+        pad_stem_dim: int = 256,
         dropout: float = 0.1,
     ):
         super().__init__()
 
-        # Feature path: depthwise-separable blocks keep spatial layout
-        # intact; GAP is deferred to the very end of each stage.
+        self.pad_stem_dim = pad_stem_dim
+
+        # Aux feature path on detached backbone stages — DS blocks preserve
+        # spatial layout, GAP is deferred to the very end of each stage.
         self.block_s1 = PADConvBlock(stage1_dim, self.FEAT_CH_PER_STAGE)
         self.block_s2 = PADConvBlock(stage2_dim, self.FEAT_CH_PER_STAGE)
         self.gap = nn.AdaptiveAvgPool2d(1)
 
         feat_dim = self.FEAT_CH_PER_STAGE * 2              # 256
-        fusion_in = feat_dim + self.ROUTE_DIM              # 280
+        fusion_in = pad_stem_dim + feat_dim + self.ROUTE_DIM   # 408
 
         self.fusion_mlp = nn.Sequential(
             nn.LayerNorm(fusion_in),
@@ -177,6 +190,7 @@ class PADHead(nn.Module):
         """
         Args:
             inputs: {
+                'pad_stem_feat':     (B, 128),
                 'stage1_feat':       (B, 64, 56, 56),
                 'stage2_feat':       (B, 128, 28, 28),
                 'routing_stats_s2':  {'expert_weights': ..., 'token_entropy': ...},
@@ -190,10 +204,11 @@ class PADHead(nn.Module):
             'pad_logit':     (B, 1),
         }
         """
-        s1 = inputs['stage1_feat']    # (B, 64, 56, 56)
-        s2 = inputs['stage2_feat']    # (B, 128, 28, 28)
+        pad_stem = inputs['pad_stem_feat']    # (B, 128)  — trainable signal
+        s1 = inputs['stage1_feat']            # (B, 64, 56, 56)  — detached
+        s2 = inputs['stage2_feat']            # (B, 128, 28, 28) — detached
 
-        # -- Feature path: conv blocks at full resolution, GAP at the end --
+        # -- Aux feature path: conv blocks at full resolution, GAP at end --
         f1 = self.block_s1(s1)                 # (B, 128, 56, 56)
         f2 = self.block_s2(s2)                 # (B, 128, 28, 28)
         f1 = self.gap(f1).flatten(1)           # (B, 128)
@@ -206,8 +221,10 @@ class PADHead(nn.Module):
         r_s3b = self._extract_routing_features(inputs['routing_stats_s3b'])  # (B, 8)
         route_combined = torch.cat([r_s2, r_s3a, r_s3b], dim=-1)  # (B, 24)
 
-        # -- Fusion --
-        all_features = torch.cat([feat_combined, route_combined], dim=-1)  # (B, 280)
+        # -- Fusion: stem is the primary (trainable) signal, aux + routing join --
+        all_features = torch.cat(
+            [pad_stem, feat_combined, route_combined], dim=-1,
+        )  # (B, 408)
         pad_features = self.fusion_mlp(all_features)  # (B, 128)
 
         # -- Parallel output branches --

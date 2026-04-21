@@ -174,10 +174,32 @@ class FreqGatedMoEFFN(nn.Module):
         ).sum(dim=-1)  # (B, N)
         balance_loss = self._balance_loss(expert_weights)
 
+        # Gate-only routing copy: re-project from a DETACHED gate_input
+        # so downstream consumers (PAD head) can backprop into gate_proj
+        # weights without the gradient escaping upstream into freq_gate
+        # → tokens → backbone. Only needed during training — in eval
+        # we alias the already-computed expert_weights (detached by the
+        # caller anyway) to avoid an extra Linear pass and the
+        # activation memory that comes with it.
+        if self.training:
+            gate_logits_go = self.gate_proj(gate_input.detach())
+            expert_weights_go = F.softmax(
+                gate_logits_go.float() / self.temperature, dim=-1,
+            ).to(gate_logits_go.dtype)
+            token_entropy_go = -(
+                expert_weights_go * (expert_weights_go + 1e-8).log()
+            ).sum(dim=-1)
+        else:
+            expert_weights_go = expert_weights
+            token_entropy_go = token_entropy
+
         routing_stats = {
             "expert_weights": expert_weights,  # (B, N, E)
             "token_entropy": token_entropy,    # (B, N)
             "balance_loss": balance_loss,      # scalar
+            # Gate-only views — grad stops at gate_proj params.
+            "expert_weights_gateonly": expert_weights_go,
+            "token_entropy_gateonly":  token_entropy_go,
         }
 
         return output, routing_stats

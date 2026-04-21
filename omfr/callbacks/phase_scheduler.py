@@ -192,6 +192,14 @@ class PhaseSchedulerCallback(L.Callback):
         pl_module.alpha = 0.0
         pl_module.beta = 0.0
 
+        # Phase 2 graph shape differs from Phase 1 (two head forwards
+        # + orth loss). Free fragmented Phase-1 blocks before the new
+        # allocation pattern settles — prevents creeping OOM a few
+        # epochs into Phase 2.
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         # Do NOT reinitialize pad_head here — it keeps its Phase 1 (identity-only)
         # starting state. Re-xavier-init destroyed warmup progress in prior runs.
 

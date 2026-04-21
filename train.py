@@ -121,6 +121,9 @@ def _prepare_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
     runtime["warmup_epochs"] = phases_cfg.get("warmup_epochs", 5)
     backbone_cfg = config.get("backbone", {})
     runtime["pretrained"] = backbone_cfg.get("pretrained", True)
+    runtime["grad_checkpoint"] = backbone_cfg.get(
+        "grad_checkpoint", config.get("grad_checkpoint", False)
+    )
     return runtime
 
 

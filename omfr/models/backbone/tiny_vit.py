@@ -138,8 +138,10 @@ class TinyViTBackbone(nn.Module):
         num_experts: int = 4,
         top_k: int = 2,
         drop: float = 0.0,
+        use_grad_checkpoint: bool = False,
     ) -> None:
         super().__init__()
+        self.use_grad_checkpoint = use_grad_checkpoint
 
         # Load pretrained TinyViT-5M
         base_model = timm.create_model(
@@ -228,9 +230,21 @@ class TinyViTBackbone(nn.Module):
 
         stage_feats = {}
 
-        # Run through 4 stages, capturing intermediate feature maps
+        # Run through 4 stages, capturing intermediate feature maps.
+        # Optional gradient checkpointing trades ~30% extra compute for
+        # roughly a 2× reduction in activation memory — the primary knob
+        # for fitting Phase 2 (two-head forward + orth loss) on a single
+        # GPU. Non-reentrant checkpointing is required so the MoE side-
+        # channel (wrapper.last_routing_stats) behaves correctly through
+        # the re-forward that happens during backward.
+        use_ckpt = self.use_grad_checkpoint and self.training and x.requires_grad
         for i, stage in enumerate(self.stages):
-            x = stage(x)
+            if use_ckpt:
+                x = torch.utils.checkpoint.checkpoint(
+                    stage, x, use_reentrant=False,
+                )
+            else:
+                x = stage(x)
             # x is (B, C, H, W) after each stage
             stage_feats[i] = x
 
@@ -243,6 +257,12 @@ class TinyViTBackbone(nn.Module):
                 routing_stats[key] = {
                     'expert_weights': stats['expert_weights'],
                     'token_entropy': stats['token_entropy'],
+                    # Gate-only copies: grad stops at gate_proj params.
+                    # Consumed by PADHead when we want to shape the
+                    # gate without leaking PAD grad back into the
+                    # backbone (see OMFRModule._run_pad).
+                    'expert_weights_gateonly': stats['expert_weights_gateonly'],
+                    'token_entropy_gateonly':  stats['token_entropy_gateonly'],
                 }
                 balance_losses.append(stats['balance_loss'])
             else:
