@@ -5,27 +5,25 @@ Manages transitions between OMFR training phases and ramps loss weights.
 
 Phase schedule (default):
     Phase 1: epochs 0-19  (identity foundation)
-    Phase 2: epochs 20-39 (PAD integration, alternating batches)
+    Phase 2: epochs 20-39 (PAD integration, joint batches via TASK_04)
     Phase 3: epochs 40-59 (joint refinement)
 
 Phase 1 warmup (CRITICAL for stability):
-    ArcFace scale:  1.0 → 32.0   (prevents gradient explosion with many classes)
-    ArcFace margin: 0.0 → 0.5    (gradual angular margin introduction)
+    ArcFace scale:  1.0 -> 32.0   (prevents gradient explosion)
+    ArcFace margin: 0.0 -> 0.5    (gradual angular margin introduction)
     Warmup over first `phase1_warmup_epochs` epochs.
 
-Phase 2 ramps:
-    alpha:       0.0 → 1.0   (PAD loss weight)
-    beta:        0.0 → 0.1   (orthogonality loss weight)
-    ArcFace s:   32.0 → 64.0
+Phase 2 ramps (TASK_04 — cosine soft-start):
+    alpha:       0.01 * target -> target over first 5 epochs of Phase 2
+    beta:        0.01 * target -> target (target = 0.05 after TASK_02 re-norm)
+    alpha_adv:   0 -> target over the FULL Phase 2 (DANN-style slow ramp)
+    lam_adv:     sigmoid schedule 2/(1+exp(-10p)) - 1 over full Phase 2
+    ArcFace s:   32.0 -> 64.0
 
-MoE temperature schedule:
+MoE temperature:
     Phase 1: 2.0 (soft routing, exploration)
-    Phase 2: 2.0 → 1.0 (gradual sharpening)
-    Phase 3: 1.0 → 0.5 (sharp routing, specialization)
-
-Dataloader reload:
-    Calls trainer.reset_train_dataloader() at phase transitions to switch
-    from Phase 1 identity-only loader to Phase 2/3 combined loaders.
+    Phase 2: 2.0 -> 1.0 (gradual sharpening)
+    Phase 3: 1.0 -> 0.5 (sharp routing, specialization)
 """
 
 from __future__ import annotations
@@ -50,7 +48,8 @@ class PhaseSchedulerCallback(L.Callback):
         phase1_warmup_epochs: int = 5,
         phase1_warmup_delay: int = 5,
         alpha_target: float = 1.0,
-        beta_target: float = 0.1,
+        beta_target: float = 0.05,
+        alpha_adv_target: float = 0.1,
         arcface_scale_init: float = 1.0,
         arcface_scale_start: float = 32.0,
         arcface_scale_end: float = 64.0,
@@ -69,6 +68,7 @@ class PhaseSchedulerCallback(L.Callback):
         self.phase1_warmup_delay = phase1_warmup_delay
         self.alpha_target = alpha_target
         self.beta_target = beta_target
+        self.alpha_adv_target = alpha_adv_target
         self.arcface_scale_init = arcface_scale_init
         self.arcface_scale_start = arcface_scale_start
         self.arcface_scale_end = arcface_scale_end
@@ -82,6 +82,37 @@ class PhaseSchedulerCallback(L.Callback):
         self._phase3_start = phase1_epochs + phase2_epochs
 
     # ------------------------------------------------------------------
+    # Ramp helper
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _cosine_ramp(
+        epoch: int,
+        start: int,
+        end: int,
+        target: float,
+        min_frac: float = 0.01,
+    ) -> float:
+        """Cosine ramp from min_frac*target (epoch=start) to target (epoch>=end)."""
+        if epoch < start:
+            return 0.0
+        if epoch >= end:
+            return target
+        p = (epoch - start) / max(end - start, 1)
+        ramp = 0.5 * (1.0 - math.cos(math.pi * p))
+        return target * (min_frac + (1.0 - min_frac) * ramp)
+
+    @staticmethod
+    def _dann_lambda(epoch: int, start: int, end: int) -> float:
+        """DANN schedule lam(p) = 2/(1+exp(-10p)) - 1, p in [0, 1]."""
+        if epoch < start:
+            return 0.0
+        if epoch >= end:
+            return 1.0
+        p = (epoch - start) / max(end - start, 1)
+        return 2.0 / (1.0 + math.exp(-10.0 * p)) - 1.0
+
+    # ------------------------------------------------------------------
     # Lightning callback hooks
     # ------------------------------------------------------------------
 
@@ -92,32 +123,32 @@ class PhaseSchedulerCallback(L.Callback):
     ) -> None:
         epoch = trainer.current_epoch
 
-        # ── Phase transitions ──
+        # Phase transitions
         if epoch == self._phase2_start:
             self._transition_to_phase2(pl_module, trainer)
         elif epoch == self._phase3_start:
             self._transition_to_phase3(pl_module, trainer)
 
-        # ── Phase 1: ArcFace scale/margin warmup + MoE temp ──
-        # Delayed ArcFace warmup: hold s=1, m=0 until LR warmup completes,
-        # then ramp linearly over `phase1_warmup_epochs` epochs. This prevents
-        # gradient explosion when LR is still tiny and embeddings are random.
+        # Phase 1: ArcFace warmup + MoE temp
         if pl_module.current_phase == 1:
             delay = max(self.phase1_warmup_delay, 0)
             effective_epoch = max(epoch - delay, 0)
             p1_progress = min(effective_epoch / max(self.phase1_warmup_epochs, 1), 1.0)
 
-            # Scale: 1.0 → 32.0 over warmup (after delay)
             scale = self.arcface_scale_init + p1_progress * (
                 self.arcface_scale_start - self.arcface_scale_init
             )
-            # Margin: 0.0 → 0.5 over warmup (after delay)
             margin = self.arcface_margin_init + p1_progress * (
                 self.arcface_margin_target - self.arcface_margin_init
             )
             for af_loss in pl_module.arcface_losses.values():
                 af_loss.set_scale(scale)
                 af_loss.set_margin(margin)
+
+            pl_module.alpha = 0.0
+            pl_module.beta = 0.0
+            pl_module.alpha_adv = 0.0
+            pl_module.lam_adv = 0.0
 
             self._set_moe_temperature(pl_module, self.moe_temp_phase1)
 
@@ -131,23 +162,42 @@ class PhaseSchedulerCallback(L.Callback):
                 step=trainer.global_step,
             )
 
-        # ── Ramp scheduling within Phase 2 ──
+        # Phase 2: cosine soft-start on alpha/beta (5-epoch ramp),
+        # sigmoid DANN ramp on lam_adv over full Phase 2, cosine ramp
+        # on alpha_adv over full Phase 2.
         if pl_module.current_phase == 2:
-            phase2_epoch = epoch - self._phase2_start
-            progress = min(phase2_epoch / max(self.warmup_epochs, 1), 1.0)
-            phase2_progress = min(phase2_epoch / max(self.phase2_epochs - 1, 1), 1.0)
+            phase2_start = self._phase2_start
+            phase2_end   = self._phase2_start + self.phase2_epochs
+            ramp_end_short = min(phase2_start + 5, phase2_end)
 
-            pl_module.alpha = progress * self.alpha_target
-            pl_module.beta = progress * self.beta_target
+            pl_module.alpha = self._cosine_ramp(
+                epoch, phase2_start, ramp_end_short, self.alpha_target,
+            )
+            pl_module.beta = self._cosine_ramp(
+                epoch, phase2_start, ramp_end_short, self.beta_target,
+            )
+            pl_module.alpha_adv = self._cosine_ramp(
+                epoch, phase2_start, phase2_end, self.alpha_adv_target,
+            )
+            pl_module.lam_adv = self._dann_lambda(epoch, phase2_start, phase2_end)
 
-            new_scale = self.arcface_scale_start + progress * (
+            # ArcFace scale: 32 -> 64 over the short warmup too (tied to
+            # identity stability). Safer than stretching it over full P2.
+            scale_progress = self._cosine_ramp(
+                epoch, phase2_start, ramp_end_short, 1.0, min_frac=0.0,
+            )
+            new_scale = self.arcface_scale_start + scale_progress * (
                 self.arcface_scale_end - self.arcface_scale_start
             )
             for af_loss in pl_module.arcface_losses.values():
                 af_loss.set_scale(new_scale)
 
-            # MoE temperature: 2.0 → 1.0 over Phase 2
-            moe_temp = self.moe_temp_phase1 + phase2_progress * (
+            # MoE temperature: linear 2.0 -> 1.0 across Phase 2
+            p2_progress = min(
+                (epoch - phase2_start) / max(self.phase2_epochs - 1, 1),
+                1.0,
+            )
+            moe_temp = self.moe_temp_phase1 + p2_progress * (
                 self.moe_temp_phase2_end - self.moe_temp_phase1
             )
             self._set_moe_temperature(pl_module, moe_temp)
@@ -156,6 +206,8 @@ class PhaseSchedulerCallback(L.Callback):
                 {
                     "phase/alpha": pl_module.alpha,
                     "phase/beta": pl_module.beta,
+                    "phase/alpha_adv": pl_module.alpha_adv,
+                    "phase/lam_adv": pl_module.lam_adv,
                     "phase/arcface_scale": new_scale,
                     "phase/moe_temperature": moe_temp,
                     "phase/current": 2.0,
@@ -163,12 +215,16 @@ class PhaseSchedulerCallback(L.Callback):
                 step=trainer.global_step,
             )
 
-        # ── Ramp scheduling within Phase 3 ──
+        # Phase 3: everything at target, only MoE temp keeps decaying.
         if pl_module.current_phase == 3:
             phase3_epoch = epoch - self._phase3_start
             phase3_progress = min(phase3_epoch / max(self.phase3_epochs - 1, 1), 1.0)
 
-            # MoE temperature: 1.0 → 0.5 over Phase 3
+            pl_module.alpha = self.alpha_target
+            pl_module.beta = self.beta_target
+            pl_module.alpha_adv = self.alpha_adv_target
+            pl_module.lam_adv = 1.0
+
             moe_temp = self.moe_temp_phase2_end + phase3_progress * (
                 self.moe_temp_phase3_end - self.moe_temp_phase2_end
             )
@@ -176,6 +232,10 @@ class PhaseSchedulerCallback(L.Callback):
 
             trainer.logger.log_metrics(
                 {
+                    "phase/alpha": pl_module.alpha,
+                    "phase/beta": pl_module.beta,
+                    "phase/alpha_adv": pl_module.alpha_adv,
+                    "phase/lam_adv": pl_module.lam_adv,
                     "phase/moe_temperature": moe_temp,
                     "phase/current": 3.0,
                 },
@@ -187,93 +247,68 @@ class PhaseSchedulerCallback(L.Callback):
     # ------------------------------------------------------------------
 
     def _transition_to_phase2(self, pl_module: Any, trainer: L.Trainer) -> None:
-        """Phase 1 → Phase 2: introduce PAD head, reset alpha/beta to 0."""
+        """Phase 1 -> Phase 2: swap loader, reset ramped weights to near-zero."""
         pl_module.current_phase = 2
         pl_module.alpha = 0.0
         pl_module.beta = 0.0
+        pl_module.alpha_adv = 0.0
+        pl_module.lam_adv = 0.0
 
-        # Phase 2 graph shape differs from Phase 1 (two head forwards
-        # + orth loss). Free fragmented Phase-1 blocks before the new
-        # allocation pattern settles — prevents creeping OOM a few
-        # epochs into Phase 2.
+        # Phase 2 activation-memory pattern differs from Phase 1. Free
+        # fragmented Phase-1 blocks before the new pattern settles.
         import torch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # Do NOT reinitialize pad_head here — it keeps its Phase 1 (identity-only)
-        # starting state. Re-xavier-init destroyed warmup progress in prior runs.
-
-        # Set ArcFace scale to Phase 2 start, margin locked at target
         for af_loss in pl_module.arcface_losses.values():
             af_loss.set_scale(self.arcface_scale_start)
             af_loss.set_margin(self.arcface_margin_target)
 
-        # MoE temperature starts at Phase 1 value, will ramp down
         self._set_moe_temperature(pl_module, self.moe_temp_phase1)
 
-        # CRITICAL: Reload dataloaders to switch from identity-only to combined
+        # Reload dataloaders to switch from identity-only to combined
         if hasattr(trainer, "datamodule") and trainer.datamodule is not None:
             trainer.datamodule.current_phase = 2
-        # Force Lightning 2.x to re-call train_dataloader()
-        # setup_data() already ran in on_advance_start before this callback,
-        # so we must clear AND rebuild immediately.
         trainer.fit_loop._combined_loader = None
         trainer.fit_loop.setup_data()
 
         print(
-            f"\n{'═'*60}\n"
+            f"\n{'='*60}\n"
             f"  PHASE 2 START (epoch {trainer.current_epoch})\n"
-            f"  Introducing PAD objective — alternating ID/PAD batches\n"
-            f"  Dataloader RELOADED for combined ID+PAD batches\n"
-            f"  ArcFace scale ramp: {self.arcface_scale_start} → {self.arcface_scale_end}\n"
-            f"  MoE temperature ramp: {self.moe_temp_phase1} → {self.moe_temp_phase2_end}\n"
-            f"{'═'*60}\n"
+            f"  Joint ID+PAD batches (TASK_04)\n"
+            f"  alpha target: {self.alpha_target}, beta target: {self.beta_target}\n"
+            f"  alpha_adv target: {self.alpha_adv_target}\n"
+            f"  Cosine soft-start over first 5 epochs; DANN ramp over full P2\n"
+            f"{'='*60}\n"
         )
 
     def _transition_to_phase3(self, pl_module: Any, trainer: L.Trainer) -> None:
-        """Phase 2 → Phase 3: lock alpha/beta at final values, enable joint batches."""
         pl_module.current_phase = 3
         pl_module.alpha = self.alpha_target
         pl_module.beta = self.beta_target
+        pl_module.alpha_adv = self.alpha_adv_target
+        pl_module.lam_adv = 1.0
 
         for af_loss in pl_module.arcface_losses.values():
             af_loss.set_scale(self.arcface_scale_end)
 
-        # MoE temperature starts at Phase 2 end value, will ramp down
         self._set_moe_temperature(pl_module, self.moe_temp_phase2_end)
 
-        # CRITICAL: Reload dataloaders for Phase 3 combined loader
         if hasattr(trainer, "datamodule") and trainer.datamodule is not None:
             trainer.datamodule.current_phase = 3
-        # Force Lightning 2.x to re-call train_dataloader()
         trainer.fit_loop._combined_loader = None
         trainer.fit_loop.setup_data()
 
         print(
-            f"\n{'═'*60}\n"
+            f"\n{'='*60}\n"
             f"  PHASE 3 START (epoch {trainer.current_epoch})\n"
-            f"  Joint refinement — all dataset types active\n"
-            f"  Dataloader RELOADED for joint batches\n"
-            f"  alpha={pl_module.alpha:.2f}, beta={pl_module.beta:.2f}\n"
-            f"  MoE temperature ramp: {self.moe_temp_phase2_end} → {self.moe_temp_phase3_end}\n"
-            f"{'═'*60}\n"
+            f"  Joint refinement — all losses at target\n"
+            f"  alpha={pl_module.alpha}, beta={pl_module.beta}, "
+            f"alpha_adv={pl_module.alpha_adv}\n"
+            f"{'='*60}\n"
         )
 
     @staticmethod
     def _set_moe_temperature(pl_module: Any, temperature: float) -> None:
-        """Set MoE routing temperature on the backbone."""
         if hasattr(pl_module, 'backbone') and hasattr(pl_module.backbone, 'set_moe_temperature'):
             pl_module.backbone.set_moe_temperature(temperature)
-
-    @staticmethod
-    def _xavier_init(module: Any) -> None:
-        """Xavier uniform init for Linear layers, zero init for biases."""
-        import torch.nn as nn
-
-        if isinstance(module, nn.Linear):
-            nn.init.xavier_uniform_(module.weight)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.LayerNorm):
-            nn.init.ones_(module.weight)
-            nn.init.zeros_(module.bias)

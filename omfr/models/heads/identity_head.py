@@ -20,14 +20,8 @@ v3 rationale:
     concatenated with the native 7x7 stage4 grid, yielding only 49 tokens.
     Two problems:
 
-      1. Pooling 14x14 -> 7x7 averages 2x2 windows of stage3. Fingerprint
-         minutiae (ridge endings, bifurcations) occupy a handful of pixels
-         at this resolution; averaging them away removes the very signal
-         the identity head needs to separate close-looking prints.
-      2. With only 49 tokens, a single attention layer already gives every
-         token a global receptive field. Stacking 3 decoder blocks adds
-         redundant depth and inflates gradient norms (a known contributor
-         to the ArcFace gradient explosion observed in Phase 2/3).
+      1. Pooling 14x14 -> 7x7 averages 2x2 windows of stage3. Fingerprint minutiae (ridge endings, bifurcations) occupy a handful of pixels at this resolution; averaging them away removes the very signal the identity head needs to separate close-looking prints.
+      2. With only 49 tokens, a single attention layer already gives every token a global receptive field. Stacking 3 decoder blocks adds redundant depth and inflates gradient norms (a known contributor to the ArcFace gradient explosion observed in Phase 2/3).
 
     v3 upsamples stage4 (7x7 -> 14x14) instead, keeps 196 tokens at the
     stage3 resolution, and runs a single StructuralAttentionBlock over

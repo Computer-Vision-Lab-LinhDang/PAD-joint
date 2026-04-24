@@ -31,7 +31,6 @@ def make_pad_train_transform(image_size: int = 224) -> T.Compose:
     """
     return T.Compose([
         T.RandomHorizontalFlip(p=0.5),
-        T.RandomVerticalFlip(p=0.3),
         T.RandomApply(
             [T.RandomRotation(degrees=15, fill=0.0)],
             p=0.7,
@@ -48,6 +47,7 @@ def make_pad_train_transform(image_size: int = 224) -> T.Compose:
         T.RandomErasing(
             p=0.25, scale=(0.02, 0.15), ratio=(0.3, 3.3), value=0.0,
         ),
+        T.Normalize(mean=[0.5], std=[0.5]),
     ])
 
 
@@ -84,6 +84,21 @@ class PADDataset(Dataset):
     SPOOF_DIRS = {'fake', 'Fake', 'FAKE', 'Spoof', 'spoof'}
     IMG_EXTS   = {'.bmp', '.png', '.jpg', '.jpeg', '.tif', '.tiff'}
 
+    # Ordered sensor list — index in this tuple is the sensor_id integer
+    # used by the adversarial head (TASK_03). Append to the END only so
+    # indices stay stable across runs.
+    SENSOR_NAMES = (
+        'Biometrika',
+        'CrossMatch',
+        'DigitalPersona',
+        'GreenBit',
+        'HiScan',
+        'Italdata',
+        'Swipe',
+        'Orcanthus',
+        'Unknown',
+    )
+
     LABEL_LIVE  = 1
     LABEL_SPOOF = 0
     SPLIT_DIR_ALIASES = {
@@ -118,7 +133,8 @@ class PADDataset(Dataset):
         self.dataset_name = dataset_name
         self.sensor = sensor
 
-        self.samples: List[Tuple[Path, int]] = []   # (path, label)
+        # (path, label, sensor_id) — sensor_id is index into SENSOR_NAMES
+        self.samples: List[Tuple[Path, int, int]] = []
         self._load_samples()
 
     # ------------------------------------------------------------------
@@ -151,7 +167,10 @@ class PADDataset(Dataset):
                 path = root / rel_path
                 label = self.LABEL_LIVE if label_str.lower() in {'live', '1', 'alive'} else self.LABEL_SPOOF
                 if path.is_file() and path.suffix.lower() in self.IMG_EXTS:
-                    self.samples.append((path, label))
+                    sensor_id = int(row.get('sensor_id', -1))
+                    if sensor_id < 0:
+                        sensor_id = self._infer_sensor_id(path, root)
+                    self.samples.append((path, label, sensor_id))
 
     def _load_from_directory(self, root: Path):
         scan_root = self._resolve_split_root(root)
@@ -172,7 +191,22 @@ class PADDataset(Dataset):
                 if self.sensor and not self._matches_sensor(img_path, scan_root):
                     continue
 
-                self.samples.append((img_path, label))
+                sensor_id = self._infer_sensor_id(img_path, scan_root)
+                self.samples.append((img_path, label, sensor_id))
+
+    def _infer_sensor_id(self, path: Path, scan_root: Path) -> int:
+        """Walk ancestors until a directory matches a known sensor name.
+        Falls back to the 'Unknown' index."""
+        normalized_targets = {
+            self._normalize_sensor_name(name): idx
+            for idx, name in enumerate(self.SENSOR_NAMES)
+        }
+        unknown_idx = self.SENSOR_NAMES.index('Unknown')
+        for ancestor in self._ancestors_until(path.parent, scan_root):
+            idx = normalized_targets.get(self._normalize_sensor_name(ancestor.name))
+            if idx is not None:
+                return idx
+        return unknown_idx
 
     def _resolve_split_root(self, root: Path) -> Path:
         for split_name in self._iter_split_candidates():
@@ -234,8 +268,12 @@ class PADDataset(Dataset):
 
     def _load_image(self, path: Path) -> torch.Tensor:
         img = Image.open(path).convert('L')
-        img = img.resize((self.image_size, self.image_size), Image.BILINEAR)
-        return TF.to_tensor(img)                        # (1, H, W)
+        tensor = TF.to_tensor(img)                      # (1, H, W)
+        tensor = TF.resize(
+            tensor, self.image_size, antialias=True,
+        )                                                # resize short edge
+        tensor = TF.center_crop(tensor, self.image_size)
+        return tensor
 
     # ------------------------------------------------------------------
 
@@ -243,7 +281,7 @@ class PADDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        path, label = self.samples[idx]
+        path, label, sensor_id = self.samples[idx]
         try:
             image = self._load_image(path)
         except (OSError, IOError):
@@ -256,15 +294,23 @@ class PADDataset(Dataset):
         return {
             'images': image,
             'liveness_labels': torch.tensor(label, dtype=torch.long),
+            'sensor_labels': torch.tensor(sensor_id, dtype=torch.long),
         }
 
     @property
     def num_live(self) -> int:
-        return sum(1 for _, l in self.samples if l == self.LABEL_LIVE)
+        return sum(1 for _, l, _ in self.samples if l == self.LABEL_LIVE)
 
     @property
     def num_spoof(self) -> int:
-        return sum(1 for _, l in self.samples if l == self.LABEL_SPOOF)
+        return sum(1 for _, l, _ in self.samples if l == self.LABEL_SPOOF)
 
     def get_liveness_labels(self) -> List[int]:
-        return [label for _, label in self.samples]
+        return [label for _, label, _ in self.samples]
+
+    def get_sensor_labels(self) -> List[int]:
+        return [sensor for _, _, sensor in self.samples]
+
+    @property
+    def num_sensors(self) -> int:
+        return len(self.SENSOR_NAMES)

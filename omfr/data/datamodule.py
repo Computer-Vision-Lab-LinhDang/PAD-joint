@@ -70,6 +70,7 @@ class OMFRDataModule(L.LightningDataModule):
         from omfr.data.datasets.identity_dataset import IdentityDataset
         from omfr.data.datasets.pad_dataset import PADDataset, make_pad_train_transform
         from omfr.data.datasets.joint_dataset import JointDataset
+        from omfr.data.transforms import get_transforms
 
         identity_root = self._cfg_get("identity_root", "data.identity_data_root", default="")
         pad_root      = self._cfg_get("pad_root", "data.pad_data_root", default="")
@@ -82,12 +83,26 @@ class OMFRDataModule(L.LightningDataModule):
         group_by_subject = bool(self._cfg_get(
             "group_by_subject", "data.group_by_subject", default=False,
         ))
+        identity_num_views = int(self._cfg_get(
+            "identity_num_views", "data.identity_num_views", default=2,
+        ))
+        identity_preset = str(self._cfg_get(
+            "identity_preset", "data.identity_preset", default="fingerprint_hard",
+        ))
+        image_size = int(self._cfg_get(
+            "image_size", "data.image_size", default=224,
+        ))
 
         if stage in ("fit", None):
             if identity_root:
                 self.identity_ds = IdentityDataset(
                     root=identity_root, split="train",
                     group_by_subject=group_by_subject,
+                    num_views=identity_num_views,
+                    transform=get_transforms(
+                        'train', output_size=image_size, preset=identity_preset,
+                    ),
+                    image_size=image_size,
                 )
             if pad_roots:
                 pad_image_size = int(self._cfg_get(

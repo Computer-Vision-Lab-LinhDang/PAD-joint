@@ -263,6 +263,11 @@ class TinyViTBackbone(nn.Module):
                     # backbone (see OMFRModule._run_pad).
                     'expert_weights_gateonly': stats['expert_weights_gateonly'],
                     'token_entropy_gateonly':  stats['token_entropy_gateonly'],
+                    # Raw 3-band frequency energy (detached in moe_ffn).
+                    # Bypasses the Temperature-collapse problem: at T=0.5
+                    # token_entropy saturates near 0, so PAD needs a
+                    # pre-softmax signal. Shape: (B, N, 3).
+                    'gate_input_gateonly': stats['gate_input_gateonly'],
                 }
                 balance_losses.append(stats['balance_loss'])
             else:

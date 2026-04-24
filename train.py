@@ -116,7 +116,7 @@ def _prepare_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "identity_supcon_weight", config.get("identity_supcon_weight", 0.7)
     )
     runtime["identity_arcface_weight"] = losses_cfg.get(
-        "identity_arcface_weight", config.get("identity_arcface_weight", 0.3)
+        "identity_arcface_weight", config.get("identity_arcface_weight", 0.1)
     )
     runtime["warmup_epochs"] = phases_cfg.get("warmup_epochs", 5)
     backbone_cfg = config.get("backbone", {})
@@ -161,7 +161,8 @@ def build_callbacks(config: Dict[str, Any]) -> list:
         phase1_warmup_epochs=phase_cfg.get("phase1_warmup_epochs", 5),
         phase1_warmup_delay=phase_cfg.get("phase1_warmup_delay", 5),
         alpha_target=phase_cfg.get("alpha_target", 1.0),
-        beta_target=phase_cfg.get("beta_target", 0.1),
+        beta_target=phase_cfg.get("beta_target", 0.05),
+        alpha_adv_target=phase_cfg.get("alpha_adv_target", 0.1),
         arcface_scale_init=phase_cfg.get("arcface_scale_init", 1.0),
         arcface_scale_start=phase_cfg.get("arcface_scale_start", 32.0),
         arcface_scale_end=phase_cfg.get("arcface_scale_end", 64.0),

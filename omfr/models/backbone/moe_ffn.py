@@ -164,7 +164,10 @@ class FreqGatedMoEFFN(nn.Module):
                 idx = mask.nonzero(as_tuple=False).squeeze(-1)
                 expert_out = self.experts[e_idx](tokens_flat.index_select(0, idx))
                 weighted = weight_k.index_select(0, idx).unsqueeze(-1) * expert_out
-                output_flat = output_flat.index_add(0, idx, weighted)
+                # index_add requires matching scalar types. Under AMP, the
+                # Linear experts can emit fp32 while output_flat tracks the
+                # input dtype (fp16), so cast back to keep them aligned.
+                output_flat = output_flat.index_add(0, idx, weighted.to(output_flat.dtype))
 
         output = output_flat.reshape(B, N, D)
 
@@ -200,6 +203,8 @@ class FreqGatedMoEFFN(nn.Module):
             # Gate-only views — grad stops at gate_proj params.
             "expert_weights_gateonly": expert_weights_go,
             "token_entropy_gateonly":  token_entropy_go,
+            # Thêm tín hiệu gốc (3 dải tần) để cứu nhánh PAD khỏi bẫy Temperature
+            "gate_input_gateonly": gate_input.detach(), # <--- THÊM DÒNG NÀY, 
         }
 
         return output, routing_stats

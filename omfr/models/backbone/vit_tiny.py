@@ -195,8 +195,15 @@ class TransformerBlock(nn.Module):
             # MoE FFN operates only on spatial tokens (excluding CLS at pos 0)
             cls_tok = normed[:, :1, :]      # (B, 1, D)
             spatial_tok = normed[:, 1:, :]  # (B, 196, D)
+            
+            # [NEW] Tính toán kích thước không gian (spatial_h, spatial_w)
+            # Vì tổng số patch là 196, nên chiều dài/rộng là căn bậc 2 của 196 = 14
+            spatial_len = spatial_tok.shape[1]
+            spatial_h = int(math.sqrt(spatial_len))
+            spatial_w = spatial_h
 
-            ffn_out, routing_stats = self.ffn(spatial_tok)  # (B, 196, D)
+            # [NEW] Truyền đầy đủ 3 tham số vào cho ffn
+            ffn_out, routing_stats = self.ffn(spatial_tok, spatial_h, spatial_w)
 
             # Reassemble: CLS goes through identity (no MoE for CLS)
             cls_residual = x[:, :1, :]  # original CLS (before norm)
@@ -207,9 +214,6 @@ class TransformerBlock(nn.Module):
             ], dim=1)
 
             return x, routing_stats
-        else:
-            x = x + self.ffn(normed)
-            return x, None
 
 
 # ---------------------------------------------------------------------------

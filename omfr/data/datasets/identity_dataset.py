@@ -76,6 +76,7 @@ class IdentityDataset(Dataset):
         image_size: int = 224,
         dataset_name: str = 'NIST_SD302',
         group_by_subject: bool = False,
+        num_views: int = 1,
     ):
         super().__init__()
         self.root = Path(root)
@@ -84,6 +85,7 @@ class IdentityDataset(Dataset):
         self.image_size = image_size
         self.dataset_name = dataset_name
         self.group_by_subject = group_by_subject
+        self.num_views = max(int(num_views), 1)
 
         self.samples: List[Tuple[Path, int]] = []   # (image_path, class_idx)
         self.class_to_idx: Dict[str, int] = {}
@@ -186,11 +188,30 @@ class IdentityDataset(Dataset):
         except (OSError, IOError):
             return self.__getitem__((idx + 1) % len(self.samples))
 
-        if self.transform is not None:
-            image = self.transform(image)
+        # Single-view path: standard transform-or-passthrough.
+        if self.num_views <= 1:
+            if self.transform is not None:
+                image = self.transform(image)
+            return {
+                'images': image,                        # (1, H, W)
+                'identity_labels': torch.tensor(label, dtype=torch.long),
+            }
 
+        # Multi-view: stack V independently-augmented copies. Without a
+        # stochastic transform the views are identical, which defeats
+        # multi-view SupCon — fall back to single-view in that case.
+        if self.transform is None:
+            return {
+                'images': image,
+                'identity_labels': torch.tensor(label, dtype=torch.long),
+            }
+
+        views = torch.stack(
+            [self.transform(image) for _ in range(self.num_views)],
+            dim=0,
+        )                                               # (V, 1, H, W)
         return {
-            'images': image,                            # (1, H, W)
+            'images': views,
             'identity_labels': torch.tensor(label, dtype=torch.long),
         }
 
@@ -209,6 +230,7 @@ def build_identity_dataset(
     image_size: int = 224,
     dataset_name: str = 'NIST_SD302',
     group_by_subject: bool = False,
+    num_views: int = 1,
 ) -> IdentityDataset:
     """Convenience factory."""
     return IdentityDataset(
@@ -218,4 +240,5 @@ def build_identity_dataset(
         image_size=image_size,
         dataset_name=dataset_name,
         group_by_subject=group_by_subject,
+        num_views=num_views,
     )

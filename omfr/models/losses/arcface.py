@@ -74,34 +74,32 @@ class ArcFaceLoss(nn.Module):
         Returns:
             loss: scalar
         """
-        # Normalize weight matrix
-        w_norm = F.normalize(self.weight, p=2, dim=1)  # (num_classes, embedding_dim)
+        # Promote to fp32 for the whole margin computation. In 16-mixed,
+        # after clamp(-1+1e-7, 1-1e-7) the value `1 - cos^2` falls to ~2e-7,
+        # which is below fp16's min-normal (6.1e-5) and underflows to 0 or
+        # denormal — sqrt then yields NaN and propagates through phi -> CE.
+        emb32 = embeddings.float()
+        w32 = self.weight.float()
+        w_norm = F.normalize(w32, p=2, dim=1)  # (num_classes, embedding_dim)
 
-        # Cosine similarity: embeddings assumed already L2-normalized
-        cosine = F.linear(embeddings, w_norm)  # (B, num_classes)
+        cosine = F.linear(emb32, w_norm)       # (B, num_classes)
         cosine = cosine.clamp(-1.0 + 1e-7, 1.0 - 1e-7)
 
-        # sin(θ) = sqrt(1 - cos²(θ))
-        sine = torch.sqrt(1.0 - cosine.pow(2))
+        # sin(θ) = sqrt(1 - cos²(θ)) — clamp the radicand too as a belt
+        # against any residual fp32 cancellation.
+        sine = torch.sqrt((1.0 - cosine.pow(2)).clamp(min=0.0))
 
-        # cos(θ + m) = cos(θ)·cos(m) - sin(θ)·sin(m)
         phi = cosine * self.cos_m - sine * self.sin_m
 
         if self.easy_margin:
-            # Use cos(θ + m) only when θ + m < π (i.e., cos(θ) > 0)
             phi = torch.where(cosine > 0, phi, cosine)
         else:
-            # Standard: use cos(θ + m) when cos(θ) > threshold, else linear fallback
             phi = torch.where(cosine > self.threshold, phi, cosine - self.mm)
 
-        # One-hot encode labels and build logit tensor
         one_hot = torch.zeros_like(cosine)
         one_hot.scatter_(1, labels.unsqueeze(1), 1.0)
 
-        # For target class: use phi; for non-target: use cosine
         output = one_hot * phi + (1.0 - one_hot) * cosine
-
-        # Scale and compute cross-entropy
         output = output * self.s
         return self.ce(output, labels)
 

@@ -5,9 +5,9 @@ Input: {
     'pad_stem_feat':     (B, 128),              # from PADStem (TRAINABLE)
     'stage1_feat':       (B, 64, 56, 56),       # detached backbone feature
     'stage2_feat':       (B, 128, 28, 28),      # detached backbone feature
-    'routing_stats_s2':  {'expert_weights': (B, 784, 4), 'token_entropy': (B, 784)},
-    'routing_stats_s3a': {'expert_weights': (B, 196, 4), 'token_entropy': (B, 196)},
-    'routing_stats_s3b': {'expert_weights': (B, 196, 4), 'token_entropy': (B, 196)},
+    'routing_stats_s2':  {'expert_weights': ..., 'token_entropy': ..., 'gate_input_gateonly': (B, 784, 3)},
+    'routing_stats_s3a': {'expert_weights': ..., 'token_entropy': ..., 'gate_input_gateonly': (B, 196, 3)},
+    'routing_stats_s3b': {'expert_weights': ..., 'token_entropy': ..., 'gate_input_gateonly': (B, 196, 3)},
 }
 
 Output: {
@@ -16,27 +16,11 @@ Output: {
     'pad_features':  (B, 128),   # Pre-projection features for SupCon
 }
 
-v4 rationale:
-    v3 introduced depthwise-separable conv blocks on stage1/stage2 and
-    killed the 2.4M Flatten+Linear explosion. On top of that, v4 adds a
-    dedicated PAD stem (see backbone/pad_stem.py) that reads the Gabor
-    output directly and produces a 128-D liveness vector. This is the
-    ONLY PAD feature path that remains connected to the autograd graph:
-    stage1/stage2 feature maps (and MoE routing stats) are detached in
-    OMFRModule._run_pad, so the TinyViT backbone is shaped exclusively
-    by L_identity. Without this parallel stem, PAD had to latch onto
-    identity-shaped features alone and collapsed on held-out sensors
-    (BPCER ~80%). With the stem, the PAD objective owns a small (~200K)
-    trainable extractor of its own while the detached backbone features
-    act as structural context.
-
-    v3 feature-path rationale (still applies):
-      * DS conv blocks preserve spatial structure (no premature 8x8
-        averaging) so micro-texture cues (print noise, pores, silicon
-        grain) survive into fusion.
-      * Linear projection of 6272-D per stage would mean ~2.4M params
-        driving severe overfit. DS conv + deferred GAP cuts that to
-        ~30K per stage.
+[NEW] v4.1 Update:
+    Added 3-band frequency energy (gate_input) directly to the routing stats.
+    This bypasses the MoE Softmax temperature collapse (T=0.5) that previously
+    squashed token_entropy to 0. PAD now extracts statistical features (mean,
+    std, max, min) for each frequency band, adding 12 robust features per MoE layer.
 """
 
 import torch
@@ -50,10 +34,6 @@ class PADConvBlock(nn.Module):
     Depthwise-separable conv block preserving spatial resolution.
 
     Flow: DW3x3 -> GN -> GELU -> PW1x1 -> GN -> GELU -> DW3x3 -> GN -> GELU
-
-    Uses GroupNorm instead of BatchNorm: PAD data spans multiple sensors
-    and datasets, so BN running stats drift between train and test
-    distributions. GN is batch-size and distribution independent.
     """
 
     def __init__(self, in_ch: int, out_ch: int):
@@ -93,7 +73,7 @@ class PADHead(nn.Module):
     """
     Multi-scale feature aggregation + dedicated PAD stem + MoE routing.
 
-    Architecture (v4):
+    Architecture (v4.1):
         -- PAD stem path (TRAINABLE, runs upstream in OMFRModule) --
         pad_stem_feat (B, 128)
 
@@ -102,14 +82,15 @@ class PADHead(nn.Module):
         stage2_feat (B,128,28,28) -> PADConvBlock(128->128) -> GAP -> (B,128)
         -> concat -> (B, 256)
 
-        -- Routing path (8 features per MoE layer x 3 layers = 24) --
+        -- Routing path (20 features per MoE layer x 3 layers = 60) -- [NEW]
         Per MoE layer:
             expert_weights: mean over tokens -> (B, 4)
             token_entropy:  [mean, std, max, min] -> (B, 4)
-        -> concat all 3 layers -> (B, 24)
+            gate_input:     [mean, std, max, min] x 3 bands -> (B, 12)
+        -> concat all 3 layers -> (B, 60)
 
         -- Fusion --
-        concat(pad_stem_128, feature_256, routing_24) -> (B, 408)
+        concat(pad_stem_128, feature_256, routing_60) -> (B, 444) [NEW]
         -> LayerNorm -> MLP -> pad_features (B, 128)
 
         -- Two PARALLEL output branches --
@@ -119,9 +100,14 @@ class PADHead(nn.Module):
 
     FEAT_CH_PER_STAGE = 128
     PAD_STEM_DIM = 256
-    ROUTE_DIM_PER_LAYER = 8   # 4 expert mean + 4 entropy stats
+    
+    # [NEW] Updated dimension: 4 expert + 4 entropy + 12 gate_input (3 bands * 4 stats) = 20
+    ROUTE_DIM_PER_LAYER = 20   
     NUM_MOE_LAYERS = 3
-    ROUTE_DIM = ROUTE_DIM_PER_LAYER * NUM_MOE_LAYERS   # 24
+    
+    # [NEW] 20 * 3 = 60
+    ROUTE_DIM = ROUTE_DIM_PER_LAYER * NUM_MOE_LAYERS   
+    
     PAD_FEATURES_DIM = 128
     PAD_EMBEDDING_DIM = 32
 
@@ -136,14 +122,15 @@ class PADHead(nn.Module):
 
         self.pad_stem_dim = pad_stem_dim
 
-        # Aux feature path on detached backbone stages — DS blocks preserve
-        # spatial layout, GAP is deferred to the very end of each stage.
+        # Aux feature path on detached backbone stages
         self.block_s1 = PADConvBlock(stage1_dim, self.FEAT_CH_PER_STAGE)
         self.block_s2 = PADConvBlock(stage2_dim, self.FEAT_CH_PER_STAGE)
         self.gap = nn.AdaptiveAvgPool2d(1)
 
         feat_dim = self.FEAT_CH_PER_STAGE * 2              # 256
-        fusion_in = pad_stem_dim + feat_dim + self.ROUTE_DIM   # 408
+        
+        # [NEW] fusion_in automatically adapts to 128 + 256 + 60 = 444
+        fusion_in = pad_stem_dim + feat_dim + self.ROUTE_DIM   
 
         self.fusion_mlp = nn.Sequential(
             nn.LayerNorm(fusion_in),
@@ -162,21 +149,20 @@ class PADHead(nn.Module):
 
     def _extract_routing_features(self, stats: Dict) -> torch.Tensor:
         """
-        Extract 8-D feature vector from a single MoE layer's routing stats.
-
-        Args:
-            stats: {'expert_weights': (B, N, 4), 'token_entropy': (B, N)}
-
-        Returns:
-            features: (B, 8)
+        Extract 20-D feature vector from a single MoE layer's routing stats.
         """
-        ew = stats['expert_weights']   # (B, N, 4)
-        ent = stats['token_entropy']   # (B, N)
+        # Note: Depending on how OMFRModule passes the dict, the keys might have 
+        # '_gateonly' suffix. We use .get() for robust fallback.
+        ew = stats.get('expert_weights_gateonly', stats.get('expert_weights'))   # (B, N, 4)
+        ent = stats.get('token_entropy_gateonly', stats.get('token_entropy'))    # (B, N)
+        
+        # [NEW] Retrieve the detached gate_input we added in moe_ffn.py
+        gate_input = stats.get('gate_input_gateonly', stats.get('gate_input'))   # (B, N, 3)
 
-        # Expert load: mean across tokens -> (B, 4)
+        # 1. Expert load: mean across tokens -> (B, 4)
         load_mean = ew.mean(dim=1)
 
-        # Entropy statistics: [mean, std, max, min] -> (B, 4)
+        # 2. Entropy statistics: [mean, std, max, min] -> (B, 4)
         ent_stats = torch.stack([
             ent.mean(dim=1),
             ent.std(dim=1),
@@ -184,31 +170,32 @@ class PADHead(nn.Module):
             ent.min(dim=1).values,
         ], dim=-1)
 
-        return torch.cat([load_mean, ent_stats], dim=-1)  # (B, 8)
+        features_list = [load_mean, ent_stats]
+
+        # 3. Gate Input statistics [NEW]
+        # Calculates mean, std, max, min for EACH of the 3 frequency bands
+        if gate_input is not None:
+            gate_stats = torch.cat([
+                gate_input.mean(dim=1),          # (B, 3)
+                gate_input.std(dim=1),           # (B, 3)
+                gate_input.max(dim=1).values,    # (B, 3)
+                gate_input.min(dim=1).values,    # (B, 3)
+            ], dim=-1)                           # Result: (B, 12)
+            features_list.append(gate_stats)
+
+        # Concat all into (B, 20)
+        return torch.cat(features_list, dim=-1)  
 
     def forward(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
         Args:
-            inputs: {
-                'pad_stem_feat':     (B, 128),
-                'stage1_feat':       (B, 64, 56, 56),
-                'stage2_feat':       (B, 128, 28, 28),
-                'routing_stats_s2':  {'expert_weights': ..., 'token_entropy': ...},
-                'routing_stats_s3a': {'expert_weights': ..., 'token_entropy': ...},
-                'routing_stats_s3b': {'expert_weights': ..., 'token_entropy': ...},
-            }
-
-        Returns: {
-            'pad_features':  (B, 128),
-            'pad_embedding': (B, 32),   # L2-normalized
-            'pad_logit':     (B, 1),
-        }
+            inputs: Dictionary containing pad_stem_feat, stage1/2 feats, and routing stats.
         """
-        pad_stem = inputs['pad_stem_feat']    # (B, 128)  — trainable signal
-        s1 = inputs['stage1_feat']            # (B, 64, 56, 56)  — detached
-        s2 = inputs['stage2_feat']            # (B, 128, 28, 28) — detached
+        pad_stem = inputs['pad_stem_feat']    # (B, 128)
+        s1 = inputs['stage1_feat']            # (B, 64, 56, 56)
+        s2 = inputs['stage2_feat']            # (B, 128, 28, 28)
 
-        # -- Aux feature path: conv blocks at full resolution, GAP at end --
+        # -- Aux feature path --
         f1 = self.block_s1(s1)                 # (B, 128, 56, 56)
         f2 = self.block_s2(s2)                 # (B, 128, 28, 28)
         f1 = self.gap(f1).flatten(1)           # (B, 128)
@@ -216,15 +203,19 @@ class PADHead(nn.Module):
         feat_combined = torch.cat([f1, f2], dim=-1)  # (B, 256)
 
         # -- Routing path --
-        r_s2 = self._extract_routing_features(inputs['routing_stats_s2'])    # (B, 8)
-        r_s3a = self._extract_routing_features(inputs['routing_stats_s3a'])  # (B, 8)
-        r_s3b = self._extract_routing_features(inputs['routing_stats_s3b'])  # (B, 8)
-        route_combined = torch.cat([r_s2, r_s3a, r_s3b], dim=-1)  # (B, 24)
+        # [NEW] These are now (B, 20) each
+        r_s2 = self._extract_routing_features(inputs['routing_stats_s2'])    
+        r_s3a = self._extract_routing_features(inputs['routing_stats_s3a'])  
+        r_s3b = self._extract_routing_features(inputs['routing_stats_s3b'])  
+        
+        # [NEW] route_combined is now (B, 60)
+        route_combined = torch.cat([r_s2, r_s3a, r_s3b], dim=-1)  
 
-        # -- Fusion: stem is the primary (trainable) signal, aux + routing join --
+        # -- Fusion --
+        # [NEW] all_features is now (B, 444) -> 128 + 256 + 60
         all_features = torch.cat(
             [pad_stem, feat_combined, route_combined], dim=-1,
-        )  # (B, 408)
+        )  
         pad_features = self.fusion_mlp(all_features)  # (B, 128)
 
         # -- Parallel output branches --

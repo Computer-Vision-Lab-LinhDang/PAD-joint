@@ -226,6 +226,101 @@ class FingerprintTrainTransform:
         return img
 
 
+class _RandomResizedPartial:
+    """Random crop of image area in [scale_min, scale_max], resize to output_size.
+
+    Simulates partial captures — FVC2004 frequently crops out the finger
+    edge or centers only a fraction of the pad, so the model must match
+    off-center ROIs to whole-finger gallery images.
+    """
+
+    def __init__(
+        self,
+        output_size: int = 224,
+        scale: Tuple[float, float] = (0.6, 1.0),
+        p: float = 0.7,
+    ):
+        self.output_size = output_size
+        self.scale = scale
+        self.p = p
+
+    def __call__(self, img: torch.Tensor) -> torch.Tensor:
+        if random.random() > self.p:
+            return F.interpolate(
+                img.unsqueeze(0), size=self.output_size,
+                mode='bilinear', align_corners=False,
+            ).squeeze(0)
+        C, H, W = img.shape
+        scale = random.uniform(*self.scale)
+        h = max(int(H * (scale ** 0.5)), 1)
+        w = max(int(W * (scale ** 0.5)), 1)
+        top  = random.randint(0, max(H - h, 0))
+        left = random.randint(0, max(W - w, 0))
+        img = img[:, top:top + h, left:left + w]
+        return F.interpolate(
+            img.unsqueeze(0), size=self.output_size,
+            mode='bilinear', align_corners=False,
+        ).squeeze(0)
+
+
+class _RandomErasingBig:
+    """RandomErasing with up to `max_area` fraction of the image.
+
+    Larger than the default torchvision erasing range — FVC captures can
+    have latex occlusion or dirt smudges covering sizeable regions.
+    """
+
+    def __init__(self, p: float = 0.35, max_area: float = 0.30):
+        self.p = p
+        self.max_area = max_area
+
+    def __call__(self, img: torch.Tensor) -> torch.Tensor:
+        if random.random() > self.p:
+            return img
+        C, H, W = img.shape
+        area = random.uniform(0.05, self.max_area) * H * W
+        aspect = random.uniform(0.3, 3.3)
+        h = int((area * aspect) ** 0.5)
+        w = int((area / aspect) ** 0.5)
+        if h <= 0 or w <= 0 or h >= H or w >= W:
+            return img
+        top  = random.randint(0, H - h)
+        left = random.randint(0, W - w)
+        img = img.clone()
+        img[:, top:top + h, left:left + w] = 0.0
+        return img
+
+
+class FingerprintHardTransform:
+    """FVC2004-mimicking augmentation for identity training.
+
+    Stronger than FingerprintTrainTransform because the open-set gap on
+    FVC2004 is dominated by intra-class distortion that NIST SD302
+    training impressions do not reproduce.
+
+      - Stronger elastic deformation (alpha=40, sigma=7): heavy finger
+        pressure variation.
+      - Partial capture: RandomResizedPartial with scale in [0.6, 1.0].
+      - Wider brightness/contrast jitter (0.4 each): sensor difference.
+      - Larger RandomErasing (up to 30% of area): latex/dirt occlusion.
+    """
+
+    def __init__(self, output_size: int = 224):
+        self.transforms = [
+            RandomRotation90(),
+            ElasticDeformation(alpha=40.0, sigma=7.0, p=0.7),
+            _RandomResizedPartial(output_size=output_size, scale=(0.6, 1.0), p=0.7),
+            RandomBrightnessContrast(brightness=0.4, contrast=0.4, p=0.9),
+            RandomGaussianNoise(std=0.03, p=0.4),
+            _RandomErasingBig(p=0.35, max_area=0.30),
+        ]
+
+    def __call__(self, img: torch.Tensor) -> torch.Tensor:
+        for t in self.transforms:
+            img = t(img)
+        return img
+
+
 class FingerprintValTransform:
     """
     Validation/inference transform: only resize, no augmentation.
@@ -246,17 +341,24 @@ class FingerprintValTransform:
         return img
 
 
-def get_transforms(split: str = 'train', output_size: int = 224):
-    """
-    Factory function returning the appropriate transform for a given split.
+def get_transforms(
+    split: str = 'train',
+    output_size: int = 224,
+    preset: str = 'fingerprint',
+):
+    """Factory function returning the appropriate transform for a given split.
 
     Args:
-        split: 'train' | 'val' | 'test'
+        split:       'train' | 'val' | 'test'
         output_size: spatial size (square)
+        preset:      'fingerprint' (default, stock training aug) or
+                     'fingerprint_hard' (FVC-mimicking, heavier distortion
+                     + partial capture for open-set transfer).
 
-    Returns:
-        transform callable
+    Only affects training; val/test always returns FingerprintValTransform.
     """
     if split == 'train':
+        if preset == 'fingerprint_hard':
+            return FingerprintHardTransform(output_size=output_size)
         return FingerprintTrainTransform(output_size=output_size)
     return FingerprintValTransform(output_size=output_size)

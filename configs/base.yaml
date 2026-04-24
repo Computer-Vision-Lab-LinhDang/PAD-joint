@@ -1,23 +1,23 @@
-# configs/base.yaml — OMFR v2 Base Configuration (TinyViT-5M)
+# configs/base.yaml — OMFR v2 Base Configuration (FastViT-SA12)
 # All hyperparameters for OMFRModule, OMFRDataModule, Trainer, and evaluation.
 
 # ─────────────────────────────────────────────────────────────────
-# Model — Backbone (TinyViT-5M)
+# Model — Backbone (FastViT-SA12, ~10.5M)
 # ─────────────────────────────────────────────────────────────────
 backbone:
-  name: tiny_vit_5m_224
-  pretrained: true           # Load ImageNet-22k pretrained weights
+  name: fastvit_sa12         # FastViT-SA12 — RepMixer s0-s2 + Self-Attn s3
+  pretrained: true           # Load ImageNet-1k distilled weights from timm
   in_chans: 8                # 8-channel Gabor stem input
-  # TinyViT-5M architecture (fixed, from timm):
-  #   embed_dims: [64, 128, 160, 320]
-  #   depths: [2, 2, 6, 2]
-  #   num_heads: [2, 4, 5, 10]
-  #   window_sizes: [7, 7, 14, 7]
-
+  # FastViT-SA12 architecture (fixed, from timm):
+  #   stage0: (B, 64, 56, 56)   2 x RepMixerBlock
+  #   stage1: (B,128, 28, 28)   2 x RepMixerBlock
+  #   stage2: (B,256, 14, 14)   6 x RepMixerBlock
+  #   stage3: (B,512,  7,  7)   2 x AttentionBlock (multi-head self-attn)
+  #
   # MoE insertion points (stage_idx, block_idx):
-  #   Stage 1 block 1: 28×28 tokens, 128-ch
-  #   Stage 2 block 2: 14×14 tokens, 160-ch
-  #   Stage 2 block 5: 14×14 tokens, 160-ch
+  #   Stage 1 block 1: 28×28 tokens, 128-ch   ('s2')
+  #   Stage 2 block 2: 14×14 tokens, 256-ch   ('s3a')
+  #   Stage 2 block 5: 14×14 tokens, 256-ch   ('s3b')
   num_experts: 4
   top_k: 2
   # Gradient checkpointing trades ~30% extra compute for ~2× lower
@@ -39,10 +39,10 @@ gabor:
 identity_head:
   embed_dim: 256             # identity embedding dimension
   num_heads: 8               # structural attention heads
-  grid_size: 7               # 7×7 token grid (49 tokens)
+  grid_size: 14              # 14x14 token grid from FastVit stage2 (196 tokens)
   num_queries: 4             # attentive pooling query seeds
-  stage3_dim: 160            # TinyViT Stage 2 output dim
-  stage4_dim: 320            # TinyViT Stage 3 output dim
+  stage3_dim: 256            # FastVit stage2 output dim (was 160 for TinyViT)
+  stage4_dim: 512            # FastVit stage3 output dim (was 320 for TinyViT)
   mrl_dims: [64, 128, 256]
   num_classes: 5000          # Number of training identities (auto-detected)
 
@@ -63,7 +63,7 @@ losses:
   arcface:
     margin: 0.5
     scale_phase1: 32.0       # gentle scale for Phase 1
-    scale_final: 64.0        # full scale reached by end of Phase 2 warmup
+    scale_final: 48.0        # full scale reached by end of Phase 2 warmup
     easy_margin: false
   supcon:
     temperature: 0.07
@@ -77,8 +77,8 @@ losses:
   gamma: 0.05                # Load-balance loss weight (up from 0.01 to combat imbalance)
   # Hybrid identity loss — SupCon (open-set) + ArcFace (closed-set).
   # SupCon dominates so embeddings generalize to unseen FVC identities.
-  identity_supcon_weight: 0.7
-  identity_arcface_weight: 0.3
+  identity_supcon_weight: 0.9
+  identity_arcface_weight: 0.1
 
 # ─────────────────────────────────────────────────────────────────
 # Optimizer
@@ -98,7 +98,7 @@ optimizer:
     identity_head: 1.0
     pad_head_phase1: 1.0
     pad_head_phase2: 2.0     # higher LR in Phase 2
-    arcface: 1.0             # reduced from 10x to prevent gradient explosion
+    arcface: 0.1             # reduced from 10x to prevent gradient explosion
 
 scheduler:
   name: CosineAnnealingLR
@@ -109,20 +109,20 @@ scheduler:
 # Training Phases
 # ─────────────────────────────────────────────────────────────────
 phases:
-  phase1_epochs: 20          # Identity Foundation: epochs 0-19
+  phase1_epochs: 20           # Identity Foundation (smoke test: compressed)
   phase2_epochs: 20          # PAD Integration: epochs 20-39
   phase3_epochs: 20          # Joint Refinement: epochs 40-59
-  total_epochs: 60
+  total_epochs: 60            # smoke test compression
 
   # Phase 1 ArcFace warmup (prevents gradient explosion with many classes)
   phase1_warmup_delay: 5     # hold s=1, m=0 for first N epochs while LR warms up
-  phase1_warmup_epochs: 5    # then ramp scale 1→32, margin 0→0.5 over next 5 epochs
+  phase1_warmup_epochs: 5    # smoke test: compressed
   arcface_scale_init: 1.0    # gentle start
   arcface_margin_init: 0.0   # no angular margin initially
   arcface_margin_target: 0.5 # full margin by end of Phase 1 warmup
 
   # Phase 2 warmup for alpha/beta/arcface_scale ramps
-  warmup_epochs: 5           # over first 5 epochs of Phase 2
+  warmup_epochs: 5          
   alpha_target: 1.0
   # Orthogonality weight: reduced 0.1 -> 0.02 because β=0.1 was
   # visibly distorting the 256-D identity embedding (MRL 256 < 128
@@ -130,8 +130,11 @@ phases:
   # PAD and identity already share less representation, so a lighter
   # decorrelation pressure suffices.
   beta_target: 0.02
+  # TASK_03/04: DANN sensor-adversarial weight on pad_features. Ramped
+  # by cosine over FULL Phase 2; lam_adv (GRL strength) uses sigmoid.
+  alpha_adv_target: 0.0      # DANN DISABLED (ablation smoke test)
   arcface_scale_start: 32.0
-  arcface_scale_end: 64.0
+  arcface_scale_end: 48.0
 
   # MoE temperature schedule
   moe_temp_phase1: 2.0       # soft routing (exploration)
@@ -162,9 +165,22 @@ data:
 
   # PKSampler settings (Phase 1 / Phase 2 identity loader)
   pk_p: 32                   # identities per batch
-  pk_k: 4                    # samples per identity → batch_size = 128
+  # TASK_06: multi-view SupCon doubles effective samples per identity,
+  # so pk_k halved (32 * 2 * 2 = 128 total, same memory).
+  pk_k: 2                    # samples per identity (× num_views)
   # BalancedPADSampler (Phase 2 PAD loader)
-  pad_batch_size: 128        # 50/50 live/spoof
+  # Cut 128 -> 64 because Phase-2 joint step runs TWO backbone forwards
+  # (id + pad) per optimizer step; 128 PAD samples on an 11 GiB card
+  # OOMs at the epoch-20 boundary even with the pad-backbone no_grad
+  # optimization. 32 live + 32 spoof is still balanced.
+  pad_batch_size: 64         # 50/50 live/spoof
+
+  # TASK_06: FVC-mimicking augmentation + multi-view SupCon for identity
+  # open-set transfer. Each sample yields `identity_num_views` augmented
+  # copies stacked as (V, C, H, W); OMFRModule flattens to (B*V, ...)
+  # with labels repeated so SupCon/ArcFace see independent views.
+  identity_num_views: 2
+  identity_preset: fingerprint_hard
 
   num_workers: 8
   pin_memory: true
@@ -177,8 +193,8 @@ trainer:
   accelerator: gpu
   devices: 1
   precision: 16-mixed
-  max_epochs: 60
-  gradient_clip_val: 1.0
+  max_epochs: 60               
+  gradient_clip_val: 0.5
   accumulate_grad_batches: 2   # effective batch ≈ 256
   log_every_n_steps: 10
   check_val_every_n_epoch: 1
