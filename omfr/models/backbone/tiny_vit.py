@@ -76,6 +76,7 @@ class MoEMlpWrapper(nn.Module):
 
         # Routing stats stored here after each forward — collected by backbone
         self.last_routing_stats: dict | None = None
+        self.route_mode = "identity"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -85,7 +86,9 @@ class MoEMlpWrapper(nn.Module):
             out: (B, N, C)
         """
         x = self.norm(x)
-        out, routing_stats = self.moe_ffn(x, self.spatial_h, self.spatial_w)
+        out, routing_stats = self.moe_ffn(
+            x, self.spatial_h, self.spatial_w, route_mode=self.route_mode,
+        )
         self.last_routing_stats = routing_stats
         return out
 
@@ -211,7 +214,11 @@ class TinyViTBackbone(nn.Module):
 
         self.patch_embed.conv1.conv = new_conv
 
-    def forward(self, x: torch.Tensor) -> Dict[str, Any]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        route_mode: str = "identity",
+    ) -> Dict[str, Any]:
         """
         Args:
             x: (B, 8, 224, 224) — 8-channel Gabor-enhanced fingerprint
@@ -240,10 +247,17 @@ class TinyViTBackbone(nn.Module):
         use_ckpt = self.use_grad_checkpoint and self.training and x.requires_grad
         for i, stage in enumerate(self.stages):
             if use_ckpt:
+                def _stage_forward(inp: torch.Tensor, stage_module: nn.Module = stage) -> torch.Tensor:
+                    for wrapper in self._moe_wrappers:
+                        wrapper.route_mode = route_mode
+                    return stage_module(inp)
+
                 x = torch.utils.checkpoint.checkpoint(
-                    stage, x, use_reentrant=False,
+                    _stage_forward, x, use_reentrant=False,
                 )
             else:
+                for wrapper in self._moe_wrappers:
+                    wrapper.route_mode = route_mode
                 x = stage(x)
             # x is (B, C, H, W) after each stage
             stage_feats[i] = x
@@ -257,6 +271,7 @@ class TinyViTBackbone(nn.Module):
                 routing_stats[key] = {
                     'expert_weights': stats['expert_weights'],
                     'token_entropy': stats['token_entropy'],
+                    'router_mode': stats['router_mode'],
                     # Gate-only copies: grad stops at gate_proj params.
                     # Consumed by PADHead when we want to shape the
                     # gate without leaking PAD grad back into the
@@ -311,6 +326,21 @@ class TinyViTBackbone(nn.Module):
         """Set temperature for all MoE routing layers."""
         for wrapper in self._moe_wrappers:
             wrapper.temperature = temperature
+
+    def refresh_gateonly_stats(
+        self,
+        routing_stats: Dict[str, Any],
+        route_mode: str,
+    ) -> None:
+        for key, wrapper in zip(self.MOE_KEYS, self._moe_wrappers):
+            stats = routing_stats.get(key)
+            if not stats or "gate_input_gateonly" not in stats:
+                continue
+            reproj = wrapper.moe_ffn.project_gateonly(
+                stats["gate_input_gateonly"], route_mode,
+            )
+            stats.update(reproj)
+            stats["router_mode"] = route_mode
 
     def freeze_stages(self, stage_indices: List[int]) -> None:
         """Freeze specific stages (0-indexed)."""

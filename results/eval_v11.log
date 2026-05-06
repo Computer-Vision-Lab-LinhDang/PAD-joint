@@ -1,0 +1,390 @@
+/home/linhdang/anaconda3/lib/python3.11/site-packages/requests/__init__.py:113: RequestsDependencyWarning: urllib3 (2.0.7) or chardet (7.4.3)/charset_normalizer (2.0.4) doesn't match a supported version!
+  warnings.warn(
+/home/linhdang/anaconda3/lib/python3.11/site-packages/pandas/core/arrays/masked.py:56: UserWarning: Pandas requires version '1.4.2' or newer of 'bottleneck' (version '1.3.7' currently installed).
+  from pandas.core import (
+Device: cuda
+Loading checkpoint: checkpoints/last-v11.ckpt
+Model loaded.
+
+
+======================================================================
+  IDENTITY MATCHING EVALUATION
+======================================================================
+  Found 11 FVC DBs
+
+  Evaluating FVC2000_Db1_a (/home/linhdang/workspace2/FVC_Dataset/FVC2000/Dbs/Db1_a)...
+    Samples: 800, Subjects: 100
+
+  [FVC2000_Db1_a]
+
+    64-D:
+      Rank-1: 70.50%  Rank-2: 79.00%  Rank-3: 81.62%  Rank-4: 84.38%  Rank-5: 86.75%
+      Rank-6: 88.00%  Rank-7: 89.00%  Rank-8: 89.50%  Rank-9: 90.25%  Rank-10: 90.50%
+      TAR@FAR=0.01: 1.86%
+      TAR@FAR=0.001: 1.86%
+      TAR@FAR=0.0001: 1.86%
+
+    128-D:
+      Rank-1: 76.38%  Rank-2: 83.12%  Rank-3: 86.38%  Rank-4: 88.00%  Rank-5: 89.12%
+      Rank-6: 89.88%  Rank-7: 91.50%  Rank-8: 92.00%  Rank-9: 92.62%  Rank-10: 92.88%
+      TAR@FAR=0.01: 2.61%
+      TAR@FAR=0.001: 2.61%
+      TAR@FAR=0.0001: 2.61%
+
+    256-D:
+      Rank-1: 80.00%  Rank-2: 85.62%  Rank-3: 89.00%  Rank-4: 91.25%  Rank-5: 92.38%
+      Rank-6: 93.12%  Rank-7: 93.75%  Rank-8: 94.38%  Rank-9: 94.88%  Rank-10: 95.38%
+      TAR@FAR=0.01: 2.14%
+      TAR@FAR=0.001: 2.14%
+      TAR@FAR=0.0001: 2.14%
+
+  Evaluating FVC2000_Db2_a (/home/linhdang/workspace2/FVC_Dataset/FVC2000/Dbs/Db2_a)...
+    Samples: 800, Subjects: 100
+
+  [FVC2000_Db2_a]
+
+    64-D:
+      Rank-1: 64.75%  Rank-2: 72.62%  Rank-3: 77.88%  Rank-4: 80.12%  Rank-5: 82.62%
+      Rank-6: 83.75%  Rank-7: 85.12%  Rank-8: 86.25%  Rank-9: 87.75%  Rank-10: 88.38%
+      TAR@FAR=0.01: 1.57%
+      TAR@FAR=0.001: 1.57%
+      TAR@FAR=0.0001: 1.57%
+
+    128-D:
+      Rank-1: 67.50%  Rank-2: 77.25%  Rank-3: 81.50%  Rank-4: 83.50%  Rank-5: 85.50%
+      Rank-6: 86.88%  Rank-7: 88.50%  Rank-8: 89.62%  Rank-9: 90.75%  Rank-10: 92.00%
+      TAR@FAR=0.01: 0.93%
+      TAR@FAR=0.001: 0.93%
+      TAR@FAR=0.0001: 0.93%
+
+    256-D:
+      Rank-1: 70.62%  Rank-2: 79.25%  Rank-3: 83.50%  Rank-4: 86.25%  Rank-5: 88.88%
+      Rank-6: 89.88%  Rank-7: 90.62%  Rank-8: 91.88%  Rank-9: 92.62%  Rank-10: 93.38%
+      TAR@FAR=0.01: 1.43%
+      TAR@FAR=0.001: 1.43%
+      TAR@FAR=0.0001: 1.43%
+
+  Evaluating FVC2000_Db3_a (/home/linhdang/workspace2/FVC_Dataset/FVC2000/Dbs/Db3_a)...
+    Samples: 800, Subjects: 100
+
+  [FVC2000_Db3_a]
+
+    64-D:
+      Rank-1: 51.25%  Rank-2: 62.88%  Rank-3: 71.00%  Rank-4: 74.50%  Rank-5: 76.75%
+      Rank-6: 79.75%  Rank-7: 81.50%  Rank-8: 83.12%  Rank-9: 84.12%  Rank-10: 85.00%
+      TAR@FAR=0.01: 1.18%
+      TAR@FAR=0.001: 1.18%
+      TAR@FAR=0.0001: 1.18%
+
+    128-D:
+      Rank-1: 56.25%  Rank-2: 68.25%  Rank-3: 74.38%  Rank-4: 77.75%  Rank-5: 80.75%
+      Rank-6: 82.62%  Rank-7: 84.25%  Rank-8: 85.62%  Rank-9: 86.62%  Rank-10: 88.00%
+      TAR@FAR=0.01: 1.57%
+      TAR@FAR=0.001: 1.57%
+      TAR@FAR=0.0001: 1.57%
+
+    256-D:
+      Rank-1: 61.25%  Rank-2: 71.62%  Rank-3: 76.75%  Rank-4: 80.62%  Rank-5: 82.38%
+      Rank-6: 84.12%  Rank-7: 86.88%  Rank-8: 87.88%  Rank-9: 89.62%  Rank-10: 91.12%
+      TAR@FAR=0.01: 1.25%
+      TAR@FAR=0.001: 1.25%
+      TAR@FAR=0.0001: 1.25%
+
+  Evaluating FVC2000_Db4_a (/home/linhdang/workspace2/FVC_Dataset/FVC2000/Dbs/Db4_a)...
+    Samples: 800, Subjects: 100
+
+  [FVC2000_Db4_a]
+
+    64-D:
+      Rank-1: 35.50%  Rank-2: 49.62%  Rank-3: 59.13%  Rank-4: 64.12%  Rank-5: 69.50%
+      Rank-6: 73.38%  Rank-7: 75.50%  Rank-8: 77.62%  Rank-9: 79.62%  Rank-10: 81.38%
+      TAR@FAR=0.01: 0.29%
+      TAR@FAR=0.001: 0.29%
+      TAR@FAR=0.0001: 0.29%
+
+    128-D:
+      Rank-1: 40.25%  Rank-2: 54.50%  Rank-3: 62.38%  Rank-4: 68.38%  Rank-5: 71.62%
+      Rank-6: 75.38%  Rank-7: 77.62%  Rank-8: 79.88%  Rank-9: 81.38%  Rank-10: 82.50%
+      TAR@FAR=0.01: 0.00%
+      TAR@FAR=0.001: 0.00%
+      TAR@FAR=0.0001: 0.00%
+
+    256-D:
+      Rank-1: 44.88%  Rank-2: 60.00%  Rank-3: 66.38%  Rank-4: 72.25%  Rank-5: 76.25%
+      Rank-6: 78.62%  Rank-7: 80.88%  Rank-8: 83.12%  Rank-9: 84.50%  Rank-10: 86.12%
+      TAR@FAR=0.01: 0.07%
+      TAR@FAR=0.001: 0.07%
+      TAR@FAR=0.0001: 0.07%
+
+  Evaluating FVC2002_Db1_a (/home/linhdang/workspace2/FVC_Dataset/FVC2002/Dbs/Db1_a)...
+    Samples: 800, Subjects: 100
+
+  [FVC2002_Db1_a]
+
+    64-D:
+      Rank-1: 41.38%  Rank-2: 50.50%  Rank-3: 56.38%  Rank-4: 60.88%  Rank-5: 63.75%
+      Rank-6: 66.25%  Rank-7: 68.88%  Rank-8: 70.62%  Rank-9: 72.12%  Rank-10: 73.25%
+      TAR@FAR=0.01: 0.64%
+      TAR@FAR=0.001: 0.64%
+      TAR@FAR=0.0001: 0.64%
+
+    128-D:
+      Rank-1: 43.38%  Rank-2: 53.50%  Rank-3: 58.88%  Rank-4: 63.50%  Rank-5: 66.12%
+      Rank-6: 70.12%  Rank-7: 71.75%  Rank-8: 72.75%  Rank-9: 73.62%  Rank-10: 75.00%
+      TAR@FAR=0.01: 1.04%
+      TAR@FAR=0.001: 1.04%
+      TAR@FAR=0.0001: 1.04%
+
+    256-D:
+      Rank-1: 46.88%  Rank-2: 56.75%  Rank-3: 62.62%  Rank-4: 65.00%  Rank-5: 68.62%
+      Rank-6: 71.75%  Rank-7: 73.12%  Rank-8: 74.12%  Rank-9: 75.25%  Rank-10: 76.00%
+      TAR@FAR=0.01: 1.25%
+      TAR@FAR=0.001: 1.25%
+      TAR@FAR=0.0001: 1.25%
+
+  Evaluating FVC2002_Db2_a (/home/linhdang/workspace2/FVC_Dataset/FVC2002/Dbs/Db2_a)...
+    Samples: 800, Subjects: 100
+
+  [FVC2002_Db2_a]
+
+    64-D:
+      Rank-1: 37.50%  Rank-2: 48.38%  Rank-3: 54.00%  Rank-4: 58.13%  Rank-5: 62.00%
+      Rank-6: 63.75%  Rank-7: 65.38%  Rank-8: 66.62%  Rank-9: 67.75%  Rank-10: 69.00%
+      TAR@FAR=0.01: 0.18%
+      TAR@FAR=0.001: 0.18%
+      TAR@FAR=0.0001: 0.18%
+
+    128-D:
+      Rank-1: 43.50%  Rank-2: 52.25%  Rank-3: 57.12%  Rank-4: 60.12%  Rank-5: 62.50%
+      Rank-6: 63.88%  Rank-7: 65.62%  Rank-8: 67.88%  Rank-9: 68.75%  Rank-10: 69.75%
+      TAR@FAR=0.01: 0.21%
+      TAR@FAR=0.001: 0.21%
+      TAR@FAR=0.0001: 0.21%
+
+    256-D:
+      Rank-1: 46.00%  Rank-2: 54.50%  Rank-3: 59.38%  Rank-4: 62.75%  Rank-5: 65.12%
+      Rank-6: 67.12%  Rank-7: 68.25%  Rank-8: 69.75%  Rank-9: 71.12%  Rank-10: 72.25%
+      TAR@FAR=0.01: 0.36%
+      TAR@FAR=0.001: 0.36%
+      TAR@FAR=0.0001: 0.36%
+
+  Evaluating FVC2002_Db3_a (/home/linhdang/workspace2/FVC_Dataset/FVC2002/Dbs/Db3_a)...
+    Samples: 800, Subjects: 100
+
+  [FVC2002_Db3_a]
+
+    64-D:
+      Rank-1: 39.25%  Rank-2: 47.50%  Rank-3: 53.25%  Rank-4: 58.88%  Rank-5: 62.25%
+      Rank-6: 64.25%  Rank-7: 66.62%  Rank-8: 68.12%  Rank-9: 70.12%  Rank-10: 71.75%
+      TAR@FAR=0.01: 0.75%
+      TAR@FAR=0.001: 0.75%
+      TAR@FAR=0.0001: 0.75%
+
+    128-D:
+      Rank-1: 43.12%  Rank-2: 52.50%  Rank-3: 58.88%  Rank-4: 63.62%  Rank-5: 66.25%
+      Rank-6: 68.50%  Rank-7: 70.88%  Rank-8: 72.50%  Rank-9: 73.38%  Rank-10: 74.62%
+      TAR@FAR=0.01: 0.89%
+      TAR@FAR=0.001: 0.89%
+      TAR@FAR=0.0001: 0.89%
+
+    256-D:
+      Rank-1: 45.50%  Rank-2: 56.88%  Rank-3: 62.12%  Rank-4: 67.12%  Rank-5: 68.75%
+      Rank-6: 70.50%  Rank-7: 72.25%  Rank-8: 74.12%  Rank-9: 75.75%  Rank-10: 76.75%
+      TAR@FAR=0.01: 1.04%
+      TAR@FAR=0.001: 1.04%
+      TAR@FAR=0.0001: 1.04%
+
+  Evaluating FVC2002_Db4_a (/home/linhdang/workspace2/FVC_Dataset/FVC2002/Dbs/Db4_a)...
+    Samples: 800, Subjects: 100
+
+  [FVC2002_Db4_a]
+
+    64-D:
+      Rank-1: 20.00%  Rank-2: 31.25%  Rank-3: 40.00%  Rank-4: 45.00%  Rank-5: 49.75%
+      Rank-6: 53.00%  Rank-7: 56.50%  Rank-8: 59.50%  Rank-9: 62.38%  Rank-10: 64.62%
+      TAR@FAR=0.01: 0.00%
+      TAR@FAR=0.001: 0.00%
+      TAR@FAR=0.0001: 0.00%
+
+    128-D:
+      Rank-1: 22.62%  Rank-2: 33.38%  Rank-3: 43.25%  Rank-4: 48.25%  Rank-5: 51.00%
+      Rank-6: 55.12%  Rank-7: 59.13%  Rank-8: 61.50%  Rank-9: 64.88%  Rank-10: 66.50%
+      TAR@FAR=0.01: 0.00%
+      TAR@FAR=0.001: 0.00%
+      TAR@FAR=0.0001: 0.00%
+
+    256-D:
+      Rank-1: 24.62%  Rank-2: 35.62%  Rank-3: 45.00%  Rank-4: 50.00%  Rank-5: 55.25%
+      Rank-6: 59.50%  Rank-7: 62.62%  Rank-8: 65.50%  Rank-9: 67.62%  Rank-10: 70.75%
+      TAR@FAR=0.01: 0.00%
+      TAR@FAR=0.001: 0.00%
+      TAR@FAR=0.0001: 0.00%
+
+  Evaluating FVC2004_DB1_A (/home/linhdang/workspace2/FVC_Dataset/FVC2004/Dbs/DB1_A)...
+    Samples: 800, Subjects: 100
+
+  [FVC2004_DB1_A]
+
+    64-D:
+      Rank-1: 9.88%  Rank-2: 15.75%  Rank-3: 19.50%  Rank-4: 22.75%  Rank-5: 25.12%
+      Rank-6: 28.75%  Rank-7: 30.50%  Rank-8: 32.00%  Rank-9: 33.25%  Rank-10: 35.50%
+      TAR@FAR=0.01: 0.00%
+      TAR@FAR=0.001: 0.00%
+      TAR@FAR=0.0001: 0.00%
+
+    128-D:
+      Rank-1: 11.50%  Rank-2: 16.38%  Rank-3: 20.75%  Rank-4: 24.38%  Rank-5: 26.75%
+      Rank-6: 28.50%  Rank-7: 31.37%  Rank-8: 33.50%  Rank-9: 35.62%  Rank-10: 36.75%
+      TAR@FAR=0.01: 0.00%
+      TAR@FAR=0.001: 0.00%
+      TAR@FAR=0.0001: 0.00%
+
+    256-D:
+      Rank-1: 11.62%  Rank-2: 16.62%  Rank-3: 21.25%  Rank-4: 24.88%  Rank-5: 27.62%
+      Rank-6: 29.25%  Rank-7: 31.87%  Rank-8: 34.25%  Rank-9: 36.75%  Rank-10: 37.50%
+      TAR@FAR=0.01: 0.00%
+      TAR@FAR=0.001: 0.00%
+      TAR@FAR=0.0001: 0.00%
+
+  Evaluating FVC2004_DB2_A (/home/linhdang/workspace2/FVC_Dataset/FVC2004/Dbs/DB2_A)...
+    Samples: 800, Subjects: 100
+
+  [FVC2004_DB2_A]
+
+    64-D:
+      Rank-1: 18.12%  Rank-2: 26.50%  Rank-3: 32.25%  Rank-4: 35.12%  Rank-5: 39.38%
+      Rank-6: 42.88%  Rank-7: 45.00%  Rank-8: 47.38%  Rank-9: 49.25%  Rank-10: 51.38%
+      TAR@FAR=0.01: 0.00%
+      TAR@FAR=0.001: 0.00%
+      TAR@FAR=0.0001: 0.00%
+
+    128-D:
+      Rank-1: 21.50%  Rank-2: 29.62%  Rank-3: 35.12%  Rank-4: 40.00%  Rank-5: 43.75%
+      Rank-6: 48.00%  Rank-7: 49.62%  Rank-8: 52.62%  Rank-9: 54.50%  Rank-10: 56.12%
+      TAR@FAR=0.01: 0.00%
+      TAR@FAR=0.001: 0.00%
+      TAR@FAR=0.0001: 0.00%
+
+    256-D:
+      Rank-1: 24.75%  Rank-2: 31.00%  Rank-3: 36.62%  Rank-4: 41.88%  Rank-5: 46.62%
+      Rank-6: 50.25%  Rank-7: 53.50%  Rank-8: 56.50%  Rank-9: 58.63%  Rank-10: 60.25%
+      TAR@FAR=0.01: 0.00%
+      TAR@FAR=0.001: 0.00%
+      TAR@FAR=0.0001: 0.00%
+
+  Evaluating FVC2004_DB3_A (/home/linhdang/workspace2/FVC_Dataset/FVC2004/Dbs/DB3_A)...
+    Samples: 800, Subjects: 100
+
+  [FVC2004_DB3_A]
+
+    64-D:
+      Rank-1: 42.00%  Rank-2: 54.50%  Rank-3: 61.50%  Rank-4: 64.88%  Rank-5: 68.50%
+      Rank-6: 72.25%  Rank-7: 74.00%  Rank-8: 75.88%  Rank-9: 78.38%  Rank-10: 79.00%
+      TAR@FAR=0.01: 0.18%
+      TAR@FAR=0.001: 0.18%
+      TAR@FAR=0.0001: 0.18%
+
+    128-D:
+      Rank-1: 47.12%  Rank-2: 58.63%  Rank-3: 66.00%  Rank-4: 70.38%  Rank-5: 73.38%
+      Rank-6: 76.38%  Rank-7: 79.12%  Rank-8: 80.50%  Rank-9: 82.12%  Rank-10: 83.38%
+      TAR@FAR=0.01: 0.14%
+      TAR@FAR=0.001: 0.14%
+      TAR@FAR=0.0001: 0.14%
+
+    256-D:
+      Rank-1: 48.12%  Rank-2: 62.50%  Rank-3: 69.75%  Rank-4: 75.50%  Rank-5: 79.25%
+      Rank-6: 81.75%  Rank-7: 83.38%  Rank-8: 85.12%  Rank-9: 86.50%  Rank-10: 87.12%
+      TAR@FAR=0.01: 0.18%
+      TAR@FAR=0.001: 0.18%
+      TAR@FAR=0.0001: 0.18%
+
+======================================================================
+  PAD EVALUATION
+======================================================================
+  Found 2 LivDet datasets
+
+  Evaluating LivDet2013 (/home/linhdang/workspace2/PAD-joint/LivDet2013)...
+    Samples: 8403 (live=4403, spoof=4000)
+
+  [LivDet2013]  (live=4403, spoof=4000)
+    EER:        6.70%  (threshold=0.6329)
+    @threshold=0.5:
+      APCER:  9.22%
+      BPCER:  5.43%
+      ACER:   7.33%
+    @EER threshold:
+      APCER:  6.70%
+      BPCER:  6.70%
+      ACER:   6.70%
+    By sensor @0.5:
+      Biometrika      EER= 4.00% APCER= 4.90% BPCER= 3.10% n=2000
+      CrossMatch      EER= 4.58% APCER=13.50% BPCER= 1.52% n=2250
+      Italdata        EER= 4.50% APCER= 8.30% BPCER= 1.20% n=2000
+      Swipe           EER=13.89% APCER=10.20% BPCER=15.35% n=2153
+    Worst spoof sensor/material @0.5:
+      CrossMatch      Latex      APCER=28.40% mean=0.3042 p90=0.8345 n=250
+      Swipe           PlayDoh    APCER=19.60% mean=0.2610 p90=0.8049 n=250
+      Italdata        Gelatin    APCER=19.50% mean=0.2227 p90=0.8533 n=200
+      Biometrika      Gelatin    APCER=14.00% mean=0.1363 p90=0.6754 n=200
+      CrossMatch      PlayDoh    APCER=12.80% mean=0.1583 p90=0.5476 n=250
+      Swipe           WoodGlue   APCER=12.40% mean=0.1725 p90=0.5543 n=250
+      CrossMatch      BodyDouble APCER=10.40% mean=0.1100 p90=0.5030 n=250
+      Italdata        WoodGlue   APCER=10.00% mean=0.1257 p90=0.4973 n=200
+
+  Evaluating LivDet2015 (/home/linhdang/workspace2/PAD-joint/LivDet2015)...
+    Samples: 10448 (live=4500, spoof=5948)
+
+  [LivDet2015]  (live=4500, spoof=5948)
+    EER:        9.18%  (threshold=0.6670)
+    @threshold=0.5:
+      APCER:  12.36%
+      BPCER:  6.58%
+      ACER:   9.47%
+    @EER threshold:
+      APCER:  9.18%
+      BPCER:  9.18%
+      ACER:   9.18%
+    By sensor @0.5:
+      CrossMatch      EER= 3.66% APCER=10.77% BPCER= 0.93% n=2948
+      DigitalPersona  EER=17.97% APCER=24.13% BPCER=11.40% n=2500
+      GreenBit        EER= 7.28% APCER= 3.73% BPCER=12.00% n=2500
+      HiScan          EER= 7.58% APCER=10.73% BPCER= 4.80% n=2500
+    Worst spoof sensor/material @0.5:
+      DigitalPersona  Unknown    APCER=30.13% mean=0.3161 p90=0.9587 n=750
+      CrossMatch      Gelatin    APCER=25.00% mean=0.2608 p90=0.8880 n=300
+      DigitalPersona  WoodGlue   APCER=24.40% mean=0.2659 p90=0.9598 n=250
+      DigitalPersona  Gelatin    APCER=23.60% mean=0.2556 p90=0.9162 n=250
+      HiScan          WoodGlue   APCER=20.00% mean=0.2168 p90=0.8242 n=250
+      CrossMatch      Unknown    APCER=12.79% mean=0.1845 p90=0.6532 n=297
+      HiScan          Gelatin    APCER=11.60% mean=0.1385 p90=0.5237 n=250
+      HiScan          Unknown    APCER=10.00% mean=0.1309 p90=0.4986 n=750
+
+======================================================================
+  SUMMARY
+======================================================================
+
+  Identity Matching (Rank-1 Accuracy):
+    Dataset                       64-D    128-D    256-D
+    -------------------------   ------   ------   ------
+    FVC2000_Db1_a               70.50%   76.38%   80.00%
+    FVC2000_Db2_a               64.75%   67.50%   70.62%
+    FVC2000_Db3_a               51.25%   56.25%   61.25%
+    FVC2000_Db4_a               35.50%   40.25%   44.88%
+    FVC2002_Db1_a               41.38%   43.38%   46.88%
+    FVC2002_Db2_a               37.50%   43.50%   46.00%
+    FVC2002_Db3_a               39.25%   43.12%   45.50%
+    FVC2002_Db4_a               20.00%   22.62%   24.62%
+    FVC2004_DB1_A                9.88%   11.50%   11.62%
+    FVC2004_DB2_A               18.12%   21.50%   24.75%
+    FVC2004_DB3_A               42.00%   47.12%   48.12%
+
+  PAD Metrics:
+    Dataset                        EER     ACER    APCER    BPCER
+    -------------------------   ------   ------   ------   ------
+    LivDet2013                   6.70%    6.70%    6.70%    6.70%
+    LivDet2015                   9.18%    9.18%    9.18%    9.18%
+
+======================================================================
+  Evaluation complete.
+======================================================================
+

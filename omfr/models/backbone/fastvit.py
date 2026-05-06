@@ -67,13 +67,16 @@ class ConvMoEMlpWrapper(nn.Module):
         self.spatial_h = spatial_h
         self.spatial_w = spatial_w
         self.last_routing_stats: dict | None = None
+        self.route_mode = "identity"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Local mixer first (pretrained) — retains FastVit inductive bias.
         x = self.conv(x)                                    # (B,C,H,W)
         B, C, H, W = x.shape
         tokens = x.flatten(2).transpose(1, 2).contiguous()  # (B,N,C)
-        out, routing_stats = self.moe_ffn(tokens, H, W)
+        out, routing_stats = self.moe_ffn(
+            tokens, H, W, route_mode=self.route_mode,
+        )
         self.last_routing_stats = routing_stats
         return out.transpose(1, 2).reshape(B, C, H, W)
 
@@ -205,7 +208,11 @@ class FastViTBackbone(nn.Module):
     # forward
     # ------------------------------------------------------------------
 
-    def forward(self, x: torch.Tensor) -> Dict[str, Any]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        route_mode: str = "identity",
+    ) -> Dict[str, Any]:
         """
         Args:
             x: (B, in_chans, 224, 224)
@@ -224,8 +231,17 @@ class FastViTBackbone(nn.Module):
         use_ckpt = self.use_grad_checkpoint and self.training and x.requires_grad
         for i, stage in enumerate(self.stages):
             if use_ckpt:
-                x = torch.utils.checkpoint.checkpoint(stage, x, use_reentrant=False)
+                def _stage_forward(inp: torch.Tensor, stage_module: nn.Module = stage) -> torch.Tensor:
+                    for wrapper in self._moe_wrappers:
+                        wrapper.route_mode = route_mode
+                    return stage_module(inp)
+
+                x = torch.utils.checkpoint.checkpoint(
+                    _stage_forward, x, use_reentrant=False,
+                )
             else:
+                for wrapper in self._moe_wrappers:
+                    wrapper.route_mode = route_mode
                 x = stage(x)
             feats[i] = x
 
@@ -237,6 +253,7 @@ class FastViTBackbone(nn.Module):
                 routing_stats[key] = {
                     'expert_weights':          stats['expert_weights'],
                     'token_entropy':           stats['token_entropy'],
+                    'router_mode':             stats['router_mode'],
                     'expert_weights_gateonly': stats['expert_weights_gateonly'],
                     'token_entropy_gateonly':  stats['token_entropy_gateonly'],
                     'gate_input_gateonly':     stats['gate_input_gateonly'],
@@ -275,6 +292,21 @@ class FastViTBackbone(nn.Module):
     def set_moe_temperature(self, temperature: float) -> None:
         for wrapper in self._moe_wrappers:
             wrapper.temperature = temperature
+
+    def refresh_gateonly_stats(
+        self,
+        routing_stats: Dict[str, Any],
+        route_mode: str,
+    ) -> None:
+        for key, wrapper in zip(self.MOE_KEYS, self._moe_wrappers):
+            stats = routing_stats.get(key)
+            if not stats or "gate_input_gateonly" not in stats:
+                continue
+            reproj = wrapper.moe_ffn.project_gateonly(
+                stats["gate_input_gateonly"], route_mode,
+            )
+            stats.update(reproj)
+            stats["router_mode"] = route_mode
 
     def freeze_stages(self, stage_indices: List[int]) -> None:
         for idx in stage_indices:

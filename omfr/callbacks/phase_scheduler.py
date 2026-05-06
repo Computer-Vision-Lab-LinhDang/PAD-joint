@@ -81,6 +81,13 @@ class PhaseSchedulerCallback(L.Callback):
         self._phase2_start = phase1_epochs
         self._phase3_start = phase1_epochs + phase2_epochs
 
+    def _phase_for_epoch(self, epoch: int) -> int:
+        if epoch >= self._phase3_start:
+            return 3
+        if epoch >= self._phase2_start:
+            return 2
+        return 1
+
     # ------------------------------------------------------------------
     # Ramp helper
     # ------------------------------------------------------------------
@@ -123,11 +130,28 @@ class PhaseSchedulerCallback(L.Callback):
     ) -> None:
         epoch = trainer.current_epoch
 
-        # Phase transitions
-        if epoch == self._phase2_start:
-            self._transition_to_phase2(pl_module, trainer)
-        elif epoch == self._phase3_start:
-            self._transition_to_phase3(pl_module, trainer)
+        # Phase transitions. Most recent checkpoints restore `current_phase`
+        # via `omfr_phase_state`, but older checkpoints may not, and resume
+        # can still leave the datamodule/phase scheduler desynced from the
+        # epoch. Infer the target phase from epoch as a safety net instead of
+        # relying only on hitting the exact boundary epoch again.
+        target_phase = self._phase_for_epoch(epoch)
+        if pl_module.current_phase != target_phase:
+            if target_phase == 2:
+                self._transition_to_phase2(pl_module, trainer)
+            elif target_phase == 3:
+                self._transition_to_phase3(pl_module, trainer)
+            else:
+                pl_module.current_phase = 1
+                pl_module.alpha = 0.0
+                pl_module.beta = 0.0
+                pl_module.alpha_adv = 0.0
+                pl_module.lam_adv = 0.0
+                self._set_moe_temperature(pl_module, self.moe_temp_phase1)
+                if hasattr(trainer, "datamodule") and trainer.datamodule is not None:
+                    trainer.datamodule.current_phase = 1
+                trainer.fit_loop._combined_loader = None
+                trainer.fit_loop.setup_data()
 
         # Phase 1: ArcFace warmup + MoE temp
         if pl_module.current_phase == 1:
@@ -169,6 +193,16 @@ class PhaseSchedulerCallback(L.Callback):
             phase2_start = self._phase2_start
             phase2_end   = self._phase2_start + self.phase2_epochs
             ramp_end_short = min(phase2_start + 5, phase2_end)
+
+            # Unfreeze PAD branch after 10 epochs of ArcFace ramp (stabilized backbone)
+            pad_unfreeze_epoch = phase2_start + 10
+            if epoch >= pad_unfreeze_epoch and not getattr(pl_module, '_pad_unfrozen_p2', False):
+                self._unfreeze_pad_branch(pl_module)
+                pl_module._pad_unfrozen_p2 = True
+                trainer.logger.log_metrics(
+                    {"phase/pad_unfrozen": 1.0},
+                    step=trainer.global_step,
+                )
 
             pl_module.alpha = self._cosine_ramp(
                 epoch, phase2_start, ramp_end_short, self.alpha_target,
@@ -266,6 +300,9 @@ class PhaseSchedulerCallback(L.Callback):
 
         self._set_moe_temperature(pl_module, self.moe_temp_phase1)
 
+        # Freeze PAD branch during ArcFace ramp to protect from backbone shift
+        self._freeze_pad_branch(pl_module)
+
         # Reload dataloaders to switch from identity-only to combined
         if hasattr(trainer, "datamodule") and trainer.datamodule is not None:
             trainer.datamodule.current_phase = 2
@@ -275,10 +312,11 @@ class PhaseSchedulerCallback(L.Callback):
         print(
             f"\n{'='*60}\n"
             f"  PHASE 2 START (epoch {trainer.current_epoch})\n"
-            f"  Joint ID+PAD batches (TASK_04)\n"
+            f"  Joint ID+PAD batches (TASK_04) — PAD branch FROZEN\n"
             f"  alpha target: {self.alpha_target}, beta target: {self.beta_target}\n"
             f"  alpha_adv target: {self.alpha_adv_target}\n"
             f"  Cosine soft-start over first 5 epochs; DANN ramp over full P2\n"
+            f"  PAD will unfreeze at epoch {self._phase2_start + 10}\n"
             f"{'='*60}\n"
         )
 
@@ -312,3 +350,25 @@ class PhaseSchedulerCallback(L.Callback):
     def _set_moe_temperature(pl_module: Any, temperature: float) -> None:
         if hasattr(pl_module, 'backbone') and hasattr(pl_module.backbone, 'set_moe_temperature'):
             pl_module.backbone.set_moe_temperature(temperature)
+
+    @staticmethod
+    def _freeze_pad_branch(pl_module: Any) -> None:
+        """Freeze PAD head + PAD stem to protect from backbone shift during ArcFace ramp."""
+        if hasattr(pl_module, 'pad_head'):
+            for p in pl_module.pad_head.parameters():
+                p.requires_grad = False
+        if hasattr(pl_module, 'pad_stem'):
+            for p in pl_module.pad_stem.parameters():
+                p.requires_grad = False
+        print("  [FREEZE] PAD branch frozen (PADHead + PADStem)")
+
+    @staticmethod
+    def _unfreeze_pad_branch(pl_module: Any) -> None:
+        """Unfreeze PAD branch for fine-tuning on shifted backbone features."""
+        if hasattr(pl_module, 'pad_head'):
+            for p in pl_module.pad_head.parameters():
+                p.requires_grad = True
+        if hasattr(pl_module, 'pad_stem'):
+            for p in pl_module.pad_stem.parameters():
+                p.requires_grad = True
+        print("  [UNFREEZE] PAD branch unfrozen (PADHead + PADStem)")

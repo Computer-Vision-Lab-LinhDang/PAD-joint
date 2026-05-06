@@ -5,6 +5,7 @@ from .moe_ffn import FreqGatedMoEFFN
 from .vit_tiny import ViTTinyBackbone
 from .tiny_vit import TinyViTBackbone
 from .fastvit import FastViTBackbone
+from .dinov2 import DINOv2Backbone
 
 __all__ = [
     "LearnableGaborStem",
@@ -14,4 +15,5 @@ __all__ = [
     "ViTTinyBackbone",
     "TinyViTBackbone",
     "FastViTBackbone",
+    "DINOv2Backbone",
 ]

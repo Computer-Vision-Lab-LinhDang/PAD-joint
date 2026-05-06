@@ -131,7 +131,10 @@ def _infer_num_classes(datamodule: OMFRDataModule) -> int:
     counts = []
     if datamodule.identity_ds is not None:
         counts.append(int(datamodule.identity_ds.num_classes))
-    if datamodule.joint_ds is not None:
+    if (
+        datamodule.joint_ds is not None
+        and getattr(datamodule.joint_ds, "contributes_identity_classes", True)
+    ):
         counts.append(int(datamodule.joint_ds.num_classes))
     return max(counts, default=0)
 
@@ -271,6 +274,12 @@ def parse_args() -> argparse.Namespace:
         help="Path to a checkpoint to resume training from.",
     )
     parser.add_argument(
+        "--init-from",
+        type=str,
+        default=None,
+        help="Path to a checkpoint to warm-start weights from (non-strict, no optimizer state).",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -299,12 +308,48 @@ def _parse_overrides(override_list: list[str]) -> Dict[str, Any]:
     return result
 
 
+def _load_pretrained_weights(model: OMFRModule, checkpoint_path: str) -> None:
+    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = ckpt.get("state_dict", ckpt)
+    current_state = model.state_dict()
+
+    filtered_state = {}
+    skipped_missing = []
+    skipped_shape = []
+
+    for key, value in state_dict.items():
+        if key not in current_state:
+            skipped_missing.append(key)
+            continue
+        if torch.is_tensor(value) and current_state[key].shape != value.shape:
+            skipped_shape.append(
+                f"{key}: ckpt={tuple(value.shape)} model={tuple(current_state[key].shape)}"
+            )
+            continue
+        filtered_state[key] = value
+
+    missing, unexpected = model.load_state_dict(filtered_state, strict=False)
+    print(
+        f"[init-from] loaded={len(filtered_state)} "
+        f"missing={len(missing)} unexpected={len(unexpected)} "
+        f"skipped_missing={len(skipped_missing)} skipped_shape={len(skipped_shape)}"
+    )
+    if skipped_shape:
+        print("[init-from] skipped shape-mismatched keys:")
+        for item in skipped_shape[:20]:
+            print(f"  - {item}")
+        if len(skipped_shape) > 20:
+            print(f"  ... and {len(skipped_shape) - 20} more")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     args = parse_args()
+    if args.resume and args.init_from:
+        raise ValueError("Use either --resume or --init-from, not both.")
 
     L.seed_everything(args.seed, workers=True)
 
@@ -324,6 +369,8 @@ def main() -> None:
         config.setdefault("identity_head", {})["num_classes"] = inferred_num_classes
 
     model      = build_module(runtime_config)
+    if args.init_from:
+        _load_pretrained_weights(model, args.init_from)
     callbacks  = build_callbacks(config)
     logger     = build_logger(config)
     trainer    = build_trainer(config, callbacks, logger)

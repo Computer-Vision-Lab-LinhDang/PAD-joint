@@ -10,13 +10,14 @@ Manages three datasets and switches DataLoader strategy per training phase:
 Datasets:
     identity_ds  — FVC2004 + NIST SD302          (identity labels only)
     pad_ds       — LivDet 2015 + LivDet 2017     (liveness labels only)
-    joint_ds     — MSU-FPAD v2.0                 (both identity + liveness)
+    joint_ds     — MSU-FPAD v2.0, or LivDetJoint fallback for Phase 3
     val_ds       — joint or identity test split  (validation)
 
 Config dict keys:
     identity_root:   str  — root dir for identity datasets
     pad_root:        str  — root dir for PAD datasets
     joint_root:      str  — root dir for joint dataset
+    livdet_joint_enabled: bool — synthesize Phase-3 joint fallback from LivDet
     num_workers:     int  — DataLoader workers (default 8)
     pk_P:            int  — P identities per identity batch (default 32)
     pk_K:            int  — K samples per identity (default 4)
@@ -70,6 +71,7 @@ class OMFRDataModule(L.LightningDataModule):
         from omfr.data.datasets.identity_dataset import IdentityDataset
         from omfr.data.datasets.pad_dataset import PADDataset, make_pad_train_transform
         from omfr.data.datasets.joint_dataset import JointDataset
+        from omfr.data.datasets.livdet_joint_dataset import LivDetJointDataset
         from omfr.data.transforms import get_transforms
 
         identity_root = self._cfg_get("identity_root", "data.identity_data_root", default="")
@@ -77,12 +79,42 @@ class OMFRDataModule(L.LightningDataModule):
         joint_root    = self._cfg_get("joint_root", "data.joint_data_root", default="")
         pad_datasets  = self._cfg_get("pad_datasets", "data.pad_datasets", default=[])
         pad_roots     = self._resolve_named_roots(pad_root, pad_datasets)
+        livdet_joint_enabled = bool(self._cfg_get(
+            "livdet_joint_enabled", "data.livdet_joint.enabled", default=False,
+        ))
+        livdet_joint_root = self._cfg_get(
+            "livdet_joint_root", "data.livdet_joint.root", default="",
+        )
+        livdet_joint_datasets = self._cfg_get(
+            "livdet_joint_datasets", "data.livdet_joint.datasets", default=pad_datasets,
+        )
+        livdet_joint_fallback = bool(self._cfg_get(
+            "livdet_joint_fallback_to_pad_roots",
+            "data.livdet_joint.fallback_to_pad_roots",
+            default=True,
+        ))
+        livdet_joint_required = bool(self._cfg_get(
+            "livdet_joint_required", "data.livdet_joint.required", default=False,
+        ))
+        livdet_joint_roots = []
+        if livdet_joint_enabled:
+            if livdet_joint_root:
+                livdet_joint_roots = self._resolve_named_roots(
+                    livdet_joint_root, livdet_joint_datasets,
+                )
+                if not livdet_joint_roots and Path(livdet_joint_root).exists():
+                    livdet_joint_roots = [str(Path(livdet_joint_root))]
+            if not livdet_joint_roots and livdet_joint_fallback:
+                livdet_joint_roots = pad_roots
         identity_root = identity_root if identity_root and Path(identity_root).exists() else ""
         joint_root = joint_root if joint_root and Path(joint_root).exists() else ""
 
         group_by_subject = bool(self._cfg_get(
             "group_by_subject", "data.group_by_subject", default=False,
         ))
+        identity_label_mode = self._cfg_get(
+            "identity_label_mode", "data.identity_label_mode", default=None,
+        )
         identity_num_views = int(self._cfg_get(
             "identity_num_views", "data.identity_num_views", default=2,
         ))
@@ -98,6 +130,7 @@ class OMFRDataModule(L.LightningDataModule):
                 self.identity_ds = IdentityDataset(
                     root=identity_root, split="train",
                     group_by_subject=group_by_subject,
+                    identity_label_mode=identity_label_mode,
                     num_views=identity_num_views,
                     transform=get_transforms(
                         'train', output_size=image_size, preset=identity_preset,
@@ -116,6 +149,22 @@ class OMFRDataModule(L.LightningDataModule):
                 )
             if joint_root:
                 self.joint_ds = JointDataset(root=joint_root, split="train")
+            elif livdet_joint_roots:
+                try:
+                    self.joint_ds = LivDetJointDataset(
+                        root=(
+                            livdet_joint_roots
+                            if len(livdet_joint_roots) > 1
+                            else livdet_joint_roots[0]
+                        ),
+                        split="train",
+                        transform=make_pad_train_transform(image_size=image_size),
+                        image_size=image_size,
+                    )
+                except (FileNotFoundError, RuntimeError):
+                    if livdet_joint_required:
+                        raise
+                    self.joint_ds = None
 
         if stage in ("fit", "validate", None):
             # Prefer joint dataset for validation (has both label types)
@@ -125,6 +174,7 @@ class OMFRDataModule(L.LightningDataModule):
                 self.val_ds = IdentityDataset(
                     root=identity_root, split="val",
                     group_by_subject=group_by_subject,
+                    identity_label_mode=identity_label_mode,
                 )
 
             # PAD validation — needed when val_ds lacks liveness labels

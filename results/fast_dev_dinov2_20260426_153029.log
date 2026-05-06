@@ -1,0 +1,52 @@
+/home/linhdang/anaconda3/lib/python3.11/site-packages/requests/__init__.py:113: RequestsDependencyWarning: urllib3 (2.0.7) or chardet (7.4.3)/charset_normalizer (2.0.4) doesn't match a supported version!
+  warnings.warn(
+/home/linhdang/anaconda3/lib/python3.11/site-packages/pandas/core/arrays/masked.py:56: UserWarning: Pandas requires version '1.4.2' or newer of 'bottleneck' (version '1.3.7' currently installed).
+  from pandas.core import (
+Seed set to 42
+Using 16bit Automatic Mixed Precision (AMP)
+GPU available: True (cuda), used: True
+TPU available: False, using: 0 TPU cores
+💡 Tip: For seamless cloud logging and experiment tracking, try installing [litlogger](https://pypi.org/project/litlogger/) to enable LitLogger, which logs metrics and artifacts automatically to the Lightning Experiments platform.
+Running in `fast_dev_run` mode: will run the requested loop using 1 batch(es). Logging and checkpointing is suppressed.
+You are using a CUDA device ('NVIDIA GeForce RTX 4070') that has Tensor Cores. To properly utilize them, you should set `torch.set_float32_matmul_precision('medium' | 'high')` which will trade-off precision for performance. For more details, read https://pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html#torch.set_float32_matmul_precision
+/home/linhdang/anaconda3/lib/python3.11/site-packages/lightning/pytorch/callbacks/model_checkpoint.py:881: Checkpoint directory /home/linhdang/workspace2/PAD-joint/checkpoints exists and is not empty.
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+/home/linhdang/anaconda3/lib/python3.11/site-packages/lightning/pytorch/utilities/model_summary/model_summary.py:242: Precision 16-mixed is not supported by the model summary.  Estimated model size in MB will not be accurate. Using 32 bits instead.
+┏━━━━┳━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━┳━━━━━━━┓
+┃    ┃ Name                 ┃ Type                  ┃ Params ┃ Mode  ┃ FLOPs ┃
+┡━━━━╇━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━╇━━━━━━━┩
+│ 0  │ gabor                │ LearnableGaborStem    │     16 │ train │     0 │
+│ 1  │ gabor_pad            │ LearnableGaborStem    │     16 │ train │     0 │
+│ 2  │ backbone             │ DINOv2Backbone        │ 22.1 M │ train │     0 │
+│ 3  │ pad_stem             │ PADStem               │  395 K │ train │     0 │
+│ 4  │ pad_head             │ PADHead               │  654 K │ train │     0 │
+│ 5  │ identity_head        │ IdentityHead          │  1.6 M │ train │     0 │
+│ 6  │ arcface_losses       │ ModuleDict            │  1.1 M │ train │     0 │
+│ 7  │ pad_focal_loss       │ FocalBCELoss          │      0 │ train │     0 │
+│ 8  │ pad_mixup_loss       │ MixUpConsistency      │      0 │ train │     0 │
+│ 9  │ bce_loss             │ BCEWithLogitsLoss     │      0 │ train │     0 │
+│ 10 │ supcon_identity_loss │ SupConLoss            │      0 │ train │     0 │
+│ 11 │ orth_loss            │ OrthogonalityLoss     │      0 │ train │     0 │
+│ 12 │ sensor_adv_head      │ SensorAdversarialHead │ 17.7 K │ train │     0 │
+│ 13 │ sensor_adv_loss      │ SensorAdversarialLoss │      0 │ train │     0 │
+└────┴──────────────────────┴───────────────────────┴────────┴───────┴───────┘
+Trainable params: 25.8 M                                                        
+Non-trainable params: 0                                                         
+Total params: 25.8 M                                                            
+Total estimated model params size (MB): 103                                     
+Modules in train mode: 422                                                      
+Modules in eval mode: 0                                                         
+Total FLOPs: 0                                                                  
+/home/linhdang/anaconda3/lib/python3.11/site-packages/lightning/pytorch/trainer/connectors/data_connector.py:434: The 'train_dataloader' does not have many workers which may be a bottleneck. Consider increasing the value of the `num_workers` argument` to `num_workers=19` in the `DataLoader` to improve performance.
+/home/linhdang/anaconda3/lib/python3.11/site-packages/lightning/pytorch/trainer/connectors/data_connector.py:434: The 'val_dataloader' does not have many workers which may be a bottleneck. Consider increasing the value of the `num_workers` argument` to `num_workers=19` in the `DataLoader` to improve performance.
+`Trainer.fit` stopped: `max_steps=1` reached.
+Epoch 0/0  ━━━━━━━━━━━━━━━━━━ 1/1 0:00:00 • 0:00:00 0.00it/s train/identity_los…
+                                                             0.775              
+                                                             train/total_loss:  
+                                                             0.775              
+                                                             val/pad_accuracy:  
+                                                             0.000              
+                                                             val/identity_rank1:
+                                                             1.000              
+                                                             val/cascaded_IM:   
+                                                             1.000              

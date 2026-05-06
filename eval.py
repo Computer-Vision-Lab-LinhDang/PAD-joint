@@ -73,30 +73,42 @@ def extract_pad_scores(
     model: OMFRModule,
     dataloader: DataLoader,
     device: torch.device,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, np.ndarray]]:
     """
     Extract PAD liveness scores P(live) for all samples.
 
     Returns:
         scores: (N,) float32 numpy — P(live) in [0, 1]
         labels: (N,) int32 numpy — 1=live, 0=spoof
+        meta:   optional arrays such as sensor/material ids
     """
     model.eval()
     all_scores = []
     all_labels = []
+    all_sensors = []
+    all_materials = []
 
     for batch in dataloader:
         images = batch["images"].to(device)
         labels = batch["liveness_labels"]
 
-        backbone_out = model._run_backbone(images)
+        backbone_out = model._run_backbone(images, route_mode="pad")
         pad_out = model._run_pad(backbone_out)
 
         scores = torch.sigmoid(pad_out["pad_logit"].squeeze(-1)).cpu().numpy()
         all_scores.append(scores)
         all_labels.append(labels.numpy())
+        if isinstance(batch, dict) and "sensor_labels" in batch:
+            all_sensors.append(batch["sensor_labels"].numpy())
+        if isinstance(batch, dict) and "material_labels" in batch:
+            all_materials.append(batch["material_labels"].numpy())
 
-    return np.concatenate(all_scores), np.concatenate(all_labels)
+    meta: Dict[str, np.ndarray] = {}
+    if all_sensors:
+        meta["sensor_ids"] = np.concatenate(all_sensors)
+    if all_materials:
+        meta["material_ids"] = np.concatenate(all_materials)
+    return np.concatenate(all_scores), np.concatenate(all_labels), meta
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -143,9 +155,9 @@ def eval_pad(
     model: OMFRModule,
     dataloader: DataLoader,
     device: torch.device,
-) -> Dict[str, float]:
+) -> Dict[str, Any]:
     """Evaluate PAD: EER, ACER, APCER, BPCER."""
-    scores, labels = extract_pad_scores(model, dataloader, device)
+    scores, labels, meta = extract_pad_scores(model, dataloader, device)
 
     eer, eer_thresh = compute_eer(scores, labels)
 
@@ -153,7 +165,7 @@ def eval_pad(
     metrics_fixed = compute_apcer_bpcer_acer(scores, labels, threshold=0.5)
     metrics_eer = compute_apcer_bpcer_acer(scores, labels, threshold=eer_thresh)
 
-    return {
+    result: Dict[str, Any] = {
         "EER": eer,
         "EER_threshold": eer_thresh,
         "ACER@0.5": metrics_fixed["ACER"],
@@ -165,6 +177,124 @@ def eval_pad(
         "num_live": int((labels == 1).sum()),
         "num_spoof": int((labels == 0).sum()),
     }
+    if "sensor_ids" in meta:
+        result["sensor_breakdown"] = compute_pad_group_breakdown(
+            scores,
+            labels,
+            meta["sensor_ids"],
+            list(PADDataset.SENSOR_NAMES),
+        )
+    if "material_ids" in meta:
+        result["spoof_material_breakdown"] = compute_spoof_material_breakdown(
+            scores,
+            labels,
+            meta["material_ids"],
+            list(PADDataset.MATERIAL_NAMES),
+        )
+    if "sensor_ids" in meta and "material_ids" in meta:
+        result["sensor_material_breakdown"] = compute_sensor_material_breakdown(
+            scores,
+            labels,
+            meta["sensor_ids"],
+            meta["material_ids"],
+            list(PADDataset.SENSOR_NAMES),
+            list(PADDataset.MATERIAL_NAMES),
+        )
+    return result
+
+
+def compute_pad_group_breakdown(
+    scores: np.ndarray,
+    labels: np.ndarray,
+    group_ids: np.ndarray,
+    group_names: List[str],
+) -> List[Dict[str, Any]]:
+    """Compute PAD metrics per group, e.g. per capture sensor."""
+    rows: List[Dict[str, Any]] = []
+    for group_id in sorted(np.unique(group_ids).astype(int).tolist()):
+        mask = group_ids == group_id
+        if not mask.any():
+            continue
+        group_scores = scores[mask]
+        group_labels = labels[mask]
+        fixed = compute_apcer_bpcer_acer(group_scores, group_labels, threshold=0.5)
+        if (group_labels == 1).any() and (group_labels == 0).any():
+            group_eer, group_thresh = compute_eer(group_scores, group_labels)
+        else:
+            group_eer, group_thresh = float("nan"), 0.5
+        rows.append({
+            "name": group_names[group_id] if 0 <= group_id < len(group_names) else str(group_id),
+            "id": group_id,
+            "n": int(mask.sum()),
+            "num_live": int((group_labels == 1).sum()),
+            "num_spoof": int((group_labels == 0).sum()),
+            "EER": group_eer,
+            "EER_threshold": group_thresh,
+            "APCER@0.5": fixed["APCER"],
+            "BPCER@0.5": fixed["BPCER"],
+            "ACER@0.5": fixed["ACER"],
+            "live_score_mean": float(group_scores[group_labels == 1].mean()) if (group_labels == 1).any() else float("nan"),
+            "spoof_score_mean": float(group_scores[group_labels == 0].mean()) if (group_labels == 0).any() else float("nan"),
+        })
+    return rows
+
+
+def compute_spoof_material_breakdown(
+    scores: np.ndarray,
+    labels: np.ndarray,
+    material_ids: np.ndarray,
+    material_names: List[str],
+) -> List[Dict[str, Any]]:
+    """Report APCER by spoof material at the fixed threshold."""
+    rows: List[Dict[str, Any]] = []
+    spoof_mask = labels == 0
+    for material_id in sorted(np.unique(material_ids[spoof_mask]).astype(int).tolist()):
+        mask = spoof_mask & (material_ids == material_id)
+        if not mask.any():
+            continue
+        material_scores = scores[mask]
+        rows.append({
+            "name": material_names[material_id] if 0 <= material_id < len(material_names) else str(material_id),
+            "id": material_id,
+            "n": int(mask.sum()),
+            "APCER@0.5": float((material_scores >= 0.5).mean()),
+            "score_mean": float(material_scores.mean()),
+            "score_p90": float(np.percentile(material_scores, 90)),
+        })
+    rows.sort(key=lambda row: row["APCER@0.5"], reverse=True)
+    return rows
+
+
+def compute_sensor_material_breakdown(
+    scores: np.ndarray,
+    labels: np.ndarray,
+    sensor_ids: np.ndarray,
+    material_ids: np.ndarray,
+    sensor_names: List[str],
+    material_names: List[str],
+) -> List[Dict[str, Any]]:
+    """Report APCER for each spoof material within each sensor."""
+    rows: List[Dict[str, Any]] = []
+    spoof_mask = labels == 0
+    pairs = sorted({
+        (int(sensor_id), int(material_id))
+        for sensor_id, material_id in zip(sensor_ids[spoof_mask], material_ids[spoof_mask])
+    })
+    for sensor_id, material_id in pairs:
+        mask = spoof_mask & (sensor_ids == sensor_id) & (material_ids == material_id)
+        material_scores = scores[mask]
+        rows.append({
+            "sensor": sensor_names[sensor_id] if 0 <= sensor_id < len(sensor_names) else str(sensor_id),
+            "sensor_id": sensor_id,
+            "material": material_names[material_id] if 0 <= material_id < len(material_names) else str(material_id),
+            "material_id": material_id,
+            "n": int(mask.sum()),
+            "APCER@0.5": float((material_scores >= 0.5).mean()),
+            "score_mean": float(material_scores.mean()),
+            "score_p90": float(np.percentile(material_scores, 90)),
+        })
+    rows.sort(key=lambda row: row["APCER@0.5"], reverse=True)
+    return rows
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -201,7 +331,7 @@ def print_identity_results(db_name: str, results: Dict[str, Dict]):
             print(f"      {k}: {metrics[k]*100:.2f}%")
 
 
-def print_pad_results(ds_name: str, metrics: Dict[str, float]):
+def print_pad_results(ds_name: str, metrics: Dict[str, Any]):
     print(f"\n  [{ds_name}]  (live={metrics['num_live']}, spoof={metrics['num_spoof']})")
     print(f"    EER:        {metrics['EER']*100:.2f}%  (threshold={metrics['EER_threshold']:.4f})")
     print(f"    @threshold=0.5:")
@@ -212,6 +342,30 @@ def print_pad_results(ds_name: str, metrics: Dict[str, float]):
     print(f"      APCER:  {metrics['APCER@EER']*100:.2f}%")
     print(f"      BPCER:  {metrics['BPCER@EER']*100:.2f}%")
     print(f"      ACER:   {metrics['ACER@EER']*100:.2f}%")
+
+    sensor_rows = metrics.get("sensor_breakdown") or []
+    if sensor_rows:
+        print(f"    By sensor @0.5:")
+        for row in sensor_rows:
+            print(
+                f"      {row['name']:<15}"
+                f" EER={row['EER']*100:5.2f}%"
+                f" APCER={row['APCER@0.5']*100:5.2f}%"
+                f" BPCER={row['BPCER@0.5']*100:5.2f}%"
+                f" n={row['n']}"
+            )
+
+    material_rows = metrics.get("sensor_material_breakdown") or []
+    if material_rows:
+        print(f"    Worst spoof sensor/material @0.5:")
+        for row in material_rows[:8]:
+            print(
+                f"      {row['sensor']:<15} {row['material']:<10}"
+                f" APCER={row['APCER@0.5']*100:5.2f}%"
+                f" mean={row['score_mean']:.4f}"
+                f" p90={row['score_p90']:.4f}"
+                f" n={row['n']}"
+            )
 
 
 def print_summary_table(
@@ -331,7 +485,11 @@ def main():
 
     # Load model
     print(f"Loading checkpoint: {args.checkpoint}")
-    model = OMFRModule.load_from_checkpoint(args.checkpoint, map_location=device)
+    model = OMFRModule.load_from_checkpoint(
+        args.checkpoint,
+        map_location=device,
+        strict=False,
+    )
     model = model.to(device)
     model.eval()
     print("Model loaded.\n")

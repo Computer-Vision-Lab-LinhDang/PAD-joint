@@ -1,29 +1,48 @@
-# configs/base.yaml — OMFR v2 Base Configuration (FastViT-SA12)
+# configs/base.yaml — OMFR v2 Base Configuration (DINOv2 ViT-S/14)
 # All hyperparameters for OMFRModule, OMFRDataModule, Trainer, and evaluation.
 
 # ─────────────────────────────────────────────────────────────────
-# Model — Backbone (FastViT-SA12, ~10.5M)
+# Model — Backbone (DINOv2 ViT-S/14, pretrained)
 # ─────────────────────────────────────────────────────────────────
 backbone:
-  name: fastvit_sa12         # FastViT-SA12 — RepMixer s0-s2 + Self-Attn s3
-  pretrained: true           # Load ImageNet-1k distilled weights from timm
+  name: vit_small_patch14_dinov2
+  pretrained: true           # Load DINOv2 pretrained weights from timm/HF
   in_chans: 8                # 8-channel Gabor stem input
-  # FastViT-SA12 architecture (fixed, from timm):
-  #   stage0: (B, 64, 56, 56)   2 x RepMixerBlock
-  #   stage1: (B,128, 28, 28)   2 x RepMixerBlock
-  #   stage2: (B,256, 14, 14)   6 x RepMixerBlock
-  #   stage3: (B,512,  7,  7)   2 x AttentionBlock (multi-head self-attn)
-  #
-  # MoE insertion points (stage_idx, block_idx):
-  #   Stage 1 block 1: 28×28 tokens, 128-ch   ('s2')
-  #   Stage 2 block 2: 14×14 tokens, 256-ch   ('s3a')
-  #   Stage 2 block 5: 14×14 tokens, 256-ch   ('s3b')
+  img_size: 224              # patch14 -> 16x16 token grid
+  # DINOv2 adapter exposes a feature pyramid compatible with existing heads:
+  #   stage1: (B, 64, 56, 56)   projected early ViT tokens
+  #   stage2: (B,128, 28, 28)   projected early/mid ViT tokens
+  #   stage3: (B,384, 16, 16)   mid ViT tokens
+  #   stage4: (B,384,  8,  8)   pooled late ViT tokens
+  stage1_dim: 64
+  stage2_dim: 128
+  # DINOv2 has no MoE router; these are retained for config compatibility.
   num_experts: 4
   top_k: 2
-  # Gradient checkpointing trades ~30% extra compute for ~2× lower
-  # activation memory. Needed to fit Phase 2 (two head forwards +
-  # orth loss) on a single GPU at batch 128.
+  # 11.5 GiB GPU: keep checkpointing on. With pk_p=32 * num_views=3 = 192
+  # ID samples + PAD 96 in Phase 2, activations still peak near the budget
+  # without checkpointing.
   grad_checkpoint: true
+
+# ─────────────────────────────────────────────────────────────────
+# LoRA — DoRA + AdaLoRA-flavor task-conditional adapters
+# Freezes the DINOv2 trunk and trains a separate (P, E, Q, m) tuple
+# for each task ("identity" / "pad") inside every attn/MLP nn.Linear.
+# ─────────────────────────────────────────────────────────────────
+lora:
+  enabled: true
+  rank: 32                   # SVD rank of P @ diag(E) @ Q
+  alpha: 64                  # scaling = alpha / rank (kept at 2)
+  dropout: 0.05
+  target_modules: [qkv, proj, fc1, fc2]   # all attention + MLP linears
+  tasks: [identity, pad]
+  # Optimizer multipliers (relative to base lr)
+  lr_mult: 5.0               # LoRA P/E/Q LR multiplier (LoRA needs higher LR)
+  magnitude_lr_mult: 1.0     # DoRA magnitude vector LR
+  # AdaLoRA-style orthogonality regularizer weight on (P^T P - I, Q Q^T - I)
+  # Per-layer-averaged value is ~6e3 at init with kaiming_uniform_; 1e-5
+  # keeps the term well under 0.1 in absolute scale relative to id/PAD loss.
+  orth_weight: 1.0e-5
 
 # ─────────────────────────────────────────────────────────────────
 # Model — Gabor Stem
@@ -39,10 +58,10 @@ gabor:
 identity_head:
   embed_dim: 256             # identity embedding dimension
   num_heads: 8               # structural attention heads
-  grid_size: 14              # 14x14 token grid from FastVit stage2 (196 tokens)
+  grid_size: 16              # 16x16 token grid from DINOv2 patch14 at 224px
   num_queries: 4             # attentive pooling query seeds
-  stage3_dim: 256            # FastVit stage2 output dim (was 160 for TinyViT)
-  stage4_dim: 512            # FastVit stage3 output dim (was 320 for TinyViT)
+  stage3_dim: 384            # DINOv2 ViT-S embedding dim
+  stage4_dim: 384            # DINOv2 ViT-S embedding dim
   mrl_dims: [64, 128, 256]
   num_classes: 5000          # Number of training identities (auto-detected)
 
@@ -52,6 +71,7 @@ identity_head:
 pad_head:
   stage1_dim: 64             # TinyViT Stage 0 output dim
   stage2_dim: 128            # TinyViT Stage 1 output dim
+  gabor_dim: 8               # detached Gabor channels for PAD texture branch
   dropout: 0.1
   pad_features_dim: 128
   pad_embedding_dim: 32
@@ -61,10 +81,10 @@ pad_head:
 # ─────────────────────────────────────────────────────────────────
 losses:
   arcface:
-    margin: 0.5
-    scale_phase1: 32.0       # gentle scale for Phase 1
-    scale_final: 48.0        # full scale reached by end of Phase 2 warmup
-    easy_margin: false
+    margin: 0.35             # was 0.5 — gentler for 5k-class regime
+    scale_phase1: 16.0       # was 32.0 — keep softmax unsaturated post-warmup
+    scale_final: 32.0        # was 48.0 — final scale capped lower
+    easy_margin: true        # was false — piecewise branch, robust to large m
   supcon:
     temperature: 0.07
     contrast_mode: all
@@ -73,12 +93,31 @@ losses:
     eps: 1.0e-8
   # Loss weights
   alpha: 0.0                 # PAD loss weight (ramped in Phase 2)
-  beta: 0.0                  # Orthogonality loss weight (ramped in Phase 2)
+  beta: 0.0                  # Shared-route bridge loss weight (ramped in Phase 2)
   gamma: 0.05                # Load-balance loss weight (up from 0.01 to combat imbalance)
+  # PAD classification now uses focal + BCE. BCE gives a stronger early
+  # separation signal on the frozen-backbone PAD branch; focal still keeps
+  # attention on hard samples once the head starts separating.
+  pad_focal_gamma: 1.0
+  pad_focal_alpha: 0.5
+  pad_focal_weight: 1.0
+  pad_bce_weight: 0.5
+  # LivDet2013 failure mode is concentrated in Swipe spoof materials.
+  # Sensor ids follow PADDataset.SENSOR_NAMES; material ids follow
+  # PADDataset.MATERIAL_NAMES. These weights only affect spoof samples.
+  pad_hard_spoof_sensor_ids: [6]      # Swipe
+  pad_hard_spoof_material_ids: [4, 6, 7]  # Latex, PlayDoh, WoodGlue
+  pad_hard_spoof_weight: 2.0
+  pad_ohem_fraction: 0.25
+  pad_ohem_weight: 1.5
   # Hybrid identity loss — SupCon (open-set) + ArcFace (closed-set).
-  # SupCon dominates so embeddings generalize to unseen FVC identities.
-  identity_supcon_weight: 0.9
-  identity_arcface_weight: 0.1
+  # Increased ArcFace weight to enforce stronger angular margin with large M.
+  identity_supcon_weight: 0.7
+  identity_arcface_weight: 0.3
+  # LivDet Joint samples carry parsed pseudo-identities only. Mark them with
+  # this ignore index so ArcFace/SupCon do not train the global identity head
+  # from LivDet-local labels.
+  identity_ignore_index: -1
 
 # ─────────────────────────────────────────────────────────────────
 # Optimizer
@@ -98,48 +137,53 @@ optimizer:
     identity_head: 1.0
     pad_head_phase1: 1.0
     pad_head_phase2: 2.0     # higher LR in Phase 2
-    arcface: 0.1             # reduced from 10x to prevent gradient explosion
+    arcface: 0.3             # rolled back: bumping mid-run desyncs Adam state
 
 scheduler:
   name: CosineAnnealingLR
-  T_max: 60                  # total training epochs
+  T_max: 100                 # total training epochs
   eta_min: 1.0e-6
 
 # ─────────────────────────────────────────────────────────────────
 # Training Phases
 # ─────────────────────────────────────────────────────────────────
 phases:
-  phase1_epochs: 20           # Identity Foundation (smoke test: compressed)
-  phase2_epochs: 20          # PAD Integration: epochs 20-39
-  phase3_epochs: 20          # Joint Refinement: epochs 40-59
-  total_epochs: 60            # smoke test compression
+  phase1_epochs: 40          # Identity Foundation
+  phase2_epochs: 20          # PAD Integration: epochs 40-59
+  phase3_epochs: 40          # Joint Refinement: epochs 60-99
+  total_epochs: 100
 
   # Phase 1 ArcFace warmup (prevents gradient explosion with many classes)
-  phase1_warmup_delay: 5     # hold s=1, m=0 for first N epochs while LR warms up
-  phase1_warmup_epochs: 5    # smoke test: compressed
+  phase1_warmup_delay: 10    # hold s=1, m=0 longer (LR warmup + extra grace)
+  phase1_warmup_epochs: 15   # ramp 1→16 spread over more epochs
   arcface_scale_init: 1.0    # gentle start
   arcface_margin_init: 0.0   # no angular margin initially
-  arcface_margin_target: 0.5 # full margin by end of Phase 1 warmup
+  arcface_margin_target: 0.5  # full margin by end of Phase 1 warmup
 
   # Phase 2 warmup for alpha/beta/arcface_scale ramps
   warmup_epochs: 5          
   alpha_target: 1.0
-  # Orthogonality weight: reduced 0.1 -> 0.02 because β=0.1 was
-  # visibly distorting the 256-D identity embedding (MRL 256 < 128
-  # at eval). With separate Gabor banks and a beefed-up pad_stem,
-  # PAD and identity already share less representation, so a lighter
-  # decorrelation pressure suffices.
+  # Shared-route bridge weight. PAD and identity now learn from the same
+  # representation; β keeps the PAD-routed MRL prefix aligned with the
+  # identity-routed prefix on the same sample without forcing the two
+  # task heads to collapse into identical logits.
   beta_target: 0.02
-  # TASK_03/04: DANN sensor-adversarial weight on pad_features. Ramped
-  # by cosine over FULL Phase 2; lam_adv (GRL strength) uses sigmoid.
-  alpha_adv_target: 0.0      # DANN DISABLED (ablation smoke test)
-  arcface_scale_start: 32.0
-  arcface_scale_end: 48.0
+  # Phase-3 fix: DANN at full strength was erasing sensor cues that
+  # fingerprint identity also depends on, accelerating identity drift in
+  # Phase 3. Disable until joint-refinement gradient isolation is verified
+  # to be net-positive; revisit only if cross-sensor PAD plateaus too low.
+  alpha_adv_target: 0.0
+  arcface_scale_start: 32.0  # Phase 2 start (ramped from Phase 1)
+  arcface_scale_end: 48.0    # Phase 2 cap for strong angular margin
 
   # MoE temperature schedule
   moe_temp_phase1: 2.0       # soft routing (exploration)
   moe_temp_phase2_end: 1.0   # gradual sharpening
-  moe_temp_phase3_end: 0.5   # sharp routing (specialization)
+  # Phase-3 fix: ramping temperature 1.0 → 0.5 in Phase 3 changes the
+  # routing distribution that both heads were trained on at temp=1.0 in
+  # Phase 2, contributing to the Phase-3 plateau. Hold at 1.0 until
+  # joint-refinement is stable, then revisit.
+  moe_temp_phase3_end: 1.0   # was 0.5; held flat to avoid distribution shift
 
 # ─────────────────────────────────────────────────────────────────
 # DataModule
@@ -151,38 +195,51 @@ data:
   joint_data_root: ""
 
   # Supported identity datasets: fvc2004, nist_sd302, nist_sd300, nist_sd302a
-  identity_datasets: [nist_sd300]
+  identity_datasets: [nist_sd300, nist_sd302, nist_sd302a]
   # Supported PAD datasets: livdet2013, livdet2015, livdet2017
   pad_datasets: [LivDet2013, LivDet2015]
   # Supported joint datasets: msu_fpad
   joint_datasets: []
+  # Phase-3 fallback joint loader synthesized from LivDet filenames.
+  # Empty root means: reuse the resolved `pad_data_root` + `pad_datasets`
+  # roots. These samples are PAD-supervised; their parsed identities are
+  # local pseudo-labels and are ignored by the identity loss.
+  livdet_joint:
+    # Phase-3 fix: when pseudo-id is ignored AND PAD route is gradient-
+    # isolated, LivDet joint becomes byte-for-byte equivalent to the PAD
+    # sub-batch (same root, same loss). Disable to halve Phase-3 step cost
+    # and keep the loss landscape identical to a stabilized Phase 2.
+    # Re-enable only after pseudo-id is wired to SupCon (Option 2).
+    enabled: false
+    root: ""
+    datasets: [LivDet2013, LivDet2015]
+    fallback_to_pad_roots: true
+    required: false
 
   image_size: 224
   grayscale: true            # load as single-channel
-  # Group NIST SD300 folders by subject (merge frgp_01..10 per subject)
-  # to reduce class count from ~10,300 → ~1,030 with ~20 samples/class.
-  group_by_subject: true
+  # Fingerprint identity is subject + finger position (FRGP), not subject only.
+  # In combined_nist, r302 rolled and d302 plain/flat views share n302 labels.
+  identity_label_mode: canonical_finger
+  group_by_subject: false    # legacy subject-only grouping; keep disabled
 
   # PKSampler settings (Phase 1 / Phase 2 identity loader)
   pk_p: 32                   # identities per batch
-  # TASK_06: multi-view SupCon doubles effective samples per identity,
-  # so pk_k halved (32 * 2 * 2 = 128 total, same memory).
+  # TASK_06: multi-view SupCon. Total ID batch = pk_p * pk_k * num_views
+  # = 32 * 2 * 3 = 192 (fits 11.5 GiB with grad_checkpoint on).
   pk_k: 2                    # samples per identity (× num_views)
   # BalancedPADSampler (Phase 2 PAD loader)
-  # Cut 128 -> 64 because Phase-2 joint step runs TWO backbone forwards
-  # (id + pad) per optimizer step; 128 PAD samples on an 11 GiB card
-  # OOMs at the epoch-20 boundary even with the pad-backbone no_grad
-  # optimization. 32 live + 32 spoof is still balanced.
-  pad_batch_size: 64         # 50/50 live/spoof
+  pad_batch_size: 96         # 48 live / 48 spoof (Phase-2 dual-forward budget)
+  val_batch_size: 48         # keep val peak memory below Phase-2 step
 
   # TASK_06: FVC-mimicking augmentation + multi-view SupCon for identity
   # open-set transfer. Each sample yields `identity_num_views` augmented
   # copies stacked as (V, C, H, W); OMFRModule flattens to (B*V, ...)
   # with labels repeated so SupCon/ArcFace see independent views.
-  identity_num_views: 2
+  identity_num_views: 3
   identity_preset: fingerprint_hard
 
-  num_workers: 8
+  num_workers: 12
   pin_memory: true
   val_split: 0.1             # fraction of data held out for validation
 
@@ -193,9 +250,9 @@ trainer:
   accelerator: gpu
   devices: 1
   precision: 16-mixed
-  max_epochs: 60               
+  max_epochs: 100              # must match phases.total_epochs
   gradient_clip_val: 0.5
-  accumulate_grad_batches: 2   # effective batch ≈ 256
+  accumulate_grad_batches: 1   # real batch each step (no accumulation)
   log_every_n_steps: 10
   check_val_every_n_epoch: 1
   enable_progress_bar: true

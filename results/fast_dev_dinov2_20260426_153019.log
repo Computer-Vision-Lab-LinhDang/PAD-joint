@@ -1,0 +1,25 @@
+/home/linhdang/anaconda3/lib/python3.11/site-packages/requests/__init__.py:113: RequestsDependencyWarning: urllib3 (2.0.7) or chardet (7.4.3)/charset_normalizer (2.0.4) doesn't match a supported version!
+  warnings.warn(
+/home/linhdang/anaconda3/lib/python3.11/site-packages/pandas/core/arrays/masked.py:56: UserWarning: Pandas requires version '1.4.2' or newer of 'bottleneck' (version '1.3.7' currently installed).
+  from pandas.core import (
+Seed set to 42
+Using 16bit Automatic Mixed Precision (AMP)
+Traceback (most recent call last):
+  File "/home/linhdang/workspace2/PAD-joint/train.py", line 380, in <module>
+    main()
+  File "/home/linhdang/workspace2/PAD-joint/train.py", line 373, in main
+    trainer    = build_trainer(config, callbacks, logger)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/linhdang/workspace2/PAD-joint/train.py", line 250, in build_trainer
+    return L.Trainer(**trainer_kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/linhdang/anaconda3/lib/python3.11/site-packages/lightning/pytorch/utilities/argparse.py", line 70, in insert_env_defaults
+    return fn(self, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/home/linhdang/anaconda3/lib/python3.11/site-packages/lightning/pytorch/trainer/trainer.py", line 447, in __init__
+    self._callback_connector.on_trainer_init(
+  File "/home/linhdang/anaconda3/lib/python3.11/site-packages/lightning/pytorch/trainer/connectors/callback_connector.py", line 79, in on_trainer_init
+    self._configure_progress_bar(enable_progress_bar)
+  File "/home/linhdang/anaconda3/lib/python3.11/site-packages/lightning/pytorch/trainer/connectors/callback_connector.py", line 148, in _configure_progress_bar
+    raise MisconfigurationException(
+lightning.fabric.utilities.exceptions.MisconfigurationException: Trainer was configured with `enable_progress_bar=False` but found `RichProgressBar` in callbacks list.

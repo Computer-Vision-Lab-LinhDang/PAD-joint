@@ -65,7 +65,28 @@ class FreqGatedMoEFFN(nn.Module):
         # Frequency-based gating — 2-layer router so the gate can learn a
         # richer mapping from the 3-band energy features to E experts.
         self.freq_gate = FrequencyGate()
-        self.gate_proj = nn.Sequential(
+        self.gate_proj = self._build_router()
+        self.pad_gate_proj = self._build_router()
+        # PAD starts close to the identity routing policy and only learns
+        # its own deviations when PAD supervision arrives.
+        self.pad_gate_proj.load_state_dict(self.gate_proj.state_dict())
+        self.active_router_mode = "identity"
+        self.last_router_mode = "identity"
+        # Noisy exploration is useful on identity routing, but it is too
+        # unstable for the PAD router while we are still constraining PAD
+        # gradients to the router path only.
+        self.pad_noisy_gate_std = 0.0
+        # PAD router gain starts small so the first PAD updates do not
+        # immediately diverge from the identity routing template.
+        self.pad_router_gain = nn.Parameter(torch.tensor(-2.2))
+        # Blend raw PAD logits with the shared identity router. A small,
+        # learnable delta is more stable than a fully independent PAD
+        # router from step 1.
+        self.pad_router_blend = nn.Parameter(torch.tensor(-2.2))
+        # Restrict the PAD router to a low-rank correction on top of the
+        # shared gate features. This keeps the experts shared while giving
+        # PAD a task-specific routing degree of freedom.
+        self.pad_router_delta = nn.Sequential(
             nn.Linear(3, 16),
             nn.GELU(),
             nn.Linear(16, num_experts, bias=True),
@@ -85,6 +106,32 @@ class FreqGatedMoEFFN(nn.Module):
             )
             for _ in range(num_experts)
         ])
+
+    def _build_router(self) -> nn.Sequential:
+        return nn.Sequential(
+            nn.Linear(3, 16),
+            nn.GELU(),
+            nn.Linear(16, self.num_experts, bias=True),
+        )
+
+    def _compute_gate_logits(
+        self,
+        gate_input: torch.Tensor,
+        route_mode: str,
+    ) -> torch.Tensor:
+        if route_mode not in {"identity", "pad"}:
+            raise ValueError(f"Unsupported route_mode={route_mode!r}")
+
+        identity_logits = self.gate_proj(gate_input)
+        if route_mode == "identity":
+            return identity_logits
+
+        pad_delta = self.pad_router_delta(gate_input)
+        pad_gain = torch.sigmoid(self.pad_router_gain)
+        pad_logits_raw = self.pad_gate_proj(gate_input) + pad_gain * pad_delta
+        blend = torch.sigmoid(self.pad_router_blend)
+        identity_anchor = identity_logits.detach()
+        return identity_anchor + blend * (pad_logits_raw - identity_anchor)
 
     def _balance_loss(self, expert_weights: torch.Tensor) -> torch.Tensor:
         """
@@ -109,11 +156,30 @@ class FreqGatedMoEFFN(nn.Module):
 
         return E * (f * P).sum()
 
+    def project_gateonly(
+        self,
+        gate_input: torch.Tensor,
+        route_mode: str,
+    ) -> dict[str, torch.Tensor]:
+        gate_logits = self._compute_gate_logits(gate_input.detach(), route_mode)
+        expert_weights = F.softmax(
+            gate_logits.float() / self.temperature, dim=-1,
+        ).to(gate_logits.dtype)
+        token_entropy = -(
+            expert_weights * (expert_weights + 1e-8).log()
+        ).sum(dim=-1)
+        return {
+            "expert_weights_gateonly": expert_weights,
+            "token_entropy_gateonly": token_entropy,
+            "gate_input_gateonly": gate_input.detach(),
+        }
+
     def forward(
         self,
         tokens: torch.Tensor,
         spatial_h: int,
         spatial_w: int,
+        route_mode: str = "identity",
     ) -> tuple[torch.Tensor, dict]:
         """
         Args:
@@ -128,12 +194,14 @@ class FreqGatedMoEFFN(nn.Module):
         B, N, D = tokens.shape
 
         # Gating
+        self.active_router_mode = route_mode
         gate_input = self.freq_gate(tokens, spatial_h, spatial_w)  # (B, N, 3)
-        gate_logits = self.gate_proj(gate_input)  # (B, N, E)
+        gate_logits = self._compute_gate_logits(gate_input, route_mode)
 
         # Noisy top-k: add Gaussian noise in training for exploration.
-        if self.training and self.noisy_gate_std > 0.0:
-            gate_logits = gate_logits + torch.randn_like(gate_logits) * self.noisy_gate_std
+        noise_std = self.noisy_gate_std if route_mode == "identity" else self.pad_noisy_gate_std
+        if self.training and noise_std > 0.0:
+            gate_logits = gate_logits + torch.randn_like(gate_logits) * noise_std
 
         # Promote to fp32 for softmax/renorm stability under AMP fp16.
         expert_weights = F.softmax(
@@ -185,7 +253,7 @@ class FreqGatedMoEFFN(nn.Module):
         # caller anyway) to avoid an extra Linear pass and the
         # activation memory that comes with it.
         if self.training:
-            gate_logits_go = self.gate_proj(gate_input.detach())
+            gate_logits_go = self._compute_gate_logits(gate_input.detach(), route_mode)
             expert_weights_go = F.softmax(
                 gate_logits_go.float() / self.temperature, dim=-1,
             ).to(gate_logits_go.dtype)
@@ -196,10 +264,12 @@ class FreqGatedMoEFFN(nn.Module):
             expert_weights_go = expert_weights
             token_entropy_go = token_entropy
 
+        self.last_router_mode = route_mode
         routing_stats = {
             "expert_weights": expert_weights,  # (B, N, E)
             "token_entropy": token_entropy,    # (B, N)
             "balance_loss": balance_loss,      # scalar
+            "router_mode": route_mode,
             # Gate-only views — grad stops at gate_proj params.
             "expert_weights_gateonly": expert_weights_go,
             "token_entropy_gateonly":  token_entropy_go,

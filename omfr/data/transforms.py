@@ -31,6 +31,25 @@ class RandomRotation90:
         return torch.rot90(img, k, dims=(-2, -1))
 
 
+class RandomAngleRotation:
+    """Rotate by random angle in [-max_angle, +max_angle] degrees.
+
+    Handles FVC2004 distortions which include arbitrary rotations, not just 90°.
+    """
+
+    def __init__(self, max_angle: float = 30.0, p: float = 0.6):
+        self.max_angle = max_angle
+        self.p = p
+
+    def __call__(self, img: torch.Tensor) -> torch.Tensor:
+        if random.random() > self.p:
+            return img
+        angle = random.uniform(-self.max_angle, self.max_angle)
+        # Use torchvision functional for rotation
+        img = TF.rotate(img, angle, fill=0.0, interpolation=TF.InterpolationMode.BILINEAR)
+        return img
+
+
 class ElasticDeformation:
     """
     Random elastic deformation to simulate finger pressure variations.
@@ -298,21 +317,23 @@ class FingerprintHardTransform:
     FVC2004 is dominated by intra-class distortion that NIST SD302
     training impressions do not reproduce.
 
-      - Stronger elastic deformation (alpha=40, sigma=7): heavy finger
-        pressure variation.
-      - Partial capture: RandomResizedPartial with scale in [0.6, 1.0].
+      - RandomAngleRotation ±30°: arbitrary finger rotations (FVC2004 frequent)
+      - Stronger elastic deformation (alpha=50, sigma=8): heavy finger
+        pressure variation and non-linear distortion.
+      - Tighter partial capture: RandomResizedPartial with scale in [0.5, 1.0].
       - Wider brightness/contrast jitter (0.4 each): sensor difference.
-      - Larger RandomErasing (up to 30% of area): latex/dirt occlusion.
+      - Larger RandomErasing (up to 40% of area): latex/dirt occlusion.
     """
 
     def __init__(self, output_size: int = 224):
         self.transforms = [
             RandomRotation90(),
-            ElasticDeformation(alpha=40.0, sigma=7.0, p=0.7),
-            _RandomResizedPartial(output_size=output_size, scale=(0.6, 1.0), p=0.7),
+            RandomAngleRotation(max_angle=30.0, p=0.6),
+            ElasticDeformation(alpha=50.0, sigma=8.0, p=0.7),
+            _RandomResizedPartial(output_size=output_size, scale=(0.5, 1.0), p=0.7),
             RandomBrightnessContrast(brightness=0.4, contrast=0.4, p=0.9),
             RandomGaussianNoise(std=0.03, p=0.4),
-            _RandomErasingBig(p=0.35, max_area=0.30),
+            _RandomErasingBig(p=0.35, max_area=0.40),
         ]
 
     def __call__(self, img: torch.Tensor) -> torch.Tensor:

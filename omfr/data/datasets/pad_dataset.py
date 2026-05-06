@@ -47,7 +47,6 @@ def make_pad_train_transform(image_size: int = 224) -> T.Compose:
         T.RandomErasing(
             p=0.25, scale=(0.02, 0.15), ratio=(0.3, 3.3), value=0.0,
         ),
-        T.Normalize(mean=[0.5], std=[0.5]),
     ])
 
 
@@ -98,6 +97,17 @@ class PADDataset(Dataset):
         'Orcanthus',
         'Unknown',
     )
+    MATERIAL_NAMES = (
+        'Live',
+        'BodyDouble',
+        'Ecoflex',
+        'Gelatin',
+        'Latex',
+        'Modasil',
+        'PlayDoh',
+        'WoodGlue',
+        'Unknown',
+    )
 
     LABEL_LIVE  = 1
     LABEL_SPOOF = 0
@@ -133,8 +143,8 @@ class PADDataset(Dataset):
         self.dataset_name = dataset_name
         self.sensor = sensor
 
-        # (path, label, sensor_id) — sensor_id is index into SENSOR_NAMES
-        self.samples: List[Tuple[Path, int, int]] = []
+        # (path, label, sensor_id, material_id) — ids index SENSOR_NAMES/MATERIAL_NAMES
+        self.samples: List[Tuple[Path, int, int, int]] = []
         self._load_samples()
 
     # ------------------------------------------------------------------
@@ -170,7 +180,10 @@ class PADDataset(Dataset):
                     sensor_id = int(row.get('sensor_id', -1))
                     if sensor_id < 0:
                         sensor_id = self._infer_sensor_id(path, root)
-                    self.samples.append((path, label, sensor_id))
+                    material_id = int(row.get('material_id', -1))
+                    if material_id < 0:
+                        material_id = self._infer_material_id(path, root, label)
+                    self.samples.append((path, label, sensor_id, material_id))
 
     def _load_from_directory(self, root: Path):
         scan_root = self._resolve_split_root(root)
@@ -192,7 +205,8 @@ class PADDataset(Dataset):
                     continue
 
                 sensor_id = self._infer_sensor_id(img_path, scan_root)
-                self.samples.append((img_path, label, sensor_id))
+                material_id = self._infer_material_id(img_path, scan_root, label)
+                self.samples.append((img_path, label, sensor_id, material_id))
 
     def _infer_sensor_id(self, path: Path, scan_root: Path) -> int:
         """Walk ancestors until a directory matches a known sensor name.
@@ -204,6 +218,21 @@ class PADDataset(Dataset):
         unknown_idx = self.SENSOR_NAMES.index('Unknown')
         for ancestor in self._ancestors_until(path.parent, scan_root):
             idx = normalized_targets.get(self._normalize_sensor_name(ancestor.name))
+            if idx is not None:
+                return idx
+        return unknown_idx
+
+    def _infer_material_id(self, path: Path, scan_root: Path, label: int) -> int:
+        if label == self.LABEL_LIVE:
+            return self.MATERIAL_NAMES.index('Live')
+
+        normalized_targets = {
+            self._normalize_material_name(name): idx
+            for idx, name in enumerate(self.MATERIAL_NAMES)
+        }
+        unknown_idx = self.MATERIAL_NAMES.index('Unknown')
+        for ancestor in self._ancestors_until(path.parent, scan_root):
+            idx = normalized_targets.get(self._normalize_material_name(ancestor.name))
             if idx is not None:
                 return idx
         return unknown_idx
@@ -266,6 +295,19 @@ class PADDataset(Dataset):
                 cleaned = cleaned[:-len(suffix)]
         return cleaned
 
+    @staticmethod
+    def _normalize_material_name(name: str) -> str:
+        cleaned = re.sub(r'[^a-z0-9]+', '', name.lower())
+        aliases = {
+            'playdoh': 'playdoh',
+            'playdough': 'playdoh',
+            'gelatine': 'gelatin',
+            'gelatin': 'gelatin',
+            'bodydouble': 'bodydouble',
+            'woodglue': 'woodglue',
+        }
+        return aliases.get(cleaned, cleaned)
+
     def _load_image(self, path: Path) -> torch.Tensor:
         img = Image.open(path).convert('L')
         tensor = TF.to_tensor(img)                      # (1, H, W)
@@ -281,7 +323,7 @@ class PADDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        path, label, sensor_id = self.samples[idx]
+        path, label, sensor_id, material_id = self.samples[idx]
         try:
             image = self._load_image(path)
         except (OSError, IOError):
@@ -295,21 +337,25 @@ class PADDataset(Dataset):
             'images': image,
             'liveness_labels': torch.tensor(label, dtype=torch.long),
             'sensor_labels': torch.tensor(sensor_id, dtype=torch.long),
+            'material_labels': torch.tensor(material_id, dtype=torch.long),
         }
 
     @property
     def num_live(self) -> int:
-        return sum(1 for _, l, _ in self.samples if l == self.LABEL_LIVE)
+        return sum(1 for _, l, _, _ in self.samples if l == self.LABEL_LIVE)
 
     @property
     def num_spoof(self) -> int:
-        return sum(1 for _, l, _ in self.samples if l == self.LABEL_SPOOF)
+        return sum(1 for _, l, _, _ in self.samples if l == self.LABEL_SPOOF)
 
     def get_liveness_labels(self) -> List[int]:
-        return [label for _, label, _ in self.samples]
+        return [label for _, label, _, _ in self.samples]
 
     def get_sensor_labels(self) -> List[int]:
-        return [sensor for _, _, sensor in self.samples]
+        return [sensor for _, _, sensor, _ in self.samples]
+
+    def get_material_labels(self) -> List[int]:
+        return [material for _, _, _, material in self.samples]
 
     @property
     def num_sensors(self) -> int:

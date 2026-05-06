@@ -1,26 +1,39 @@
 """
-pad_head.py — PAD Branch Head (v4: Dedicated Stem + DS-Conv Aux + Routing)
+pad_head.py — PAD Branch Head (v6: Shared Spatial Latent + FPN-light Fusion)
 
 Input: {
-    'pad_stem_feat':     (B, 128),              # from PADStem (TRAINABLE)
-    'stage1_feat':       (B, 64, 56, 56),       # detached backbone feature
-    'stage2_feat':       (B, 128, 28, 28),      # detached backbone feature
+    'shared_spatial_feat':  (B, 256, 14, 14),  # post-attention spatial latent from IdentityHead
+    'stage1_feat':          (B, 64, 56, 56),   # detached early backbone feature
+    'stage2_feat':          (B, 128, 28, 28),  # detached early backbone feature
     'routing_stats_s2':  {'expert_weights': ..., 'token_entropy': ..., 'gate_input_gateonly': (B, 784, 3)},
     'routing_stats_s3a': {'expert_weights': ..., 'token_entropy': ..., 'gate_input_gateonly': (B, 196, 3)},
     'routing_stats_s3b': {'expert_weights': ..., 'token_entropy': ..., 'gate_input_gateonly': (B, 196, 3)},
 }
 
 Output: {
-    'pad_embedding': (B, 32),    # L2-normalized, for SupCon + orthogonality
-    'pad_logit':     (B, 1),     # Raw logit for BCE
-    'pad_features':  (B, 128),   # Pre-projection features for SupCon
+    'pad_embedding': (B, 32),    # L2-normalized PAD-specific embedding from pad_features
+    'pad_logit':     (B, 1),     # Raw logit for BCE / Focal BCE
+    'pad_features':  (B, 128),   # Pre-projection PAD features (sensor-adv head input)
 }
 
-[NEW] v4.1 Update:
-    Added 3-band frequency energy (gate_input) directly to the routing stats.
-    This bypasses the MoE Softmax temperature collapse (T=0.5) that previously
-    squashed token_entropy to 0. PAD now extracts statistical features (mean,
-    std, max, min) for each frequency band, adding 12 robust features per MoE layer.
+v6 rationale:
+    Earlier versions consumed `shared_repr_feat`, a single (B, 256) vector
+    obtained by attentive-pooling the structural-attention tokens. PAD
+    needs cues that are intrinsically spatial — background halo, edge
+    artifacts, material texture, regions where ridges look fake — and
+    pooling away the 14x14 grid before fusing with stage1/stage2 wipes
+    out exactly those cues.
+
+    v6 takes the 14x14 token grid produced by IdentityHead's structural
+    attention block (`shared_spatial_feat`) and fuses it with downsampled
+    `stage1_feat` (56→14) and `stage2_feat` (28→14) in a light FPN-style
+    tower, applies depthwise-separable refinement, spatial attention,
+    and GAP to derive `pad_features`. MoE routing stats stay as a small
+    auxiliary signal injected post-pool.
+
+    PAD no longer consumes an identity MRL prefix as its embedding. The PAD
+    embedding is projected from `pad_features`, keeping identity MRL and PAD
+    classification as separate downstream tasks over the shared trunk.
 """
 
 import torch
@@ -29,85 +42,194 @@ import torch.nn.functional as F
 from typing import Dict
 
 
-class PADConvBlock(nn.Module):
-    """
-    Depthwise-separable conv block preserving spatial resolution.
+def _pick_groups(channels: int) -> int:
+    for g in (8, 4, 2, 1):
+        if channels % g == 0:
+            return g
+    return 1
 
-    Flow: DW3x3 -> GN -> GELU -> PW1x1 -> GN -> GELU -> DW3x3 -> GN -> GELU
+
+class PADSpatialFusion(nn.Module):
+    """
+    FPN-light fusion of three resolutions onto the shared latent grid, followed by
+    depthwise-separable refinement, spatial attention, and GAP.
+
+    Inputs:
+        stage1_feat: downsampled and aligned to shared_spatial_feat
+        stage2_feat: downsampled and aligned to shared_spatial_feat
+        shared_spatial_feat: projected to hidden_dim
+    Output: (B, hidden_dim) pooled spatial vector
     """
 
-    def __init__(self, in_ch: int, out_ch: int):
+    def __init__(
+        self,
+        stage1_dim: int = 64,
+        stage2_dim: int = 128,
+        shared_dim: int = 256,
+        hidden_dim: int = 128,
+    ):
         super().__init__()
-        gn_in = self._pick_groups(in_ch)
-        gn_out = self._pick_groups(out_ch)
+        self.hidden_dim = hidden_dim
+        gn_h = _pick_groups(hidden_dim)
 
-        self.block = nn.Sequential(
-            # DW 3x3 on input channels
-            nn.Conv2d(in_ch, in_ch, kernel_size=3, padding=1,
-                      groups=in_ch, bias=False),
-            nn.GroupNorm(gn_in, in_ch),
+        # 56x56 -> 14x14: two stride-2 convs with channel projection.
+        self.proj_s1 = nn.Sequential(
+            nn.Conv2d(stage1_dim, hidden_dim, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(gn_h, hidden_dim),
             nn.GELU(),
-            # PW 1x1 to change channel count
-            nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False),
-            nn.GroupNorm(gn_out, out_ch),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(gn_h, hidden_dim),
             nn.GELU(),
-            # DW 3x3 to refine on new channel basis
-            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1,
-                      groups=out_ch, bias=False),
-            nn.GroupNorm(gn_out, out_ch),
+        )
+        # 28x28 -> 14x14: one stride-2 conv with channel projection.
+        self.proj_s2 = nn.Sequential(
+            nn.Conv2d(stage2_dim, hidden_dim, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(gn_h, hidden_dim),
+            nn.GELU(),
+        )
+        # 14x14 channel reduction for the shared spatial latent.
+        self.proj_shared = nn.Sequential(
+            nn.Conv2d(shared_dim, hidden_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(gn_h, hidden_dim),
             nn.GELU(),
         )
 
-    @staticmethod
-    def _pick_groups(channels: int) -> int:
-        for g in (8, 4, 2, 1):
-            if channels % g == 0:
-                return g
-        return 1
+        fused_in = hidden_dim * 3
+        gn_f = _pick_groups(fused_in)
+        # Depthwise-separable refinement: DW3x3 -> PW1x1 -> DW3x3 on the
+        # concatenated 384-ch tensor. Keeps params small while letting
+        # each spatial position blend stage-1/stage-2/shared cues.
+        self.fuse = nn.Sequential(
+            nn.Conv2d(fused_in, fused_in, kernel_size=3, padding=1, groups=fused_in, bias=False),
+            nn.GroupNorm(gn_f, fused_in),
+            nn.GELU(),
+            nn.Conv2d(fused_in, hidden_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(gn_h, hidden_dim),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, groups=hidden_dim, bias=False),
+            nn.GroupNorm(gn_h, hidden_dim),
+            nn.GELU(),
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.block(x)
+        # Lightweight 1-channel spatial attention mask.
+        self.spatial_attn = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim // 4, kernel_size=1, bias=False),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim // 4, 1, kernel_size=1, bias=True),
+        )
+
+        self.gap = nn.AdaptiveAvgPool2d(1)
+
+    def forward(
+        self,
+        stage1_feat: torch.Tensor,
+        stage2_feat: torch.Tensor,
+        shared_spatial_feat: torch.Tensor,
+    ) -> torch.Tensor:
+        f1 = self.proj_s1(stage1_feat)              # (B, H, 14, 14)
+        f2 = self.proj_s2(stage2_feat)              # (B, H, 14, 14)
+        fs = self.proj_shared(shared_spatial_feat)  # (B, H, 14, 14)
+        target_size = fs.shape[-2:]
+        if f1.shape[-2:] != target_size:
+            f1 = F.interpolate(f1, size=target_size, mode='bilinear', align_corners=False)
+        if f2.shape[-2:] != target_size:
+            f2 = F.interpolate(f2, size=target_size, mode='bilinear', align_corners=False)
+        x = torch.cat([f1, f2, fs], dim=1)          # (B, 3H, 14, 14)
+        x = self.fuse(x)                            # (B, H, 14, 14)
+        attn = torch.sigmoid(self.spatial_attn(x))  # (B, 1, 14, 14)
+        x = x * attn
+        return self.gap(x).flatten(1)               # (B, H)
+
+
+class PADTextureBranch(nn.Module):
+    """
+    PAD-specific local texture branch from the earliest available signals.
+
+    The shared identity path is optimized for minutiae/structure. Spoof
+    artifacts are often local material cues, so this branch reads detached
+    Gabor responses plus stage-0 features, downsamples them only to 28x28,
+    and injects a compact residual into the PAD spatial vector.
+    """
+
+    def __init__(
+        self,
+        gabor_dim: int = 8,
+        stage1_dim: int = 64,
+        hidden_dim: int = 128,
+    ):
+        super().__init__()
+        mid_dim = hidden_dim // 2
+        gn_mid = _pick_groups(mid_dim)
+        gn_h = _pick_groups(hidden_dim)
+
+        self.gabor_tower = nn.Sequential(
+            nn.Conv2d(gabor_dim, 32, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(_pick_groups(32), 32),
+            nn.GELU(),
+            nn.Conv2d(32, mid_dim, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(gn_mid, mid_dim),
+            nn.GELU(),
+            nn.Conv2d(mid_dim, mid_dim, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(gn_mid, mid_dim),
+            nn.GELU(),
+        )
+        self.stage1_tower = nn.Sequential(
+            nn.Conv2d(stage1_dim, mid_dim, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(gn_mid, mid_dim),
+            nn.GELU(),
+        )
+        self.fuse = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, groups=hidden_dim, bias=False),
+            nn.GroupNorm(gn_h, hidden_dim),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(gn_h, hidden_dim),
+            nn.GELU(),
+        )
+        self.gap = nn.AdaptiveAvgPool2d(1)
+
+    def forward(
+        self,
+        gabor_feat: torch.Tensor,
+        stage1_feat: torch.Tensor,
+    ) -> torch.Tensor:
+        fg = self.gabor_tower(gabor_feat)       # (B, H/2, 28, 28)
+        fs = self.stage1_tower(stage1_feat)     # (B, H/2, 28, 28)
+        x = torch.cat([fg, fs], dim=1)           # (B, H, 28, 28)
+        x = self.fuse(x)
+        return self.gap(x).flatten(1)            # (B, H)
 
 
 class PADHead(nn.Module):
     """
-    Multi-scale feature aggregation + dedicated PAD stem + MoE routing.
+    Spatial-fusion PAD head on top of the shared latent.
 
-    Architecture (v4.1):
-        -- PAD stem path (TRAINABLE, runs upstream in OMFRModule) --
-        pad_stem_feat (B, 128)
+    Architecture (v6):
+        -- Spatial fusion path --
+        stage1_feat (B, 64, 56, 56)  -> proj 56->14 -> (B, 128, 14, 14)
+        stage2_feat (B, 128, 28, 28) -> proj 28->14 -> (B, 128, 14, 14)
+        shared_spatial_feat (B, 256, 14, 14) -> proj -> (B, 128, 14, 14)
+        concat (3 x H) -> DSConv refinement -> (B, 128, 14, 14)
+        spatial attention -> GAP -> spatial_vec (B, 128)
 
-        -- Aux feature path on detached backbone stages --
-        stage1_feat (B,64,56,56)  -> PADConvBlock(64->128)  -> GAP -> (B,128)
-        stage2_feat (B,128,28,28) -> PADConvBlock(128->128) -> GAP -> (B,128)
-        -> concat -> (B, 256)
+        -- Routing path (auxiliary, low-gain by default) --
+        per-MoE-layer 20-D stats x 3 -> 60 -> route_mlp -> 24 -> route_vec
 
-        -- Routing path (20 features per MoE layer x 3 layers = 60) -- [NEW]
-        Per MoE layer:
-            expert_weights: mean over tokens -> (B, 4)
-            token_entropy:  [mean, std, max, min] -> (B, 4)
-            gate_input:     [mean, std, max, min] x 3 bands -> (B, 12)
-        -> concat all 3 layers -> (B, 60)
+        -- Fusion -> pad_features --
+        concat(spatial_vec, route_vec) -> Linear -> (B, 128)
 
-        -- Fusion --
-        concat(pad_stem_128, feature_256, routing_60) -> (B, 444) [NEW]
-        -> LayerNorm -> MLP -> pad_features (B, 128)
-
-        -- Two PARALLEL output branches --
-        pad_features -> Linear(128, 32) -> L2Norm -> pad_embedding
+        -- Output branches --
         pad_features -> Linear(128, 1) -> pad_logit
+        pad_features -> Linear(128, 32) -> L2Norm -> pad_embedding
     """
 
-    FEAT_CH_PER_STAGE = 128
-    PAD_STEM_DIM = 256
-    
-    # [NEW] Updated dimension: 4 expert + 4 entropy + 12 gate_input (3 bands * 4 stats) = 20
-    ROUTE_DIM_PER_LAYER = 20   
+    # Routing descriptor: 4 expert load + 4 entropy stats + 12 (3 bands x 4) gate stats = 20
+    ROUTE_DIM_PER_LAYER = 20
     NUM_MOE_LAYERS = 3
-    
-    # [NEW] 20 * 3 = 60
-    ROUTE_DIM = ROUTE_DIM_PER_LAYER * NUM_MOE_LAYERS   
-    
+    ROUTE_RAW_DIM = ROUTE_DIM_PER_LAYER * NUM_MOE_LAYERS
+    ROUTE_FEATURE_DIM = 24
+
+    SPATIAL_HIDDEN_DIM = 128
     PAD_FEATURES_DIM = 128
     PAD_EMBEDDING_DIM = 32
 
@@ -115,114 +237,105 @@ class PADHead(nn.Module):
         self,
         stage1_dim: int = 64,
         stage2_dim: int = 128,
-        pad_stem_dim: int = 256,
+        shared_dim: int = 256,
+        gabor_dim: int = 8,
         dropout: float = 0.1,
+        **_legacy_kwargs,
     ):
         super().__init__()
 
-        self.pad_stem_dim = pad_stem_dim
+        self.spatial_fusion = PADSpatialFusion(
+            stage1_dim=stage1_dim,
+            stage2_dim=stage2_dim,
+            shared_dim=shared_dim,
+            hidden_dim=self.SPATIAL_HIDDEN_DIM,
+        )
+        self.texture_branch = PADTextureBranch(
+            gabor_dim=gabor_dim,
+            stage1_dim=stage1_dim,
+            hidden_dim=self.SPATIAL_HIDDEN_DIM,
+        )
+        self.texture_gain = nn.Parameter(torch.tensor(-4.0))
 
-        # Aux feature path on detached backbone stages
-        self.block_s1 = PADConvBlock(stage1_dim, self.FEAT_CH_PER_STAGE)
-        self.block_s2 = PADConvBlock(stage2_dim, self.FEAT_CH_PER_STAGE)
-        self.gap = nn.AdaptiveAvgPool2d(1)
-
-        feat_dim = self.FEAT_CH_PER_STAGE * 2              # 256
-        
-        # [NEW] fusion_in automatically adapts to 128 + 256 + 60 = 444
-        fusion_in = pad_stem_dim + feat_dim + self.ROUTE_DIM   
-
-        self.fusion_mlp = nn.Sequential(
-            nn.LayerNorm(fusion_in),
-            nn.Linear(fusion_in, 512),
+        # Routing bottleneck — sensor-biased raw stats compressed through a
+        # small MLP and gated by a learnable scalar that starts low so the
+        # frequency cue does not dominate as a sensor shortcut early on.
+        self.route_mlp = nn.Sequential(
+            nn.LayerNorm(self.ROUTE_RAW_DIM),
+            nn.Linear(self.ROUTE_RAW_DIM, 32),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(512, 256),
+            nn.Linear(32, self.ROUTE_FEATURE_DIM),
+        )
+        self.route_gain = nn.Parameter(torch.tensor(-2.2))
+
+        fusion_in = self.SPATIAL_HIDDEN_DIM + self.ROUTE_FEATURE_DIM
+        self.fusion_mlp = nn.Sequential(
+            nn.LayerNorm(fusion_in),
+            nn.Linear(fusion_in, 256),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(256, self.PAD_FEATURES_DIM),
         )
 
-        # Parallel output branches from pad_features
+        # Output branches.
         self.embedding_proj = nn.Linear(self.PAD_FEATURES_DIM, self.PAD_EMBEDDING_DIM)
         self.logit_head = nn.Linear(self.PAD_FEATURES_DIM, 1)
 
     def _extract_routing_features(self, stats: Dict) -> torch.Tensor:
-        """
-        Extract 20-D feature vector from a single MoE layer's routing stats.
-        """
-        # Note: Depending on how OMFRModule passes the dict, the keys might have 
-        # '_gateonly' suffix. We use .get() for robust fallback.
+        """20-D routing descriptor from a single MoE layer's stats."""
         ew = stats.get('expert_weights_gateonly', stats.get('expert_weights'))   # (B, N, 4)
         ent = stats.get('token_entropy_gateonly', stats.get('token_entropy'))    # (B, N)
-        
-        # [NEW] Retrieve the detached gate_input we added in moe_ffn.py
         gate_input = stats.get('gate_input_gateonly', stats.get('gate_input'))   # (B, N, 3)
 
-        # 1. Expert load: mean across tokens -> (B, 4)
-        load_mean = ew.mean(dim=1)
-
-        # 2. Entropy statistics: [mean, std, max, min] -> (B, 4)
+        load_mean = ew.mean(dim=1)                                                # (B, 4)
         ent_stats = torch.stack([
             ent.mean(dim=1),
             ent.std(dim=1),
             ent.max(dim=1).values,
             ent.min(dim=1).values,
-        ], dim=-1)
+        ], dim=-1)                                                                # (B, 4)
 
-        features_list = [load_mean, ent_stats]
-
-        # 3. Gate Input statistics [NEW]
-        # Calculates mean, std, max, min for EACH of the 3 frequency bands
+        features = [load_mean, ent_stats]
         if gate_input is not None:
             gate_stats = torch.cat([
-                gate_input.mean(dim=1),          # (B, 3)
-                gate_input.std(dim=1),           # (B, 3)
-                gate_input.max(dim=1).values,    # (B, 3)
-                gate_input.min(dim=1).values,    # (B, 3)
-            ], dim=-1)                           # Result: (B, 12)
-            features_list.append(gate_stats)
-
-        # Concat all into (B, 20)
-        return torch.cat(features_list, dim=-1)  
+                gate_input.mean(dim=1),         # (B, 3)
+                gate_input.std(dim=1),          # (B, 3)
+                gate_input.max(dim=1).values,   # (B, 3)
+                gate_input.min(dim=1).values,   # (B, 3)
+            ], dim=-1)                          # (B, 12)
+            features.append(gate_stats)
+        return torch.cat(features, dim=-1)      # (B, 20)
 
     def forward(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """
-        Args:
-            inputs: Dictionary containing pad_stem_feat, stage1/2 feats, and routing stats.
-        """
-        pad_stem = inputs['pad_stem_feat']    # (B, 128)
-        s1 = inputs['stage1_feat']            # (B, 64, 56, 56)
-        s2 = inputs['stage2_feat']            # (B, 128, 28, 28)
+        s1 = inputs['stage1_feat']                          # (B, 64, 56, 56)
+        s2 = inputs['stage2_feat']                          # (B, 128, 28, 28)
+        shared_spatial = inputs['shared_spatial_feat']      # (B, 256, 14, 14)
+        gabor_feat = inputs.get('gabor_feat')               # (B, 8, 224, 224)
 
-        # -- Aux feature path --
-        f1 = self.block_s1(s1)                 # (B, 128, 56, 56)
-        f2 = self.block_s2(s2)                 # (B, 128, 28, 28)
-        f1 = self.gap(f1).flatten(1)           # (B, 128)
-        f2 = self.gap(f2).flatten(1)           # (B, 128)
-        feat_combined = torch.cat([f1, f2], dim=-1)  # (B, 256)
+        # -- Spatial fusion --
+        spatial_vec = self.spatial_fusion(s1, s2, shared_spatial)   # (B, 128)
+        if gabor_feat is not None:
+            texture_vec = self.texture_branch(gabor_feat, s1).to(spatial_vec.dtype)
+            spatial_vec = spatial_vec + torch.sigmoid(self.texture_gain).to(spatial_vec.dtype) * texture_vec
 
         # -- Routing path --
-        # [NEW] These are now (B, 20) each
-        r_s2 = self._extract_routing_features(inputs['routing_stats_s2'])    
-        r_s3a = self._extract_routing_features(inputs['routing_stats_s3a'])  
-        r_s3b = self._extract_routing_features(inputs['routing_stats_s3b'])  
-        
-        # [NEW] route_combined is now (B, 60)
-        route_combined = torch.cat([r_s2, r_s3a, r_s3b], dim=-1)  
+        r_s2  = self._extract_routing_features(inputs['routing_stats_s2'])
+        r_s3a = self._extract_routing_features(inputs['routing_stats_s3a'])
+        r_s3b = self._extract_routing_features(inputs['routing_stats_s3b'])
+        route_raw = torch.cat([r_s2, r_s3a, r_s3b], dim=-1)         # (B, 60)
+        route_gain = torch.sigmoid(self.route_gain).to(route_raw.dtype)
+        route_vec = self.route_mlp(route_raw) * route_gain          # (B, 24)
 
         # -- Fusion --
-        # [NEW] all_features is now (B, 444) -> 128 + 256 + 60
-        all_features = torch.cat(
-            [pad_stem, feat_combined, route_combined], dim=-1,
-        )  
-        pad_features = self.fusion_mlp(all_features)  # (B, 128)
+        fused = torch.cat([spatial_vec, route_vec], dim=-1)         # (B, 152)
+        pad_features = self.fusion_mlp(fused)                       # (B, 128)
 
-        # -- Parallel output branches --
+        # -- Output branches --
         pad_embedding = F.normalize(
-            self.embedding_proj(pad_features), p=2, dim=-1
-        )  # (B, 32)
-        pad_logit = self.logit_head(pad_features)  # (B, 1)
+            self.embedding_proj(pad_features), p=2, dim=-1,
+        )
+        pad_logit = self.logit_head(pad_features)                   # (B, 1)
 
         return {
             'pad_features': pad_features,

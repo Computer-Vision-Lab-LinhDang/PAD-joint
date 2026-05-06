@@ -7,8 +7,18 @@ Input: {
 }
 
 Output: {
+    'shared_repr_feat':    (B, 256),    # shared latent before identity-specific adapter
+    'shared_spatial_feat': (B, 256, 14, 14),  # post-attention spatial latent (PAD branch)
+    'shared_embedding':    (B, 256),    # L2-normalized shared latent
+    'shared_mrl_embeddings': {
+        32:  (B, 32),
+        64:  (B, 64),
+        128: (B, 128),
+        256: (B, 256),
+    },
     'identity_embedding': (B, 256),     # L2-normalized, full 256-D
     'mrl_embeddings': {
+        32:  (B, 32),
         64:  (B, 64),
         128: (B, 128),
         256: (B, 256),
@@ -178,8 +188,9 @@ class IdentityHead(nn.Module):
         -> Linear(480, 256) -> (B, 196, 256)
         -> StructuralAttentionBlock (8 heads, RPE 14x14) x 1
         -> AttentivePooling (4 query seeds) -> (B, 256)
-        -> LayerNorm -> L2Norm -> identity_embedding (B, 256)
-        -> MRL: slice at {64, 128, 256}, re-normalize each
+        -> LayerNorm -> shared_repr_feat (B, 256)
+        -> residual identity adapter -> L2Norm -> identity_embedding (B, 256)
+        -> MRL: slice at {32, 64, 128, 256}, re-normalize each
 
     No ArcFace classifiers here — those live in ArcFaceLoss to avoid
     weight duplication.
@@ -194,7 +205,7 @@ class IdentityHead(nn.Module):
         num_decoder_blocks: number of structural attention blocks (1)
     """
 
-    MRL_DIMS = [64, 128, 256]
+    MRL_DIMS = [32, 64, 128, 256]
 
     def __init__(
         self,
@@ -233,28 +244,45 @@ class IdentityHead(nn.Module):
             num_queries=num_queries,
         )
 
-        # Final normalization
+        # Shared latent normalization. We keep this parameter name so
+        # warm-starting from older checkpoints still loads the old head.
         self.final_norm = nn.LayerNorm(embed_dim)
+        # Identity-specific residual adapter. Zero-init keeps the initial
+        # behavior close to the old head so warm-started checkpoints do
+        # not drift immediately, while still giving identity its own
+        # task adapter on top of the shared latent.
+        self.identity_adapter = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 2),
+            nn.GELU(),
+            nn.Linear(embed_dim * 2, embed_dim),
+        )
+        nn.init.zeros_(self.identity_adapter[-1].weight)
+        nn.init.zeros_(self.identity_adapter[-1].bias)
 
-    def forward(
+    @staticmethod
+    def _build_mrl_embeddings(embedding: torch.Tensor) -> Dict[int, torch.Tensor]:
+        mrl_embeddings = {}
+        for d in IdentityHead.MRL_DIMS:
+            z = embedding[:, :d]
+            z = F.normalize(z, p=2, dim=-1)
+            mrl_embeddings[d] = z
+        return mrl_embeddings
+
+    def forward_shared(
         self,
         inputs: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
         """
-        Args:
-            inputs: {
-                'stage3_feat': (B, 160, 14, 14),
-                'stage4_feat': (B, 320, 7, 7),
-            }
+        Forward pass through the shared latent extractor only.
 
         Returns: {
-            'identity_embedding': (B, 256),
-            'mrl_embeddings': {64: (B,64), 128: (B,128), 256: (B,256)},
+            'shared_repr_feat': (B, 256),
+            'shared_embedding': (B, 256),
+            'shared_mrl_embeddings': {32, 64, 128, 256},
         }
         """
         s3 = inputs['stage3_feat']  # (B, 160, 14, 14)
         s4 = inputs['stage4_feat']  # (B, 320, 7, 7)
-        B = s3.shape[0]
         G = self.grid_size  # 14
 
         # Upsample stage4 to stage3's resolution so fine-grained minutiae
@@ -276,24 +304,59 @@ class IdentityHead(nn.Module):
         for block in self.struct_attn:
             tokens = block(tokens)                                 # (B, 196, 256)
 
-        # Attentive pooling -> single vector
+        # Spatial latent for PAD: reshape attention tokens back to a 14x14
+        # feature map BEFORE pooling. PAD relies on position-aware cues
+        # (background halo, edge artifacts, material texture, fake-ridge
+        # regions) that disappear once the tokens are attentive-pooled.
+        B = tokens.shape[0]
+        shared_spatial_feat = (
+            tokens.transpose(1, 2)
+                  .reshape(B, self.embed_dim, self.grid_size, self.grid_size)
+        )                                                          # (B, 256, 14, 14)
+
+        # Attentive pooling -> single vector (identity branch consumes this)
         pooled = self.attn_pool(tokens)                           # (B, 256)
-        pooled = self.final_norm(pooled)
-
-        # L2 normalize for identity embedding
-        identity_embedding = F.normalize(pooled, p=2, dim=-1)     # (B, 256)
-
-        # MRL: slice prefix, re-normalize
-        mrl_embeddings = {}
-        for d in self.MRL_DIMS:
-            z = identity_embedding[:, :d]
-            z = F.normalize(z, p=2, dim=-1)
-            mrl_embeddings[d] = z
+        shared_repr = self.final_norm(pooled)
+        shared_embedding = F.normalize(shared_repr, p=2, dim=-1)
 
         return {
-            'identity_embedding': identity_embedding,
-            'mrl_embeddings': mrl_embeddings,
+            'shared_repr_feat': shared_repr,
+            'shared_spatial_feat': shared_spatial_feat,
+            'shared_embedding': shared_embedding,
+            'shared_mrl_embeddings': self._build_mrl_embeddings(shared_embedding),
         }
+
+    def forward(
+        self,
+        inputs: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Args:
+            inputs: {
+                'stage3_feat': (B, 160, 14, 14),
+                'stage4_feat': (B, 320, 7, 7),
+            }
+
+        Returns: {
+            'shared_repr_feat': (B, 256),
+            'shared_spatial_feat': (B, 256, 14, 14),
+            'shared_embedding': (B, 256),
+            'shared_mrl_embeddings': {32, 64, 128, 256},
+            'identity_embedding': (B, 256),
+            'mrl_embeddings': {32: (B,32), 64: (B,64), 128: (B,128), 256: (B,256)},
+        }
+        """
+        shared_out = self.forward_shared(inputs)
+        shared_repr = shared_out['shared_repr_feat']
+
+        # Identity uses a residual adapter on top of the shared latent.
+        identity_pre = shared_repr + self.identity_adapter(shared_repr)
+        identity_embedding = F.normalize(identity_pre, p=2, dim=-1)  # (B, 256)
+
+        out = dict(shared_out)
+        out['identity_embedding'] = identity_embedding
+        out['mrl_embeddings'] = self._build_mrl_embeddings(identity_embedding)
+        return out
 
     def forward_embedding_only(
         self,

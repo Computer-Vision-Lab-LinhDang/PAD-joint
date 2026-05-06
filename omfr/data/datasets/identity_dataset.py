@@ -16,6 +16,10 @@ import torchvision.transforms.functional as TF
 
 
 _SUBJECT_RE = re.compile(r"(?:^|[_\-])subj[_\-](\d+)(?=[_\-]|$)", re.IGNORECASE)
+_A300_DIR_RE = re.compile(r"^a300_subj_(\d+)_frgp_(\d+)$", re.IGNORECASE)
+_R302_DIR_RE = re.compile(r"^r302_subj_(\d+)_frgp_(\d+)$", re.IGNORECASE)
+_D302_DIR_RE = re.compile(r"^d302_(\d+)_fp(\d+)$", re.IGNORECASE)
+_NIST_FRGP_DIR_RE = re.compile(r"^subj_(\d+)_frgp_(\d+)$", re.IGNORECASE)
 
 
 def _subject_id(folder_name: str) -> str:
@@ -30,6 +34,39 @@ def _subject_id(folder_name: str) -> str:
     m = _SUBJECT_RE.search(folder_name)
     if m:
         return f"subj_{m.group(1)}"
+    return folder_name
+
+
+def _canonical_finger_id(folder_name: str) -> str:
+    """
+    Return the matching identity key for NIST-style single-finger folders.
+
+    For fingerprint identity, a class is a subject *and* a finger position.
+    In the combined NIST layout, SD302 rolled (`r302`) and plain/flat (`d302`)
+    views are different impressions of the same subject+finger, so they share
+    the same `n302` namespace. SD300 gets its own namespace to avoid accidental
+    subject-id collisions across databases.
+    """
+    m = _A300_DIR_RE.match(folder_name)
+    if m:
+        subject, frgp = m.groups()
+        return f"a300:{subject}:{int(frgp):02d}"
+
+    m = _R302_DIR_RE.match(folder_name)
+    if m:
+        subject, frgp = m.groups()
+        return f"n302:{subject}:{int(frgp):02d}"
+
+    m = _D302_DIR_RE.match(folder_name)
+    if m:
+        subject, frgp = m.groups()
+        return f"n302:{subject}:{int(frgp):02d}"
+
+    m = _NIST_FRGP_DIR_RE.match(folder_name)
+    if m:
+        subject, frgp = m.groups()
+        return f"subj:{subject}:{int(frgp):02d}"
+
     return folder_name
 
 
@@ -76,6 +113,7 @@ class IdentityDataset(Dataset):
         image_size: int = 224,
         dataset_name: str = 'NIST_SD302',
         group_by_subject: bool = False,
+        identity_label_mode: Optional[str] = None,
         num_views: int = 1,
     ):
         super().__init__()
@@ -85,6 +123,7 @@ class IdentityDataset(Dataset):
         self.image_size = image_size
         self.dataset_name = dataset_name
         self.group_by_subject = group_by_subject
+        self.identity_label_mode = self._normalize_label_mode(identity_label_mode)
         self.num_views = max(int(num_views), 1)
 
         self.samples: List[Tuple[Path, int]] = []   # (image_path, class_idx)
@@ -93,9 +132,36 @@ class IdentityDataset(Dataset):
         self._load_samples()
 
     def _class_name_from_dir(self, dir_name: str) -> str:
-        if self.group_by_subject:
+        if self.identity_label_mode == 'canonical_finger':
+            return _canonical_finger_id(dir_name)
+        if self.identity_label_mode == 'subject':
             return _subject_id(dir_name)
         return dir_name
+
+    def _normalize_label_mode(self, mode: Optional[str]) -> str:
+        if mode is None:
+            return 'subject' if self.group_by_subject else 'folder'
+
+        normalized = str(mode).strip().lower().replace('-', '_')
+        aliases = {
+            'dir': 'folder',
+            'directory': 'folder',
+            'class_folder': 'folder',
+            'subject_id': 'subject',
+            'group_by_subject': 'subject',
+            'finger': 'canonical_finger',
+            'subject_finger': 'canonical_finger',
+            'subject_position': 'canonical_finger',
+            'canonical': 'canonical_finger',
+        }
+        normalized = aliases.get(normalized, normalized)
+        valid = {'folder', 'subject', 'canonical_finger'}
+        if normalized not in valid:
+            raise ValueError(
+                f"Unsupported identity_label_mode={mode!r}; "
+                f"expected one of {sorted(valid)}"
+            )
+        return normalized
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -230,6 +296,7 @@ def build_identity_dataset(
     image_size: int = 224,
     dataset_name: str = 'NIST_SD302',
     group_by_subject: bool = False,
+    identity_label_mode: Optional[str] = None,
     num_views: int = 1,
 ) -> IdentityDataset:
     """Convenience factory."""
@@ -240,5 +307,6 @@ def build_identity_dataset(
         image_size=image_size,
         dataset_name=dataset_name,
         group_by_subject=group_by_subject,
+        identity_label_mode=identity_label_mode,
         num_views=num_views,
     )

@@ -23,7 +23,7 @@ Config dict keys:
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -34,6 +34,7 @@ from omfr.models.backbone.gabor_stem import LearnableGaborStem
 from omfr.models.backbone.pad_stem import PADStem
 from omfr.models.backbone.tiny_vit import TinyViTBackbone
 from omfr.models.backbone.fastvit import FastViTBackbone
+from omfr.models.backbone.dinov2 import DINOv2Backbone
 from omfr.models.heads.identity_head import IdentityHead
 from omfr.models.heads.pad_head import PADHead
 from omfr.models.losses.arcface import ArcFaceLoss
@@ -69,24 +70,41 @@ class OMFRModule(L.LightningModule):
 
         # -- Model components --
         self.gabor = LearnableGaborStem()
-        # Separate Gabor bank for PAD — initialized at a higher base
-        # frequency (~0.35 cycles/px) so its filter bank covers pore-
-        # and micro-texture scales, while the identity Gabor stays on
-        # ridge frequencies (~0.12 cycles/px). Each bank has its own
-        # σ/γ params, so identity and PAD never interfere at the
-        # preprocessing stage (each objective shapes its own bank).
+        # Legacy PAD-specific modules are kept in the module/state_dict for
+        # checkpoint compatibility. The unified PAD path below now consumes
+        # the shared Gabor + shared backbone representation instead.
         self.gabor_pad = LearnableGaborStem(init_frequency=0.35)
 
         # Backbone dispatch. `backbone.name` selects the implementation:
-        #   tiny_vit_5m_224  -> TinyViTBackbone (5M, hierarchical, local window)
-        #   fastvit_sa12     -> FastViTBackbone (~10.5M, RepMixer + self-attn @ s3)
-        # Stage dims differ between backbones — must flow into IdentityHead.
+        #   tiny_vit_5m_224          -> TinyViTBackbone
+        #   fastvit_sa12             -> FastViTBackbone
+        #   vit_*_patch14_*_dinov2   -> DINOv2Backbone
+        # Stage dims differ between backbones and must flow into the heads.
         backbone_cfg = config.get("backbone", {}) or {}
         backbone_name = str(backbone_cfg.get("name", "tiny_vit_5m_224"))
         num_experts = int(backbone_cfg.get("num_experts", 4))
         top_k = int(backbone_cfg.get("top_k", 2))
 
-        if backbone_name.startswith("fastvit"):
+        if "dinov2" in backbone_name:
+            self.backbone = DINOv2Backbone(
+                pretrained=pretrained,
+                in_chans=int(backbone_cfg.get("in_chans", 8)),
+                model_name=backbone_name,
+                img_size=int(
+                    backbone_cfg.get(
+                        "img_size",
+                        config.get("data", {}).get("image_size", 224),
+                    )
+                ),
+                use_grad_checkpoint=grad_checkpoint,
+                stage1_dim=int(backbone_cfg.get("stage1_dim", 64)),
+                stage2_dim=int(backbone_cfg.get("stage2_dim", 128)),
+                lora_cfg=config.get("lora") or backbone_cfg.get("lora"),
+            )
+            default_stage1, default_stage2, default_stage3, default_stage4 = (
+                self.backbone.out_dims
+            )
+        elif backbone_name.startswith("fastvit"):
             self.backbone = FastViTBackbone(
                 pretrained=pretrained,
                 in_chans=8,
@@ -114,12 +132,15 @@ class OMFRModule(L.LightningModule):
         pad_cfg = config.get("pad_head", {}) or {}
 
         self.pad_stem = PADStem()
+        identity_embed_dim = int(id_cfg.get("embed_dim", 256))
         self.pad_head = PADHead(
             stage1_dim=int(pad_cfg.get("stage1_dim", default_stage1)),
             stage2_dim=int(pad_cfg.get("stage2_dim", default_stage2)),
+            shared_dim=int(pad_cfg.get("shared_dim", identity_embed_dim)),
+            gabor_dim=int(pad_cfg.get("gabor_dim", 8)),
         )
         self.identity_head = IdentityHead(
-            embed_dim=int(id_cfg.get("embed_dim", 256)),
+            embed_dim=identity_embed_dim,
             num_heads=int(id_cfg.get("num_heads", 8)),
             grid_size=int(id_cfg.get("grid_size", 14)),
             num_queries=int(id_cfg.get("num_queries", 4)),
@@ -128,20 +149,44 @@ class OMFRModule(L.LightningModule):
         )
 
         # -- Losses --
+        losses_cfg = config.get("losses", {}) or {}
+        self.identity_ignore_index: int = int(losses_cfg.get("identity_ignore_index", -1))
         # ArcFace: one per MRL dim, weights stored HERE (not in IdentityHead)
         # Init with s=1.0, margin=0.0 — PhaseSchedulerCallback warms up to s=32, m=0.5
         self.arcface_losses = nn.ModuleDict({
-            "64":  ArcFaceLoss(64,  num_classes=num_classes, s=1.0, margin=0.0),
-            "128": ArcFaceLoss(128, num_classes=num_classes, s=1.0, margin=0.0),
-            "256": ArcFaceLoss(256, num_classes=num_classes, s=1.0, margin=0.0),
+            "64":  ArcFaceLoss(
+                64, num_classes=num_classes, s=1.0, margin=0.0,
+                ignore_index=self.identity_ignore_index,
+            ),
+            "128": ArcFaceLoss(
+                128, num_classes=num_classes, s=1.0, margin=0.0,
+                ignore_index=self.identity_ignore_index,
+            ),
+            "256": ArcFaceLoss(
+                256, num_classes=num_classes, s=1.0, margin=0.0,
+                ignore_index=self.identity_ignore_index,
+            ),
         })
-        # PAD branch — focal BCE (hard-example mining) + MixUp consistency
-        # (manifold smoothness). Replaces SupCon(tau=0.07), which was
-        # degenerate on binary PAD and plateaued around 4.5 (TASK_01).
-        self.pad_focal_loss = FocalBCELoss(gamma=2.0, alpha=0.5)
+        # PAD branch — hybrid BCE + focal on top of the shared latent
+        # representation plus task-conditioned routing.
+        self.pad_focal_weight = float(losses_cfg.get("pad_focal_weight", 1.0))
+        self.pad_bce_weight = float(losses_cfg.get("pad_bce_weight", 0.5))
+        self.pad_focal_loss = FocalBCELoss(
+            gamma=float(losses_cfg.get("pad_focal_gamma", 1.0)),
+            alpha=float(losses_cfg.get("pad_focal_alpha", 0.5)),
+        )
+        self.pad_hard_spoof_weight = float(
+            losses_cfg.get("pad_hard_spoof_weight", 2.0)
+        )
+        self.pad_hard_spoof_sensor_ids = {
+            int(x) for x in losses_cfg.get("pad_hard_spoof_sensor_ids", [6])
+        }
+        self.pad_hard_spoof_material_ids = {
+            int(x) for x in losses_cfg.get("pad_hard_spoof_material_ids", [4, 6, 7])
+        }
+        self.pad_ohem_fraction = float(losses_cfg.get("pad_ohem_fraction", 0.25))
+        self.pad_ohem_weight = float(losses_cfg.get("pad_ohem_weight", 1.5))
         self.pad_mixup_loss = MixUpConsistency(alpha=0.4)
-        # Legacy BCE / SupCon kept for back-compat (val only). Unused in
-        # training paths after TASK_01.
         self.bce_loss = nn.BCEWithLogitsLoss()
         # Dedicated SupCon for identity embeddings — higher temperature so
         # the contrastive signal is smoother across many identities.
@@ -162,7 +207,7 @@ class OMFRModule(L.LightningModule):
 
         # -- Loss weights --
         self.alpha: float = 0.0   # PAD weight — ramped in Phase 2
-        self.beta:  float = 0.0   # Orth weight — ramped in Phase 2
+        self.beta:  float = 0.0   # bridge-consistency weight — ramped in Phase 2
         self.alpha_adv: float = 0.0  # sensor-adv weight, ramped in Phase 2
         self.lam_adv:   float = 0.0  # GRL lambda, ramped in Phase 2
         self.gamma: float = float(config.get("gamma", 0.01))
@@ -174,6 +219,15 @@ class OMFRModule(L.LightningModule):
         )
         self.identity_arcface_weight: float = float(
             config.get("identity_arcface_weight", 0.3)
+        )
+        self.bridge_mrl_dims: List[int] = [
+            int(dim) for dim in config.get("bridge_mrl_dims", [64])
+        ]
+
+        # AdaLoRA-style orthogonality regularizer weight on (P^T P - I)
+        # and (Q Q^T - I). Scaled per-layer so the magnitude is ~O(1).
+        self.lora_orth_weight: float = float(
+            (config.get("lora") or {}).get("orth_weight", 0.0)
         )
 
         # -- Phase state --
@@ -194,33 +248,47 @@ class OMFRModule(L.LightningModule):
         self,
         images: torch.Tensor,
         backbone_no_grad: bool = False,
+        route_mode: str = "identity",
+        detach_backbone_outputs: bool = False,
     ) -> Dict:
-        """Gabor stem -> TinyViT backbone. Returns backbone output dict.
-
-        Two Gabor responses are computed:
-          * ``gabor_feat``     — identity Gabor (ridge-tuned), fed into
-            the TinyViT backbone and used downstream by identity_head.
-          * ``gabor_pad_feat`` — PAD Gabor (pore/micro-texture-tuned),
-            consumed by pad_stem inside _run_pad. Separate banks mean
-            identity grads never touch PAD σ/γ and vice-versa.
-
-        ``backbone_no_grad=True`` wraps the expensive TinyViT forward in
-        ``torch.no_grad()`` so none of its activations are retained for
-        backward. The PAD-side Gabor bank stays under autograd because
-        pad_stem must still learn through it. Used by Phase-2 joint step
-        for the PAD branch, where stage1/2 feats are detached downstream
-        and the only gradient we lose is a thin one to MoE gate_proj —
-        already driven by the concurrent identity branch.
-        """
-        enhanced     = self.gabor(images)        # (B, 8, 224, 224)
-        enhanced_pad = self.gabor_pad(images)    # (B, 8, 224, 224)
+        """Shared Gabor stem -> shared backbone with task-conditioned routing."""
+        enhanced = self.gabor(images)        # (B, 8, 224, 224)
         if backbone_no_grad:
             with torch.no_grad():
-                out = self.backbone(enhanced)
+                out = self.backbone(enhanced, route_mode=route_mode)
         else:
-            out = self.backbone(enhanced)
+            out = self.backbone(enhanced, route_mode=route_mode)
+        if backbone_no_grad and route_mode == "pad":
+            self.backbone.refresh_gateonly_stats(out["routing_stats"], route_mode)
+        if detach_backbone_outputs:
+            out["stage1_feat"] = out["stage1_feat"].detach()
+            out["stage2_feat"] = out["stage2_feat"].detach()
+            out["stage3_feat"] = out["stage3_feat"].detach()
+            out["stage4_feat"] = out["stage4_feat"].detach()
+            out["balance_losses"] = [
+                loss.detach() if torch.is_tensor(loss) else loss
+                for loss in out["balance_losses"]
+            ]
+            routing_stats = {}
+            for key, stats in out["routing_stats"].items():
+                detached_stats = {}
+                for name, value in stats.items():
+                    if name in {
+                        "expert_weights_gateonly",
+                        "token_entropy_gateonly",
+                        "gate_input_gateonly",
+                        "router_mode",
+                    }:
+                        detached_stats[name] = value
+                    elif torch.is_tensor(value):
+                        detached_stats[name] = value.detach()
+                    else:
+                        detached_stats[name] = value
+                routing_stats[key] = detached_stats
+            out["routing_stats"] = routing_stats
         out["gabor_feat"]     = enhanced
-        out["gabor_pad_feat"] = enhanced_pad
+        # Legacy alias preserved for scripts/checkpoints that still inspect it.
+        out["gabor_pad_feat"] = enhanced
         return out
 
     def _run_identity(self, backbone_out: Dict) -> Dict:
@@ -230,30 +298,12 @@ class OMFRModule(L.LightningModule):
             "stage4_feat": backbone_out["stage4_feat"],
         })
 
-    def _run_pad(self, backbone_out: Dict) -> Dict:
-        """PAD head reading stage1 + stage2 features + routing stats.
-
-        ALL tensors coming out of the backbone are detached before they
-        reach the PAD head. Rationale:
-
-          * stage1/stage2 feature maps — without the detach, PAD
-            BCE/SupCon back-propagates through the 5.4 M-param TinyViT
-            backbone. LivDet datasets have strong sensor signatures, so
-            the backbone quickly memorizes sensor -> class shortcuts.
-            Observed symptoms: identity_loss jumps from ~5 to ~12 at
-            the Phase 2 boundary (backbone features shift away from
-            what identity head expects), val BPCER climbs to ~80% on
-            held-out sensors (test prints look "alien", head defaults
-            to spoof). The fix is to make the PAD head a pure read-only
-            classifier on top of identity-shaped features.
-          * routing_stats — same reason for the MoE gate: if PAD loss
-            could shape routing, the gate would encode liveness as a
-            sensor fingerprint and fail cross-split.
-
-        Net effect: the backbone is shaped only by L_identity (Phase 1,
-        2-identity, 3-joint) + balance loss. PAD head trains its own
-        ~340K params from a frozen view of the backbone.
-        """
+    def _run_pad(
+        self,
+        backbone_out: Dict,
+        shared_out: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> Dict:
+        """PAD head reading shared latent + early shared features."""
         rs = backbone_out["routing_stats"]
 
         def _detach_stats(stats: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -267,8 +317,9 @@ class OMFRModule(L.LightningModule):
             return res
 
         def _gateonly_stats(stats: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-            # "Gate-only" routing copy — grad can reach gate_proj
-            # weights but stops at gate_input (see moe_ffn.forward).
+            # "Gate-only" routing copy. Grad can reach the active router
+            # (`gate_proj` for identity mode, `pad_gate_proj` for pad mode)
+            # while staying detached from the shared frequency/trunk path.
             res = {
                 "expert_weights": stats["expert_weights_gateonly"],
                 "token_entropy":  stats["token_entropy_gateonly"],
@@ -278,15 +329,9 @@ class OMFRModule(L.LightningModule):
                 res["gate_input_gateonly"] = stats["gate_input_gateonly"]
             return res
 
-        # Phase-gated routing un-detach: from Phase 2 on, let PAD
-        # gradients flow back into the MoE gate projection only
-        # (~200 params/layer × 3 layers ≈ 600 params). Expert bodies,
-        # stage features, and the upstream tokens that feed FrequencyGate
-        # stay isolated — PAD can bias routing toward spoof-texture
-        # experts without reshaping the backbone.
-        # Phase 1: keep everything detached — backbone is still
-        # converging on identity and we don't want a noisy PAD head
-        # steering routing before it has a useful signal.
+        # From Phase 2 on we prefer the gate-only routing views so PAD
+        # can adapt its router without leaking gradients upstream into
+        # the shared token features.
         if self.current_phase >= 2:
             rs_s2  = _gateonly_stats(rs["s2"])
             rs_s3a = _gateonly_stats(rs["s3a"])
@@ -296,33 +341,48 @@ class OMFRModule(L.LightningModule):
             rs_s3a = _detach_stats(rs["s3a"])
             rs_s3b = _detach_stats(rs["s3b"])
 
-        # Dedicated PAD stem runs on the PAD-specific Gabor bank
-        # (self.gabor_pad). Because it's a separate filter bank from
-        # the identity Gabor, PAD gradients never touch identity σ/γ —
-        # no detach needed. The PAD bank is free to learn pore- and
-        # texture-scale frequencies throughout all phases.
-        pad_stem_feat = self.pad_stem(backbone_out["gabor_pad_feat"])
+        if shared_out is None:
+            shared_out = self._run_identity(backbone_out)
 
-        return self.pad_head({
-            "pad_stem_feat":     pad_stem_feat,
-            "stage1_feat":       backbone_out["stage1_feat"].detach(),
-            "stage2_feat":       backbone_out["stage2_feat"].detach(),
-            "routing_stats_s2":  rs_s2,
-            "routing_stats_s3a": rs_s3a,
-            "routing_stats_s3b": rs_s3b,
+        pad_out = self.pad_head({
+            "shared_spatial_feat":  shared_out["shared_spatial_feat"],
+            "gabor_feat":           backbone_out["gabor_feat"].detach(),
+            "stage1_feat":          backbone_out["stage1_feat"].detach(),
+            "stage2_feat":          backbone_out["stage2_feat"].detach(),
+            "routing_stats_s2":     rs_s2,
+            "routing_stats_s3a":    rs_s3a,
+            "routing_stats_s3b":    rs_s3b,
         })
+        pad_out["shared_repr_feat"] = shared_out["shared_repr_feat"]
+        pad_out["shared_spatial_feat"] = shared_out["shared_spatial_feat"]
+        pad_out["shared_embedding"] = shared_out["shared_embedding"]
+        pad_out["shared_mrl_embeddings"] = shared_out["shared_mrl_embeddings"]
+        return pad_out
 
     def _arcface_loss(
         self,
         mrl_embeddings: Dict[int, torch.Tensor],
         identity_labels: torch.Tensor,
     ) -> torch.Tensor:
-        """MRL-ArcFace: average loss across {64, 128, 256} dims."""
-        total = sum(
-            self.arcface_losses[str(dim)](emb, identity_labels)
-            for dim, emb in mrl_embeddings.items()
-        )
-        return total / len(mrl_embeddings)
+        """MRL-ArcFace: average loss across {64, 128, 256} dims.
+
+        Per-dim values are logged so it is visible which prefix is the
+        weakest (typically the smallest dim with many classes).
+        """
+        per_dim = {
+            dim: self.arcface_losses[str(dim)](mrl_embeddings[dim], identity_labels)
+            for dim in self.MRL_DIMS
+        }
+        if self.training:
+            for dim, loss in per_dim.items():
+                self.log(
+                    f"train/id_arcface_d{dim}",
+                    loss.detach(),
+                    on_step=True,
+                    on_epoch=False,
+                    sync_dist=True,
+                )
+        return sum(per_dim.values()) / len(per_dim)
 
     def _identity_loss(
         self,
@@ -338,6 +398,19 @@ class OMFRModule(L.LightningModule):
 
         Returns a dict so each component can be logged separately.
         """
+        valid_mask = self._valid_identity_mask(identity_labels)
+        if not valid_mask.any():
+            anchor = sum(emb.sum() for emb in mrl_embeddings.values()) * 0.0
+            zero = anchor + next(iter(self.arcface_losses.values())).weight.sum() * 0.0
+            return {"arcface": zero, "supcon": zero, "total": zero}
+
+        if not bool(valid_mask.all()):
+            mrl_embeddings = {
+                dim: emb[valid_mask]
+                for dim, emb in mrl_embeddings.items()
+            }
+            identity_labels = identity_labels[valid_mask]
+
         l_arcface = self._arcface_loss(mrl_embeddings, identity_labels)
         # SupCon is computed on the full 256-D embedding — the MRL prefixes
         # inherit the same geometry via truncation + re-normalization.
@@ -349,6 +422,120 @@ class OMFRModule(L.LightningModule):
             + self.identity_supcon_weight * l_supcon
         )
         return {"arcface": l_arcface, "supcon": l_supcon, "total": total}
+
+    def _valid_identity_mask(self, identity_labels: torch.Tensor) -> torch.Tensor:
+        """Return True for labels that belong to the global identity classifier."""
+        num_classes = next(iter(self.arcface_losses.values())).num_classes
+        labels = identity_labels.long()
+        return (
+            (labels != self.identity_ignore_index)
+            & (labels >= 0)
+            & (labels < num_classes)
+        )
+
+    def _pad_classification_loss(
+        self,
+        pad_logit: torch.Tensor,
+        liveness_labels: torch.Tensor,
+        sensor_labels: Optional[torch.Tensor] = None,
+        material_labels: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        logits = pad_logit.squeeze(-1)
+        targets = liveness_labels.float()
+        sample_weight = self._pad_sample_weights(
+            logits,
+            liveness_labels,
+            sensor_labels=sensor_labels,
+            material_labels=material_labels,
+        )
+        l_focal = self.pad_focal_loss(logits, targets, sample_weight=sample_weight)
+        bce_per_sample = F.binary_cross_entropy_with_logits(
+            logits, targets, reduction="none",
+        )
+        l_bce = (bce_per_sample * sample_weight).sum() / sample_weight.sum().clamp_min(1.0)
+        total = self.pad_focal_weight * l_focal + self.pad_bce_weight * l_bce
+        return {
+            "focal": l_focal,
+            "bce": l_bce,
+            "total": total,
+            "sample_weight_mean": sample_weight.mean().detach(),
+            "sample_weight_max": sample_weight.max().detach(),
+        }
+
+    def _pad_sample_weights(
+        self,
+        logits: torch.Tensor,
+        liveness_labels: torch.Tensor,
+        sensor_labels: Optional[torch.Tensor] = None,
+        material_labels: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        targets = liveness_labels.to(logits.device).float().reshape(-1)
+        weights = torch.ones_like(targets, dtype=logits.dtype)
+        spoof_mask = targets == 0
+
+        if (
+            self.pad_hard_spoof_weight > 1.0
+            and sensor_labels is not None
+            and material_labels is not None
+            and self.pad_hard_spoof_sensor_ids
+            and self.pad_hard_spoof_material_ids
+        ):
+            sensor = sensor_labels.to(logits.device).long().reshape(-1)
+            material = material_labels.to(logits.device).long().reshape(-1)
+            sensor_ids = torch.tensor(
+                sorted(self.pad_hard_spoof_sensor_ids),
+                device=logits.device,
+                dtype=torch.long,
+            )
+            material_ids = torch.tensor(
+                sorted(self.pad_hard_spoof_material_ids),
+                device=logits.device,
+                dtype=torch.long,
+            )
+            hard_group = (
+                spoof_mask
+                & torch.isin(sensor, sensor_ids)
+                & torch.isin(material, material_ids)
+            )
+            weights = torch.where(
+                hard_group,
+                weights * self.pad_hard_spoof_weight,
+                weights,
+            )
+
+        if self.pad_ohem_fraction > 0.0 and self.pad_ohem_weight > 1.0 and spoof_mask.any():
+            with torch.no_grad():
+                losses = F.binary_cross_entropy_with_logits(
+                    logits.detach().reshape(-1),
+                    targets,
+                    reduction="none",
+                )
+                spoof_indices = spoof_mask.nonzero(as_tuple=False).flatten()
+                k = max(1, int(round(float(spoof_indices.numel()) * self.pad_ohem_fraction)))
+                k = min(k, int(spoof_indices.numel()))
+                hard_rel = losses[spoof_indices].topk(k).indices
+                hard_indices = spoof_indices[hard_rel]
+            weights = weights.clone()
+            weights[hard_indices] = weights[hard_indices] * self.pad_ohem_weight
+
+        return weights
+
+    def _phase_aware_bridge_loss(
+        self,
+        pad_mrl_embeddings: Dict[int, torch.Tensor],
+        identity_mrl_embeddings: Dict[int, torch.Tensor],
+    ) -> torch.Tensor:
+        losses = []
+        for dim in self.bridge_mrl_dims:
+            pad_z = pad_mrl_embeddings[dim]
+            id_z = identity_mrl_embeddings[dim]
+            if self.current_phase == 2:
+                id_z = id_z.detach()
+            losses.append(1.0 - (pad_z * id_z).sum(dim=-1).mean())
+        if not losses:
+            anchor_dim = self.bridge_mrl_dims[0] if self.bridge_mrl_dims else 64
+            return pad_mrl_embeddings[anchor_dim].new_zeros(())
+        return torch.stack(losses).mean()
 
     # -------------------------------------------------------------------------
     # Phase-specific training steps
@@ -373,54 +560,105 @@ class OMFRModule(L.LightningModule):
         return loss
 
     def _pad_features_from_images(self, images: torch.Tensor) -> torch.Tensor:
-        """Gabor_pad -> PADStem -> pad_head fusion, producing pad_features.
+        """Legacy helper for MixUp; now runs through the shared PAD path."""
+        backbone_out = self._run_backbone(images, route_mode="pad")
+        pad_out = self._run_pad(backbone_out)
+        return pad_out["pad_features"]
 
-        Used by MixUpConsistency to get features on linearly-mixed images
-        without paying for the full TinyViT backbone. We skip the backbone:
-        PADStem is the only trainable pixel-path on PAD, and the routing /
-        stage features are batch-dependent (can't be linearly mixed anyway),
-        so feeding zeros for those lets the consistency loss target the
-        pad_stem manifold.
-        """
-        gabor_pad = self.gabor_pad(images)
-        pad_stem_feat = self.pad_stem(gabor_pad)
-        B = images.shape[0]
-        device = images.device
-        zeros_s1 = torch.zeros(B, 64, 56, 56, device=device, dtype=pad_stem_feat.dtype)
-        zeros_s2 = torch.zeros(B, 128, 28, 28, device=device, dtype=pad_stem_feat.dtype)
-        zeros_rs = {
-            "expert_weights": torch.zeros(B, 1, 4, device=device, dtype=pad_stem_feat.dtype),
-            "token_entropy":  torch.zeros(B, 1, device=device, dtype=pad_stem_feat.dtype),
-            # [NEW] Dummy tensor 3 chiều để thỏa mãn 444 chiều đầu vào của fusion_mlp
-            "gate_input_gateonly": torch.zeros(B, 1, 3, device=device, dtype=pad_stem_feat.dtype),
-        }
-        out = self.pad_head({
-            "pad_stem_feat":     pad_stem_feat,
-            "stage1_feat":       zeros_s1,
-            "stage2_feat":       zeros_s2,
-            "routing_stats_s2":  zeros_rs,
-            "routing_stats_s3a": zeros_rs,
-            "routing_stats_s3b": zeros_rs,
-        })
-        return out["pad_features"]
+    def _log_pad_separation(
+        self,
+        pad_logit: torch.Tensor,
+        pad_target: torch.Tensor,
+        valid_pad_mask: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Log train-time PAD separation stats to detect collapse early."""
+        with torch.no_grad():
+            prob = torch.sigmoid(pad_logit.float()).reshape(-1)
+            y = pad_target.float().reshape(-1)
+
+            if valid_pad_mask is None:
+                mask = torch.ones_like(y, dtype=torch.bool)
+            else:
+                mask = valid_pad_mask.bool().reshape(-1)
+
+            mask = mask & torch.isfinite(prob) & torch.isfinite(y)
+            if not mask.any():
+                return
+
+            prob_m = prob[mask]
+            y_m = y[mask]
+            pos_mask = y_m == 1
+            neg_mask = y_m == 0
+            pred = (prob_m > 0.5).float()
+
+            self.log("train/pad_valid", mask.sum().float(), on_step=True, on_epoch=False, sync_dist=True)
+            self.log("train/pad_pos_rate", y_m.mean(), on_step=True, on_epoch=False, sync_dist=True)
+            self.log("train/pad_prob_mean", prob_m.mean(), on_step=True, on_epoch=False, sync_dist=True)
+            self.log("train/pad_prob_std", prob_m.std(unbiased=False), on_step=True, on_epoch=False, sync_dist=True)
+            self.log("train/pad_acc", (pred == y_m).float().mean(), on_step=True, on_epoch=False, sync_dist=True)
+
+            prob_y0 = None
+            if neg_mask.any():
+                prob_y0 = prob_m[neg_mask].mean()
+                self.log("train/pad_prob_y0", prob_y0, on_step=True, on_epoch=False, sync_dist=True)
+
+            prob_y1 = None
+            if pos_mask.any():
+                prob_y1 = prob_m[pos_mask].mean()
+                self.log("train/pad_prob_y1", prob_y1, on_step=True, on_epoch=False, sync_dist=True)
+
+            if prob_y0 is not None and prob_y1 is not None:
+                self.log(
+                    "train/pad_prob_gap",
+                    prob_y1 - prob_y0,
+                    on_step=True,
+                    on_epoch=False,
+                    sync_dist=True,
+                )
+
+            debug_every = int(self.cfg.get("pad_debug_print_every_n_steps", 50))
+            if debug_every > 0 and (int(self.global_step) % debug_every == 0):
+                prob_y0_str = "nan" if prob_y0 is None else f"{prob_y0.item():.4f}"
+                prob_y1_str = "nan" if prob_y1 is None else f"{prob_y1.item():.4f}"
+                self.print(
+                    "[pad-debug] "
+                    f"step={int(self.global_step)} "
+                    f"valid={int(mask.sum().item())} "
+                    f"pos_rate={y_m.mean().item():.4f} "
+                    f"prob_mean={prob_m.mean().item():.4f} "
+                    f"prob_std={prob_m.std(unbiased=False).item():.4f} "
+                    f"prob_y0={prob_y0_str} "
+                    f"prob_y1={prob_y1_str} "
+                    f"acc={(pred == y_m).float().mean().item():.4f}"
+                )
 
     def _phase2_identity_step(self, batch: Any) -> torch.Tensor:
-        """Phase 2 — identity batch. Full gradients to backbone + identity head."""
+        """Phase 2 — identity batch. Full gradients to backbone + shared/id head."""
         images, identity_labels = self._unpack_identity_batch(batch)
 
-        backbone_out = self._run_backbone(images)
-        id_out       = self._run_identity(backbone_out)
-        pad_out      = self._run_pad(backbone_out)
+        id_backbone = self._run_backbone(images, route_mode="identity")
+        id_out      = self._run_identity(id_backbone)
+        pad_backbone = self._run_backbone(
+            images,
+            backbone_no_grad=True,
+            route_mode="pad",
+            detach_backbone_outputs=True,
+        )
+        pad_out     = self._run_pad(pad_backbone)
 
         id_parts  = self._identity_loss(id_out["mrl_embeddings"], identity_labels)
-        l_orth    = self.orth_loss(pad_out["pad_embedding"], id_out["identity_embedding"])
-        l_balance = sum(backbone_out["balance_losses"])
-        loss      = id_parts["total"] + self.beta * l_orth + self.gamma * l_balance
+        l_bridge  = self._phase_aware_bridge_loss(
+            pad_out["shared_mrl_embeddings"], id_out["shared_mrl_embeddings"],
+        )
+        l_balance = 0.5 * (
+            sum(id_backbone["balance_losses"]) + sum(pad_backbone["balance_losses"])
+        )
+        loss      = id_parts["total"] + self.beta * l_bridge + self.gamma * l_balance
 
         self.log("train/identity_loss", id_parts["total"], prog_bar=True, sync_dist=True)
         self.log("train/id_arcface",    id_parts["arcface"],                sync_dist=True)
         self.log("train/id_supcon",     id_parts["supcon"],                 sync_dist=True)
-        self.log("train/orth_loss",     l_orth,            sync_dist=True)
+        self.log("train/bridge_loss",   l_bridge,          sync_dist=True)
         self.log("train/balance_loss",  l_balance,         sync_dist=True)
         self.log("train/total_loss",    loss,              prog_bar=True, sync_dist=True)
         return loss
@@ -433,22 +671,34 @@ class OMFRModule(L.LightningModule):
         """
         images, liveness_labels = self._unpack_pad_batch(batch)
         sensor_labels = self._unpack_sensor_labels(batch)
+        material_labels = self._unpack_material_labels(batch)
 
-        backbone_out = self._run_backbone(images)
-        pad_out      = self._run_pad(backbone_out)
-
-        id_out = self.identity_head({
-            "stage3_feat": backbone_out["stage3_feat"].detach(),
-            "stage4_feat": backbone_out["stage4_feat"].detach(),
-        })
-
-        l_focal = self.pad_focal_loss(
-            pad_out["pad_logit"].squeeze(-1), liveness_labels.float(),
+        pad_backbone = self._run_backbone(
+            images,
+            backbone_no_grad=True,
+            route_mode="pad",
+            detach_backbone_outputs=True,
         )
-        
+        pad_out      = self._run_pad(pad_backbone)
+
+        # Bridge loss requires an identity-route forward of the same images.
+        # In this PAD-only fallback step we drop bridge to save a full ViT
+        # forward — identity batches still drive the bridge alignment in
+        # `_phase2_identity_step`, where both routes are already needed.
+        pad_parts = self._pad_classification_loss(
+            pad_out["pad_logit"],
+            liveness_labels,
+            sensor_labels=sensor_labels,
+            material_labels=material_labels,
+        )
+        self._log_pad_separation(
+            pad_out["pad_logit"].squeeze(-1),
+            liveness_labels,
+        )
+
         # MixUp disabled: destroys fingerprint micro-texture and caused NaN in smoke test.
         l_mixup = images.new_zeros(())
-        
+
         if sensor_labels is not None and self.lam_adv > 0:
             sensor_logits = self.sensor_adv_head(
                 pad_out["pad_features"], lam=self.lam_adv,
@@ -456,18 +706,22 @@ class OMFRModule(L.LightningModule):
             l_sensor = self.sensor_adv_loss(sensor_logits, sensor_labels)
         else:
             l_sensor = images.new_zeros(())
-        l_orth    = self.orth_loss(pad_out["pad_embedding"], id_out["identity_embedding"])
-        l_balance = sum(backbone_out["balance_losses"])
+        l_bridge  = images.new_zeros(())
+        l_balance = sum(pad_backbone["balance_losses"])
 
-        loss = (self.alpha * (l_focal + l_mixup)
+        loss = (self.alpha * (pad_parts["total"] + l_mixup)
                 + self.alpha_adv * l_sensor
-                + self.beta * l_orth
+                + self.beta * l_bridge
                 + self.gamma * l_balance)
 
-        self.log("train/pad_focal_loss", l_focal,   sync_dist=True)
+        self.log("train/pad_focal_loss", pad_parts["focal"], sync_dist=True)
+        self.log("train/pad_bce_loss",   pad_parts["bce"],   sync_dist=True)
+        self.log("train/pad_cls_loss",   pad_parts["total"], sync_dist=True)
+        self.log("train/pad_weight_mean", pad_parts["sample_weight_mean"], sync_dist=True)
+        self.log("train/pad_weight_max",  pad_parts["sample_weight_max"],  sync_dist=True)
         self.log("train/pad_mixup_loss", l_mixup,   sync_dist=True)
         self.log("train/pad_sensor_adv", l_sensor,  sync_dist=True)
-        self.log("train/orth_loss",      l_orth,    sync_dist=True)
+        self.log("train/bridge_loss",    l_bridge,  sync_dist=True)
         self.log("train/balance_loss",   l_balance, sync_dist=True)
         self.log("train/total_loss",     loss, prog_bar=True, sync_dist=True)
         return loss
@@ -483,9 +737,9 @@ class OMFRModule(L.LightningModule):
 
         Forward structure:
           1. Identity branch on id_batch — full grad to backbone + id head.
-          2. PAD branch on pad_batch — grad into pad_stem + pad_head only
-             (backbone stage1/2 still detached inside _run_pad).
-          3. Orth loss on matched subset of the two embedding sets.
+          2. PAD branch on pad_batch — shared trunk read-only in Phase 2;
+             PAD adapts through the PAD router + shared latent head.
+          3. Bridge loss aligns PAD-route and ID-route shared latents.
           4. Optional sensor-adversarial via GRL on pad_features.
         """
         # --- Identity branch ---
@@ -498,20 +752,33 @@ class OMFRModule(L.LightningModule):
         # --- PAD branch ---
         pad_images, liveness_labels = self._unpack_pad_batch(pad_batch)
         sensor_labels = self._unpack_sensor_labels(pad_batch)
-        # Wrap TinyViT forward for the PAD branch in no_grad: the only
-        # gradient we would otherwise get here is a thin one into
-        # MoE gate_proj via `expert_weights_gateonly`, which the ID
-        # branch (above) is already driving. All other outputs are
-        # detached inside `_run_pad` anyway. Releases ~40% of Phase-2
-        # activation memory — the fix for the epoch-20 OOM jump.
-        pad_backbone = self._run_backbone(pad_images, backbone_no_grad=True)
+        material_labels = self._unpack_material_labels(pad_batch)
+        # PAD branch gets its own router in the shared MoE backbone.
+        # `detach_backbone_outputs=True` keeps only the PAD-router path
+        # live while stage maps / raw routing tensors stay read-only.
+        pad_backbone = self._run_backbone(
+            pad_images,
+            backbone_no_grad=True,
+            route_mode="pad",
+            detach_backbone_outputs=True,
+        )
         pad_out      = self._run_pad(pad_backbone)
-
-        l_focal = self.pad_focal_loss(
-            pad_out["pad_logit"].squeeze(-1), liveness_labels.float(),
+        # NOTE: a third backbone forward (identity-route on PAD images) used
+        # to be run here only to feed bridge_loss. We drop it to halve the
+        # Phase-2 PAD-side trunk cost — bridge alignment is still driven by
+        # `_phase2_identity_step`, where both routes are needed anyway.
+        pad_parts = self._pad_classification_loss(
+            pad_out["pad_logit"],
+            liveness_labels,
+            sensor_labels=sensor_labels,
+            material_labels=material_labels,
+        )
+        self._log_pad_separation(
+            pad_out["pad_logit"].squeeze(-1),
+            liveness_labels,
         )
         
-        # MixUp costs two extra pad_stem forwards (original + mixed). At
+        # MixUp costs an extra shared PAD forward. At
         # the Phase-2 boundary, alpha starts at ~0.01 (cosine soft-start),
         # so the contribution alpha * l_mixup is negligible while the
         # memory cost isn't. Skip under a small threshold.
@@ -527,29 +794,31 @@ class OMFRModule(L.LightningModule):
         else:
             l_sensor = pad_images.new_zeros(())
 
-        # --- Orthogonality across the two branches ---
-        Bmin = min(id_out["identity_embedding"].shape[0],
-                   pad_out["pad_embedding"].shape[0])
-        l_orth = self.orth_loss(
-            pad_out["pad_embedding"][:Bmin],
-            id_out["identity_embedding"][:Bmin],
-        )
+        # Bridge alignment is driven by `_phase2_identity_step` (which already
+        # has both routes in scope). On the joint step we only have the
+        # PAD-route forward of pad_images, so an extra identity-route forward
+        # would just be a memory tax. Zero out bridge here.
+        l_bridge = pad_images.new_zeros(())
 
         l_balance = 0.5 * (l_balance_id + l_balance_pad)
 
         loss = (id_parts["total"]
-                + self.alpha * (l_focal + l_mixup)
+                + self.alpha * (pad_parts["total"] + l_mixup)
                 + self.alpha_adv * l_sensor
-                + self.beta * l_orth
+                + self.beta * l_bridge
                 + self.gamma * l_balance)
 
         self.log("train/identity_loss",  id_parts["total"], prog_bar=True, sync_dist=True)
         self.log("train/id_arcface",     id_parts["arcface"],                sync_dist=True)
         self.log("train/id_supcon",      id_parts["supcon"],                 sync_dist=True)
-        self.log("train/pad_focal_loss", l_focal,                            sync_dist=True)
+        self.log("train/pad_focal_loss", pad_parts["focal"],                  sync_dist=True)
+        self.log("train/pad_bce_loss",   pad_parts["bce"],                    sync_dist=True)
+        self.log("train/pad_cls_loss",   pad_parts["total"],                  sync_dist=True)
+        self.log("train/pad_weight_mean", pad_parts["sample_weight_mean"],     sync_dist=True)
+        self.log("train/pad_weight_max",  pad_parts["sample_weight_max"],      sync_dist=True)
         self.log("train/pad_mixup_loss", l_mixup,                            sync_dist=True)
         self.log("train/pad_sensor_adv", l_sensor,                           sync_dist=True)
-        self.log("train/orth_loss",      l_orth,                             sync_dist=True)
+        self.log("train/bridge_loss",    l_bridge,                           sync_dist=True)
         self.log("train/balance_loss",   l_balance,                          sync_dist=True)
         self.log("train/total_loss",     loss,              prog_bar=True, sync_dist=True)
         self.log("train/alpha",          self.alpha,                         sync_dist=True)
@@ -559,69 +828,154 @@ class OMFRModule(L.LightningModule):
         return loss
 
     def _phase3_step(self, batch: Any) -> torch.Tensor:
-        """Phase 3 — joint refinement. Spoof-masked ArcFace."""
-        images = batch["images"] if isinstance(batch, dict) else batch[0]
+        """Phase 3 — single sub-batch loss for joint refinement.
+
+        Only forwards the backbone routes that the sub-batch actually needs:
+          * identity-only sub-batch -> identity route only
+          * PAD-only sub-batch      -> PAD route only
+          * true joint sub-batch (valid identity + liveness) -> both routes + bridge loss
+          * LivDet pseudo-joint sub-batch -> PAD route only (`identity_loss_ignore`)
+
+        Earlier this function ran *both* routes on every sub-batch, which (a)
+        wasted a forward pass and (b) let the bridge loss reshape the identity
+        backbone on PAD-only LivDet batches. The Phase-3 collapse from
+        cascaded_IM=0.35 (epoch 56-58) down to 0.07 (epoch 80+) tracks back
+        to that leakage combined with batch_idx alternation.
+
+        This step computes the per-sub-batch loss only; the caller in
+        `training_step` sums losses over all sub-batches in a single
+        optimizer step (TASK_04 concat scheme), so Adam's second-moment
+        sees a single stable loss landscape per step.
+        """
+        is_dict = isinstance(batch, dict)
+        has_id  = is_dict and "identity_labels" in batch
+        has_liv = is_dict and "liveness_labels" in batch
+
+        images = batch["images"] if is_dict else batch[0]
 
         # Multi-view identity sub-batch arrives as (B, V, C, H, W).
         # Flatten before the Gabor stem (which expects (B, 1, H, W)).
-        # PAD/joint sub-batches are already 4-D and pass through
-        # untouched. Labels must be replicated in lockstep so the
-        # identity loss sees (B*V) samples with the correct class.
+        # PAD/joint sub-batches are already 4-D and pass through untouched.
         v_repeat = 1
         if images.ndim == 5:
             B, V, C, H, W = images.shape
             images = images.reshape(B * V, C, H, W)
             v_repeat = V
 
-        backbone_out = self._run_backbone(images)
-        id_out       = self._run_identity(backbone_out)
-        pad_out      = self._run_pad(backbone_out)
+        def _repeat_if_multiview(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if tensor is not None and v_repeat > 1:
+                return tensor.repeat_interleave(v_repeat)
+            return tensor
 
-        l_orth    = self.orth_loss(pad_out["pad_embedding"], id_out["identity_embedding"])
-        l_balance = sum(backbone_out["balance_losses"])
-        loss: torch.Tensor = self.beta * l_orth + self.gamma * l_balance
-
-        # Identity loss — spoof-masked when liveness labels available
-        if isinstance(batch, dict) and "identity_labels" in batch:
-            id_labels = batch["identity_labels"]
-            if v_repeat > 1:
-                id_labels = id_labels.repeat_interleave(v_repeat)
-            if "liveness_labels" in batch:
-                live_mask = batch["liveness_labels"] == 1
-                if live_mask.any():
-                    masked_embs = {
-                        dim: emb[live_mask]
-                        for dim, emb in id_out["mrl_embeddings"].items()
-                    }
-                    id_parts = self._identity_loss(masked_embs, id_labels[live_mask])
-                    loss = loss + id_parts["total"]
-                    self.log("train/id_arcface", id_parts["arcface"], sync_dist=True)
-                    self.log("train/id_supcon",  id_parts["supcon"],  sync_dist=True)
-            else:
-                id_parts = self._identity_loss(id_out["mrl_embeddings"], id_labels)
-                loss = loss + id_parts["total"]
-                self.log("train/id_arcface", id_parts["arcface"], sync_dist=True)
-                self.log("train/id_supcon",  id_parts["supcon"],  sync_dist=True)
-
-        # PAD loss — focal + mixup (TASK_01). MixUp runs on the raw
-        # images tensor; it computes features via _pad_features_from_images
-        # so only pad_stem + pad_head are regularized (backbone not touched).
-        if isinstance(batch, dict) and "liveness_labels" in batch:
-            liveness = batch["liveness_labels"]
-            l_focal = self.pad_focal_loss(
-                pad_out["pad_logit"].squeeze(-1), liveness.float(),
+        id_labels = None
+        valid_id_mask = None
+        has_valid_id = False
+        if has_id:
+            id_labels = _repeat_if_multiview(batch["identity_labels"])
+            ignore_mask = _repeat_if_multiview(batch.get("identity_loss_ignore"))
+            if ignore_mask is not None:
+                id_labels = id_labels.clone()
+                ignore_mask = ignore_mask.to(device=id_labels.device, dtype=torch.bool)
+                id_labels[ignore_mask] = self.identity_ignore_index
+            valid_id_mask = self._valid_identity_mask(id_labels)
+            has_valid_id = bool(valid_id_mask.any().item())
+            self.log(
+                "train/id_ignored_samples",
+                (~valid_id_mask).sum().float(),
+                on_step=True,
+                on_epoch=False,
+                sync_dist=True,
             )
-            
+
+        liveness = _repeat_if_multiview(batch["liveness_labels"]) if has_liv else None
+
+        loss: torch.Tensor = images.new_zeros(())
+        l_balance_total = images.new_zeros(())
+        n_routes = 0
+
+        id_out = None
+        pad_out = None
+
+        if has_valid_id:
+            id_images = images[valid_id_mask]
+            id_backbone = self._run_backbone(id_images, route_mode="identity")
+            id_out = self._run_identity(id_backbone)
+            l_balance_total = l_balance_total + sum(id_backbone["balance_losses"])
+            n_routes += 1
+
+        if has_liv:
+            # Gradient isolation: only true joint sub-batches (valid identity
+            # AND liveness, e.g. MSU-FPAD) run PAD with full backbone grad —
+            # that is when bridge_loss meaningfully shapes both heads. PAD-only
+            # and LivDet pseudo-joint MUST detach the backbone, otherwise PAD
+            # loss leaks through `_run_pad → _run_identity(pad_backbone) →
+            # shared_spatial_feat → identity_head` and pulls identity_head
+            # toward LivDet-favoured features. That leak is the root cause of
+            # the Phase-3 identity_rank1 drift (0.053 → 0.045 over 22 epochs).
+            pad_full_grad = bool(has_valid_id)
+            if pad_full_grad:
+                pad_backbone = self._run_backbone(images, route_mode="pad")
+            else:
+                pad_backbone = self._run_backbone(
+                    images,
+                    backbone_no_grad=True,
+                    route_mode="pad",
+                    detach_backbone_outputs=True,
+                )
+            pad_out = self._run_pad(pad_backbone)
+            l_balance_total = l_balance_total + sum(pad_backbone["balance_losses"])
+            n_routes += 1
+
+        # Identity loss: ignore LivDet pseudo-identities (-1) and preserve the
+        # existing spoof mask for true joint batches.
+        if has_valid_id and id_out is not None and id_labels is not None:
+            id_loss_labels = id_labels[valid_id_mask]
+            id_loss_embs = id_out["mrl_embeddings"]
+            if has_liv and liveness is not None:
+                live_mask = liveness[valid_id_mask] == 1
+                if live_mask.any():
+                    id_loss_embs = {
+                        dim: emb[live_mask]
+                        for dim, emb in id_loss_embs.items()
+                    }
+                    id_loss_labels = id_loss_labels[live_mask]
+                else:
+                    id_loss_labels = id_loss_labels[:0]
+                    id_loss_embs = {
+                        dim: emb[:0]
+                        for dim, emb in id_loss_embs.items()
+                    }
+
+            if id_loss_labels.numel() > 0:
+                id_parts = self._identity_loss(id_loss_embs, id_loss_labels)
+                loss = loss + id_parts["total"]
+                self.log("train/identity_loss", id_parts["total"], prog_bar=True, sync_dist=True)
+                self.log("train/id_arcface",   id_parts["arcface"], sync_dist=True)
+                self.log("train/id_supcon",    id_parts["supcon"],  sync_dist=True)
+
+        # PAD loss — focal + BCE on shared representation
+        if has_liv and pad_out is not None:
+            sensor_labels = _repeat_if_multiview(self._unpack_sensor_labels(batch))
+            material_labels = _repeat_if_multiview(self._unpack_material_labels(batch))
+            pad_parts = self._pad_classification_loss(
+                pad_out["pad_logit"],
+                liveness,
+                sensor_labels=sensor_labels,
+                material_labels=material_labels,
+            )
+            self._log_pad_separation(pad_out["pad_logit"].squeeze(-1), liveness)
+
             # MixUp disabled: destroys fingerprint micro-texture and caused NaN in smoke test.
             l_mixup = images.new_zeros(())
-            
-            loss = loss + self.alpha * (l_focal + l_mixup)
-            self.log("train/pad_focal_loss", l_focal, sync_dist=True)
-            self.log("train/pad_mixup_loss", l_mixup, sync_dist=True)
 
-            # Sensor adversarial if labels available (Phase 3 joint set
-            # typically doesn't carry sensor labels — guard with None check).
-            sensor_labels = self._unpack_sensor_labels(batch)
+            loss = loss + self.alpha * (pad_parts["total"] + l_mixup)
+            self.log("train/pad_focal_loss", pad_parts["focal"], sync_dist=True)
+            self.log("train/pad_bce_loss",   pad_parts["bce"],   sync_dist=True)
+            self.log("train/pad_cls_loss",   pad_parts["total"], sync_dist=True)
+            self.log("train/pad_weight_mean", pad_parts["sample_weight_mean"], sync_dist=True)
+            self.log("train/pad_weight_max",  pad_parts["sample_weight_max"],  sync_dist=True)
+            self.log("train/pad_mixup_loss",  l_mixup, sync_dist=True)
+
             if sensor_labels is not None and self.lam_adv > 0:
                 sensor_logits = self.sensor_adv_head(
                     pad_out["pad_features"], lam=self.lam_adv,
@@ -630,9 +984,29 @@ class OMFRModule(L.LightningModule):
                 loss = loss + self.alpha_adv * l_sensor
                 self.log("train/pad_sensor_adv", l_sensor, sync_dist=True)
 
-        self.log("train/orth_loss",    l_orth,    sync_dist=True)
-        self.log("train/balance_loss", l_balance, sync_dist=True)
-        self.log("train/total_loss",   loss, prog_bar=True, sync_dist=True)
+        # Bridge alignment is meaningful only when both routes saw the same
+        # images (i.e. a joint slice with both label types). Computing it on
+        # PAD-only or ID-only sub-batches reshapes the identity backbone on
+        # spoof signals and was a key contributor to the Phase-3 collapse.
+        if has_valid_id and has_liv and id_out is not None and pad_out is not None:
+            pad_mrl_embeddings = {
+                dim: emb[valid_id_mask]
+                for dim, emb in pad_out["shared_mrl_embeddings"].items()
+            }
+            l_bridge = self._phase_aware_bridge_loss(
+                pad_mrl_embeddings, id_out["shared_mrl_embeddings"],
+            )
+            loss = loss + self.beta * l_bridge
+            self.log("train/bridge_loss", l_bridge, sync_dist=True)
+
+        # Balance: average across the routes that actually ran this step,
+        # matching `_phase2_joint_step` (which halves when both routes run).
+        if n_routes > 1:
+            l_balance_eff = l_balance_total / float(n_routes)
+        else:
+            l_balance_eff = l_balance_total
+        loss = loss + self.gamma * l_balance_eff
+        self.log("train/balance_loss", l_balance_eff, sync_dist=True)
         return loss
 
     # -------------------------------------------------------------------------
@@ -655,21 +1029,44 @@ class OMFRModule(L.LightningModule):
                 loss = self._phase2_identity_step(batch)
 
         else:  # phase 3
+            # TASK_04 (Phase 3): concatenate identity + PAD (+ joint) sub-batches
+            # into ONE optimizer step. Previously this branch dispatched a
+            # single sub-batch per step via `batch_idx % N` alternation, which
+            # is the same anti-pattern Phase 2 abandoned: total_loss alternates
+            # between large (identity ~5.5) and small (PAD ~0.1) values, which
+            # corrupts Adam's second-moment estimate and caused the Phase-3
+            # collapse from cascaded_IM≈0.35 to ≈0.07.
             if isinstance(batch, dict) and any(
                 k in batch for k in ("identity", "pad", "joint")
             ):
-                key_order = [k for k in ("identity", "pad", "joint") if batch.get(k) is not None]
-                key = key_order[batch_idx % len(key_order)]
-                sub = batch.get(key)
-                if sub is not None:
-                    loss = self._phase3_step(sub)
-                else:
-                    for k in key_order:
-                        if k in batch:
-                            loss = self._phase3_step(batch[k])
-                            break
+                loss = None
+                for k in ("identity", "pad", "joint"):
+                    sub = batch.get(k)
+                    if sub is None:
+                        continue
+                    sub_loss = self._phase3_step(sub)
+                    loss = sub_loss if loss is None else loss + sub_loss
+                if loss is None:
+                    anchor = next(p for p in self.parameters() if p.requires_grad)
+                    loss = anchor.sum() * 0.0
             else:
                 loss = self._phase3_step(batch)
+
+            self.log("train/total_loss", loss, prog_bar=True, sync_dist=True)
+            self.log("train/alpha",      self.alpha,     sync_dist=True)
+            self.log("train/beta",       self.beta,      sync_dist=True)
+            self.log("train/alpha_adv",  self.alpha_adv, sync_dist=True)
+            self.log("train/lam_adv",    self.lam_adv,   sync_dist=True)
+
+        # AdaLoRA-style orthogonality regularizer on every layer's (P, Q),
+        # averaged across all registered tasks. Direct param-only gradient,
+        # so works regardless of which route_mode forwarded this step.
+        if self.lora_orth_weight > 0 and getattr(self.backbone, "use_lora", False):
+            l_orth_lora = self.backbone.get_lora_orthogonality_loss()
+            loss = loss + self.lora_orth_weight * l_orth_lora
+            self.log(
+                "train/lora_orth", l_orth_lora.detach(), sync_dist=True
+            )
 
         # Non-finite loss would poison Adam's moments permanently. Replace
         # with a zero scalar tied to a live parameter so autograd has a
@@ -728,19 +1125,30 @@ class OMFRModule(L.LightningModule):
 
     def validation_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0) -> None:
         images = batch["images"] if isinstance(batch, dict) else batch[0]
+        id_out = None
+        pad_out = None
 
-        backbone_out = self._run_backbone(images)
-        id_out       = self._run_identity(backbone_out)
-        pad_out      = self._run_pad(backbone_out)
+        if not isinstance(batch, dict) or "identity_labels" in batch:
+            id_backbone = self._run_backbone(images, route_mode="identity")
+            id_out = self._run_identity(id_backbone)
+
+        # PAD logits are needed both for PAD validation and for the
+        # cascaded IM metric on identity samples.
+        if not isinstance(batch, dict) or any(
+            k in batch for k in ("identity_labels", "liveness_labels")
+        ):
+            pad_backbone = self._run_backbone(images, route_mode="pad")
+            pad_out = self._run_pad(pad_backbone)
 
         if isinstance(batch, dict):
-            if "identity_labels" in batch:
+            if "identity_labels" in batch and id_out is not None:
                 self._val_id_embeddings.append(id_out["identity_embedding"].detach().cpu())
                 self._val_id_labels.append(batch["identity_labels"].detach().cpu())
                 # Store PAD logit for same identity samples → cascaded_IM
-                self._val_id_pad_logits.append(pad_out["pad_logit"].detach().cpu())
+                if pad_out is not None:
+                    self._val_id_pad_logits.append(pad_out["pad_logit"].detach().cpu())
 
-            if "liveness_labels" in batch:
+            if "liveness_labels" in batch and pad_out is not None:
                 self._val_pad_logits.append(pad_out["pad_logit"].detach().cpu())
                 self._val_liveness_labels.append(batch["liveness_labels"].detach().cpu())
 
@@ -805,19 +1213,39 @@ class OMFRModule(L.LightningModule):
         weight_decay  = float(self.cfg.get("weight_decay", 0.05))
         total_epochs  = int(  self.cfg.get("total_epochs", 60))
 
+        use_lora = bool(getattr(self.backbone, "use_lora", False))
+        lora_cfg = self.cfg.get("lora", {}) or {}
+        lora_lr_mult = float(lora_cfg.get("lr_mult", 5.0))
+        magnitude_lr_mult = float(lora_cfg.get("magnitude_lr_mult", 1.0))
+
+        opt_cfg = self.cfg.get("optimizer", {}) or {}
+        lr_mults = opt_cfg.get("lr_multipliers", {}) or {}
+        arcface_lr_mult = float(lr_mults.get("arcface", 0.1))
+
         # MoE params need separate group — exclude from backbone groups
         moe_ids = {id(p) for p in self.backbone.get_moe_params()}
+        # LoRA params are owned by the backbone but live inside attn/MLP
+        # blocks; exclude them from the generic stage groups so we can apply
+        # a dedicated LR.
+        lora_ids = (
+            {id(p) for p in self.backbone.get_lora_params()}
+            if use_lora
+            else set()
+        )
+
+        def _trainable(it):
+            return [p for p in it if p.requires_grad]
 
         # Stage 0+1 = early (PAD branch reads these)
-        backbone_early = [
+        backbone_early = _trainable(
             p for p in self.backbone.get_stage_params([0, 1])
-            if id(p) not in moe_ids
-        ]
+            if id(p) not in moe_ids and id(p) not in lora_ids
+        )
         # Stage 2+3 = late (identity branch reads these)
-        backbone_late = [
+        backbone_late = _trainable(
             p for p in self.backbone.get_stage_params([2, 3])
-            if id(p) not in moe_ids
-        ]
+            if id(p) not in moe_ids and id(p) not in lora_ids
+        )
 
         param_groups = [
             # Identity Gabor stem — low LR (only 16 params, stable)
@@ -826,27 +1254,25 @@ class OMFRModule(L.LightningModule):
                 "lr":     lr * 0.1,
                 "name":   "gabor",
             },
-            # PAD Gabor stem — starts from scratch (pore frequencies),
-            # needs a higher LR than the identity bank to converge in
-            # the same number of epochs. Only 16 params.
+            # Legacy PAD Gabor bank kept for checkpoint compatibility.
             {
                 "params": list(self.gabor_pad.parameters()),
                 "lr":     lr * 1.0,
                 "name":   "gabor_pad",
             },
-            # Patch embed — standard LR
+            # Patch embed — standard LR (kept trainable to absorb 8-ch input)
             {
-                "params": list(self.backbone.get_embed_params()),
+                "params": _trainable(self.backbone.get_embed_params()),
                 "lr":     lr,
                 "name":   "backbone_embed",
             },
-            # Backbone stages 0+1 (early, PAD-relevant) — standard LR
+            # Backbone stages 0+1 — empty when LoRA freezes the trunk
             {
                 "params": backbone_early,
                 "lr":     lr,
                 "name":   "backbone_early",
             },
-            # Backbone stages 2+3 (late, identity-relevant) — standard LR
+            # Backbone stages 2+3 — empty when LoRA freezes the trunk
             {
                 "params": backbone_late,
                 "lr":     lr,
@@ -864,27 +1290,25 @@ class OMFRModule(L.LightningModule):
                 "lr":     lr,
                 "name":   "identity_head",
             },
-            # Dedicated PAD stem — always 2x. The previous conditional
-            # (2x only in Phase 2) was a bug: configure_optimizers runs
-            # once at fit start when current_phase is still 1, so the
-            # 2x multiplier never actually applied. Pinning to 2x keeps
-            # the PAD extractor converging fast throughout training.
+            # Legacy PAD stem retained for checkpoint compatibility.
             {
                 "params": list(self.pad_stem.parameters()),
                 "lr":     lr * 2.0,
                 "name":   "pad_stem",
             },
-            # PAD Head — always 2x (same reasoning as pad_stem).
+            # PAD Head — always 2x.
             {
                 "params": list(self.pad_head.parameters()),
                 "lr":     lr * 2.0,
                 "name":   "pad_head",
             },
-            # ArcFace classifiers — 1x LR (reduced from 10x to prevent gradient explosion)
+            # ArcFace classifiers — lr_mult from config (default 0.1).
+            # Higher LRs blow up the classifier weights once scale reaches
+            # ~32 with many classes; the yaml multiplier is now honored.
             {
                 "params": [p for af in self.arcface_losses.values()
                            for p in af.parameters()],
-                "lr":     lr * 1.0,
+                "lr":     lr * arcface_lr_mult,
                 "name":   "arcface",
             },
             # Sensor adversarial head — standard LR; trained normally while
@@ -895,6 +1319,30 @@ class OMFRModule(L.LightningModule):
                 "name":   "sensor_adv_head",
             },
         ]
+
+        if use_lora:
+            # Identity adapter (P, E, Q) at lora_lr_mult; magnitude at base LR.
+            id_lora = [p for p in self.backbone.get_lora_params(
+                task="identity", include_magnitude=False
+            )]
+            id_mag = [p for p in self.backbone.get_lora_params(
+                task="identity", include_magnitude=True
+            ) if not any(p is q for q in id_lora)]
+            pad_lora = [p for p in self.backbone.get_lora_params(
+                task="pad", include_magnitude=False
+            )]
+            pad_mag = [p for p in self.backbone.get_lora_params(
+                task="pad", include_magnitude=True
+            ) if not any(p is q for q in pad_lora)]
+            param_groups += [
+                {"params": id_lora,  "lr": lr * lora_lr_mult,        "name": "lora_identity"},
+                {"params": pad_lora, "lr": lr * lora_lr_mult,        "name": "lora_pad"},
+                {"params": id_mag,   "lr": lr * magnitude_lr_mult,   "name": "dora_mag_identity"},
+                {"params": pad_mag,  "lr": lr * magnitude_lr_mult,   "name": "dora_mag_pad"},
+            ]
+
+        # Drop empty param groups (PyTorch tolerates them but they pollute logs).
+        param_groups = [g for g in param_groups if len(g["params"]) > 0]
 
         optimizer = torch.optim.AdamW(
             param_groups,
@@ -965,4 +1413,11 @@ class OMFRModule(L.LightningModule):
         """Returns sensor_labels tensor if available, else None."""
         if isinstance(batch, dict):
             return batch.get("sensor_labels")
+        return None
+
+    @staticmethod
+    def _unpack_material_labels(batch: Any):
+        """Returns material_labels tensor if available, else None."""
+        if isinstance(batch, dict):
+            return batch.get("material_labels")
         return None

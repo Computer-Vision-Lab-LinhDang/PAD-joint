@@ -39,6 +39,7 @@ class ArcFaceLoss(nn.Module):
         s: float = 64.0,
         margin: float = 0.5,
         easy_margin: bool = False,
+        ignore_index: int = -1,
     ):
         super().__init__()
         self.embedding_dim = embedding_dim
@@ -46,6 +47,7 @@ class ArcFaceLoss(nn.Module):
         self.s = s
         self.margin = margin
         self.easy_margin = easy_margin
+        self.ignore_index = ignore_index
 
         # Weight matrix: each row is a class center (normalized during forward)
         self.weight = nn.Parameter(torch.empty(num_classes, embedding_dim))
@@ -57,7 +59,7 @@ class ArcFaceLoss(nn.Module):
         self.threshold = math.cos(math.pi - margin)  # for easy_margin=False
         self.mm = math.sin(math.pi - margin) * margin  # for easy_margin=False
 
-        self.ce = nn.CrossEntropyLoss()
+        self.ce = nn.CrossEntropyLoss(ignore_index=ignore_index)
 
     def forward(
         self,
@@ -70,6 +72,7 @@ class ArcFaceLoss(nn.Module):
         Args:
             embeddings: (B, embedding_dim) — L2-normalized feature vectors
             labels:     (B,)               — LongTensor, class indices in [0, num_classes)
+                                      or ignore_index for ignored samples
 
         Returns:
             loss: scalar
@@ -79,6 +82,14 @@ class ArcFaceLoss(nn.Module):
         # which is below fp16's min-normal (6.1e-5) and underflows to 0 or
         # denormal — sqrt then yields NaN and propagates through phi -> CE.
         emb32 = embeddings.float()
+        labels = labels.long()
+        valid = (labels != self.ignore_index) & (labels >= 0) & (labels < self.num_classes)
+        if not valid.any():
+            return emb32.sum() * 0.0 + self.weight.sum() * 0.0
+
+        labels_for_ce = labels.clone()
+        labels_for_ce[~valid] = self.ignore_index
+        labels_for_scatter = labels_for_ce.clamp_min(0)
         w32 = self.weight.float()
         w_norm = F.normalize(w32, p=2, dim=1)  # (num_classes, embedding_dim)
 
@@ -97,11 +108,16 @@ class ArcFaceLoss(nn.Module):
             phi = torch.where(cosine > self.threshold, phi, cosine - self.mm)
 
         one_hot = torch.zeros_like(cosine)
-        one_hot.scatter_(1, labels.unsqueeze(1), 1.0)
+        one_hot.scatter_(1, labels_for_scatter.unsqueeze(1), 1.0)
+        one_hot = one_hot * valid.unsqueeze(1).to(one_hot.dtype)
 
         output = one_hot * phi + (1.0 - one_hot) * cosine
-        output = output * self.s
-        return self.ce(output, labels)
+        # Clamp scaled logits before softmax. With many classes and a high
+        # scale (s≥32), saturated softmax produces gradients that can spike
+        # the classifier weights into a runaway state. ±30 keeps exp() in a
+        # safe fp32 range while preserving useful margin separation.
+        output = (output * self.s).clamp(-30.0, 30.0)
+        return self.ce(output, labels_for_ce)
 
     def set_scale(self, s: float) -> None:
         """Update the scale parameter (called by PhaseSchedulerCallback during ramp)."""
@@ -118,5 +134,5 @@ class ArcFaceLoss(nn.Module):
     def extra_repr(self) -> str:
         return (
             f"embedding_dim={self.embedding_dim}, num_classes={self.num_classes}, "
-            f"s={self.s}, margin={self.margin}"
+            f"s={self.s}, margin={self.margin}, ignore_index={self.ignore_index}"
         )
