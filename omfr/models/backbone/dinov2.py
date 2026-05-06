@@ -25,6 +25,7 @@ from .lora import (
     lora_parameters,
     set_lora_task,
 )
+from .pad_shallow_moe import PADShallowMoE
 
 
 class DINOv2Backbone(nn.Module):
@@ -53,6 +54,7 @@ class DINOv2Backbone(nn.Module):
         stage2_dim: int = 128,
         intermediate_indices: Sequence[int] | None = None,
         lora_cfg: Optional[Dict[str, Any]] = None,
+        use_pad_shallow_moe: bool = True,
     ) -> None:
         super().__init__()
         self.model_name = model_name
@@ -127,6 +129,14 @@ class DINOv2Backbone(nn.Module):
                 "alpha": alpha,
                 "tasks": tuple(self.lora_tasks),
             }
+
+        # PAD-specific shallow MoE: replaces dummy routing_stats for route_mode="pad"
+        self.pad_shallow_moe: Optional[PADShallowMoE] = None
+        if use_pad_shallow_moe:
+            self.pad_shallow_moe = PADShallowMoE(
+                stage2_dim=stage2_dim,
+                stage3_dim=self.embed_dim,
+            )
 
     @staticmethod
     def _build_stage_slices(num_blocks: int) -> List[range]:
@@ -221,22 +231,26 @@ class DINOv2Backbone(nn.Module):
             ),
         )
 
-        s2_tokens = stage2_feat.shape[-2] * stage2_feat.shape[-1]
-        s3_tokens = stage3_feat.shape[-2] * stage3_feat.shape[-1]
-        routing_stats = {
-            "s2": self._dummy_routing_stats(stage2_feat, s2_tokens),
-            "s3a": self._dummy_routing_stats(stage3_feat, s3_tokens),
-            "s3b": self._dummy_routing_stats(stage3_feat, s3_tokens),
-        }
-
         zero = stage3_feat.new_zeros(())
+        if route_mode == "pad" and self.pad_shallow_moe is not None:
+            routing_stats, balance_losses = self.pad_shallow_moe(stage2_feat, stage3_feat)
+        else:
+            s2_tokens = stage2_feat.shape[-2] * stage2_feat.shape[-1]
+            s3_tokens = stage3_feat.shape[-2] * stage3_feat.shape[-1]
+            routing_stats = {
+                "s2":  self._dummy_routing_stats(stage2_feat, s2_tokens),
+                "s3a": self._dummy_routing_stats(stage3_feat, s3_tokens),
+                "s3b": self._dummy_routing_stats(stage3_feat, s3_tokens),
+            }
+            balance_losses = [zero, zero, zero]
+
         return {
             "stage1_feat": stage1_feat,
             "stage2_feat": stage2_feat,
             "stage3_feat": stage3_feat,
             "stage4_feat": stage4_feat,
             "routing_stats": routing_stats,
-            "balance_losses": [zero, zero, zero],
+            "balance_losses": balance_losses,
         }
 
     def get_stage_params(self, stage_indices: List[int]) -> Iterator[nn.Parameter]:
@@ -253,7 +267,8 @@ class DINOv2Backbone(nn.Module):
                 yield from self.model.norm.parameters()
 
     def get_moe_params(self) -> Iterator[nn.Parameter]:
-        return iter(())
+        if self.pad_shallow_moe is not None:
+            yield from self.pad_shallow_moe.parameters()
 
     # ------------------------------------------------------------------
     # LoRA helpers
@@ -294,14 +309,23 @@ class DINOv2Backbone(nn.Module):
                 yield param
 
     def set_moe_temperature(self, temperature: float) -> None:
-        del temperature
+        if self.pad_shallow_moe is not None:
+            self.pad_shallow_moe.set_temperature(temperature)
 
     def refresh_gateonly_stats(
         self,
         routing_stats: Dict[str, Any],
         route_mode: str,
     ) -> None:
-        del routing_stats, route_mode
+        if route_mode != "pad" or self.pad_shallow_moe is None:
+            return
+        result = self.pad_shallow_moe.refresh_gateonly()
+        if result is None:
+            return
+        go_s2, go_s3 = result
+        routing_stats["s2"].update(go_s2)
+        routing_stats["s3a"].update(go_s3)
+        routing_stats["s3b"].update(go_s3)
 
     def freeze_stages(self, stage_indices: List[int]) -> None:
         for param in self.get_stage_params(stage_indices):

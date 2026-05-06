@@ -49,6 +49,7 @@ import torch.nn as nn
 
 DEFAULT_RIDGE_FREQ: Dict[int, float] = {
     28: 11.5,
+    16: 6.6,   # DINOv2 ViT-S/14: 16×16 tokens on 224px (ridge_px≈92, same calibration basis)
     14: 5.8,
 }
 

@@ -133,10 +133,13 @@ class OMFRModule(L.LightningModule):
 
         self.pad_stem = PADStem()
         identity_embed_dim = int(id_cfg.get("embed_dim", 256))
+        # PADHead shared_dim must match backbone stage3_feat channels (384 for DINOv2).
+        # Falls back to identity_embed_dim for legacy FastViT checkpoints.
+        backbone_stage3_dim = int(id_cfg.get("stage3_dim", default_stage3))
         self.pad_head = PADHead(
             stage1_dim=int(pad_cfg.get("stage1_dim", default_stage1)),
             stage2_dim=int(pad_cfg.get("stage2_dim", default_stage2)),
-            shared_dim=int(pad_cfg.get("shared_dim", identity_embed_dim)),
+            shared_dim=int(pad_cfg.get("shared_dim", backbone_stage3_dim)),
             gabor_dim=int(pad_cfg.get("gabor_dim", 8)),
         )
         self.identity_head = IdentityHead(
@@ -229,6 +232,9 @@ class OMFRModule(L.LightningModule):
         self.lora_orth_weight: float = float(
             (config.get("lora") or {}).get("orth_weight", 0.0)
         )
+        # Barlow-Twins orthogonality between PAD and identity embedding subspaces.
+        # Ramped in Phase 2 alongside alpha. Start at 0 — PhaseScheduler sets it.
+        self.beta_orth: float = 0.0
 
         # -- Phase state --
         self.current_phase: int = 1
@@ -298,12 +304,8 @@ class OMFRModule(L.LightningModule):
             "stage4_feat": backbone_out["stage4_feat"],
         })
 
-    def _run_pad(
-        self,
-        backbone_out: Dict,
-        shared_out: Optional[Dict[str, torch.Tensor]] = None,
-    ) -> Dict:
-        """PAD head reading shared latent + early shared features."""
+    def _run_pad(self, backbone_out: Dict) -> Dict:
+        """PAD head using backbone stage3_feat directly (no identity head dependency)."""
         rs = backbone_out["routing_stats"]
 
         def _detach_stats(stats: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -311,27 +313,19 @@ class OMFRModule(L.LightningModule):
                 "expert_weights": stats["expert_weights"].detach(),
                 "token_entropy":  stats["token_entropy"].detach(),
             }
-            # [NEW] Đảm bảo vector tần số cũng được truyền qua an toàn
             if "gate_input_gateonly" in stats:
                 res["gate_input_gateonly"] = stats["gate_input_gateonly"].detach()
             return res
 
         def _gateonly_stats(stats: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-            # "Gate-only" routing copy. Grad can reach the active router
-            # (`gate_proj` for identity mode, `pad_gate_proj` for pad mode)
-            # while staying detached from the shared frequency/trunk path.
             res = {
                 "expert_weights": stats["expert_weights_gateonly"],
                 "token_entropy":  stats["token_entropy_gateonly"],
             }
-            # [NEW] Bypass 3 dải tần số gốc để PAD trực tiếp phân tích bọt khí/nhiễu
             if "gate_input_gateonly" in stats:
                 res["gate_input_gateonly"] = stats["gate_input_gateonly"]
             return res
 
-        # From Phase 2 on we prefer the gate-only routing views so PAD
-        # can adapt its router without leaking gradients upstream into
-        # the shared token features.
         if self.current_phase >= 2:
             rs_s2  = _gateonly_stats(rs["s2"])
             rs_s3a = _gateonly_stats(rs["s3a"])
@@ -341,23 +335,15 @@ class OMFRModule(L.LightningModule):
             rs_s3a = _detach_stats(rs["s3a"])
             rs_s3b = _detach_stats(rs["s3b"])
 
-        if shared_out is None:
-            shared_out = self._run_identity(backbone_out)
-
-        pad_out = self.pad_head({
-            "shared_spatial_feat":  shared_out["shared_spatial_feat"],
-            "gabor_feat":           backbone_out["gabor_feat"].detach(),
-            "stage1_feat":          backbone_out["stage1_feat"].detach(),
-            "stage2_feat":          backbone_out["stage2_feat"].detach(),
-            "routing_stats_s2":     rs_s2,
-            "routing_stats_s3a":    rs_s3a,
-            "routing_stats_s3b":    rs_s3b,
+        return self.pad_head({
+            "stage3_feat":       backbone_out["stage3_feat"],
+            "gabor_feat":        backbone_out["gabor_feat"].detach(),
+            "stage1_feat":       backbone_out["stage1_feat"].detach(),
+            "stage2_feat":       backbone_out["stage2_feat"].detach(),
+            "routing_stats_s2":  rs_s2,
+            "routing_stats_s3a": rs_s3a,
+            "routing_stats_s3b": rs_s3b,
         })
-        pad_out["shared_repr_feat"] = shared_out["shared_repr_feat"]
-        pad_out["shared_spatial_feat"] = shared_out["shared_spatial_feat"]
-        pad_out["shared_embedding"] = shared_out["shared_embedding"]
-        pad_out["shared_mrl_embeddings"] = shared_out["shared_mrl_embeddings"]
-        return pad_out
 
     def _arcface_loss(
         self,
@@ -633,32 +619,19 @@ class OMFRModule(L.LightningModule):
                 )
 
     def _phase2_identity_step(self, batch: Any) -> torch.Tensor:
-        """Phase 2 — identity batch. Full gradients to backbone + shared/id head."""
+        """Phase 2 — identity-only batch. Full gradients to backbone + identity head."""
         images, identity_labels = self._unpack_identity_batch(batch)
 
         id_backbone = self._run_backbone(images, route_mode="identity")
         id_out      = self._run_identity(id_backbone)
-        pad_backbone = self._run_backbone(
-            images,
-            backbone_no_grad=True,
-            route_mode="pad",
-            detach_backbone_outputs=True,
-        )
-        pad_out     = self._run_pad(pad_backbone)
 
         id_parts  = self._identity_loss(id_out["mrl_embeddings"], identity_labels)
-        l_bridge  = self._phase_aware_bridge_loss(
-            pad_out["shared_mrl_embeddings"], id_out["shared_mrl_embeddings"],
-        )
-        l_balance = 0.5 * (
-            sum(id_backbone["balance_losses"]) + sum(pad_backbone["balance_losses"])
-        )
-        loss      = id_parts["total"] + self.beta * l_bridge + self.gamma * l_balance
+        l_balance = sum(id_backbone["balance_losses"])
+        loss      = id_parts["total"] + self.gamma * l_balance
 
         self.log("train/identity_loss", id_parts["total"], prog_bar=True, sync_dist=True)
         self.log("train/id_arcface",    id_parts["arcface"],                sync_dist=True)
         self.log("train/id_supcon",     id_parts["supcon"],                 sync_dist=True)
-        self.log("train/bridge_loss",   l_bridge,          sync_dist=True)
         self.log("train/balance_loss",  l_balance,         sync_dist=True)
         self.log("train/total_loss",    loss,              prog_bar=True, sync_dist=True)
         return loss
@@ -802,10 +775,19 @@ class OMFRModule(L.LightningModule):
 
         l_balance = 0.5 * (l_balance_id + l_balance_pad)
 
+        # Orthogonality: cross-correlate PAD ↔ identity embedding subspaces.
+        # Id and PAD batches are different images so trim to the smaller B.
+        _B_orth = min(id_out["identity_embedding"].shape[0], pad_out["pad_embedding"].shape[0])
+        l_orth = self.orth_loss(
+            pad_out["pad_embedding"][:_B_orth],
+            id_out["identity_embedding"][:_B_orth],
+        )
+
         loss = (id_parts["total"]
                 + self.alpha * (pad_parts["total"] + l_mixup)
                 + self.alpha_adv * l_sensor
                 + self.beta * l_bridge
+                + self.beta_orth * l_orth
                 + self.gamma * l_balance)
 
         self.log("train/identity_loss",  id_parts["total"], prog_bar=True, sync_dist=True)
@@ -819,10 +801,12 @@ class OMFRModule(L.LightningModule):
         self.log("train/pad_mixup_loss", l_mixup,                            sync_dist=True)
         self.log("train/pad_sensor_adv", l_sensor,                           sync_dist=True)
         self.log("train/bridge_loss",    l_bridge,                           sync_dist=True)
+        self.log("train/orth_loss",      l_orth,                             sync_dist=True)
         self.log("train/balance_loss",   l_balance,                          sync_dist=True)
         self.log("train/total_loss",     loss,              prog_bar=True, sync_dist=True)
         self.log("train/alpha",          self.alpha,                         sync_dist=True)
         self.log("train/beta",           self.beta,                          sync_dist=True)
+        self.log("train/beta_orth",      self.beta_orth,                     sync_dist=True)
         self.log("train/alpha_adv",      self.alpha_adv,                     sync_dist=True)
         self.log("train/lam_adv",        self.lam_adv,                       sync_dist=True)
         return loss
@@ -904,15 +888,16 @@ class OMFRModule(L.LightningModule):
             n_routes += 1
 
         if has_liv:
-            # Gradient isolation: only true joint sub-batches (valid identity
-            # AND liveness, e.g. MSU-FPAD) run PAD with full backbone grad —
-            # that is when bridge_loss meaningfully shapes both heads. PAD-only
-            # and LivDet pseudo-joint MUST detach the backbone, otherwise PAD
-            # loss leaks through `_run_pad → _run_identity(pad_backbone) →
-            # shared_spatial_feat → identity_head` and pulls identity_head
-            # toward LivDet-favoured features. That leak is the root cause of
-            # the Phase-3 identity_rank1 drift (0.053 → 0.045 over 22 epochs).
-            pad_full_grad = bool(has_valid_id)
+            # Gradient isolation for Phase 3:
+            # - No LoRA: detach backbone unless it's a true joint batch (both
+            #   identity + liveness labels), keeping the Phase-2 guarantee that
+            #   PAD loss cannot reshape frozen identity backbone weights.
+            # - LoRA enabled: PAD adapter (task="pad") can safely receive grad
+            #   even on PAD-only batches because the base weights stay frozen —
+            #   only the PAD LoRA adapter updates. This is the Phase-3 "LoRA
+            #   unlock" — adapters converge toward their per-task subspaces.
+            use_lora = getattr(self.backbone, 'use_lora', False)
+            pad_full_grad = bool(has_valid_id) or use_lora
             if pad_full_grad:
                 pad_backbone = self._run_backbone(images, route_mode="pad")
             else:
@@ -989,15 +974,14 @@ class OMFRModule(L.LightningModule):
         # PAD-only or ID-only sub-batches reshapes the identity backbone on
         # spoof signals and was a key contributor to the Phase-3 collapse.
         if has_valid_id and has_liv and id_out is not None and pad_out is not None:
-            pad_mrl_embeddings = {
-                dim: emb[valid_id_mask]
-                for dim, emb in pad_out["shared_mrl_embeddings"].items()
-            }
-            l_bridge = self._phase_aware_bridge_loss(
-                pad_mrl_embeddings, id_out["shared_mrl_embeddings"],
+            # Orthogonality: same-image joint samples have both embeddings —
+            # slice PAD embeddings to the valid-identity subset to match sizes.
+            l_orth = self.orth_loss(
+                pad_out["pad_embedding"][valid_id_mask],
+                id_out["identity_embedding"],
             )
-            loss = loss + self.beta * l_bridge
-            self.log("train/bridge_loss", l_bridge, sync_dist=True)
+            loss = loss + self.beta_orth * l_orth
+            self.log("train/orth_loss", l_orth, sync_dist=True)
 
         # Balance: average across the routes that actually ran this step,
         # matching `_phase2_joint_step` (which halves when both routes run).
@@ -1099,6 +1083,7 @@ class OMFRModule(L.LightningModule):
             "current_phase": int(self.current_phase),
             "alpha": float(self.alpha),
             "beta": float(self.beta),
+            "beta_orth": float(self.beta_orth),
             "alpha_adv": float(self.alpha_adv),
             "lam_adv": float(self.lam_adv),
             "arcface": arc,
@@ -1110,8 +1095,9 @@ class OMFRModule(L.LightningModule):
         if not st:
             return
         self.current_phase = int(st.get("current_phase", self.current_phase))
-        self.alpha = float(st.get("alpha", self.alpha))
-        self.beta  = float(st.get("beta",  self.beta))
+        self.alpha     = float(st.get("alpha",     self.alpha))
+        self.beta      = float(st.get("beta",      self.beta))
+        self.beta_orth = float(st.get("beta_orth", self.beta_orth))
         self.alpha_adv = float(st.get("alpha_adv", self.alpha_adv))
         self.lam_adv   = float(st.get("lam_adv",   self.lam_adv))
         for k, params in st.get("arcface", {}).items():

@@ -65,7 +65,7 @@ class PADSpatialFusion(nn.Module):
         self,
         stage1_dim: int = 64,
         stage2_dim: int = 128,
-        shared_dim: int = 256,
+        shared_dim: int = 384,
         hidden_dim: int = 128,
     ):
         super().__init__()
@@ -237,7 +237,7 @@ class PADHead(nn.Module):
         self,
         stage1_dim: int = 64,
         stage2_dim: int = 128,
-        shared_dim: int = 256,
+        shared_dim: int = 384,
         gabor_dim: int = 8,
         dropout: float = 0.1,
         **_legacy_kwargs,
@@ -310,7 +310,7 @@ class PADHead(nn.Module):
     def forward(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         s1 = inputs['stage1_feat']                          # (B, 64, 56, 56)
         s2 = inputs['stage2_feat']                          # (B, 128, 28, 28)
-        shared_spatial = inputs['shared_spatial_feat']      # (B, 256, 14, 14)
+        shared_spatial = inputs['stage3_feat']              # (B, 384, 16, 16) from backbone
         gabor_feat = inputs.get('gabor_feat')               # (B, 8, 224, 224)
 
         # -- Spatial fusion --

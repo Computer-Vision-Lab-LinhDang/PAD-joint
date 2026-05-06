@@ -6,6 +6,7 @@ from .vit_tiny import ViTTinyBackbone
 from .tiny_vit import TinyViTBackbone
 from .fastvit import FastViTBackbone
 from .dinov2 import DINOv2Backbone
+from .pad_shallow_moe import PADShallowMoE
 
 __all__ = [
     "LearnableGaborStem",
@@ -16,4 +17,5 @@ __all__ = [
     "TinyViTBackbone",
     "FastViTBackbone",
     "DINOv2Backbone",
+    "PADShallowMoE",
 ]

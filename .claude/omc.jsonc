@@ -1,0 +1,15 @@
+{
+  // Research team model overrides for PAD project
+  // Claude workers use claude-opus-4-7
+  // Codex workers use gpt-5.5 (xhigh reasoning from ~/.codex/config.toml)
+  "agents": {
+    "analyst": { "model": "claude-opus-4-7" },
+    "critic": { "model": "claude-opus-4-7" },
+    "scientist": { "model": "claude-opus-4-7" }
+  },
+  "externalModels": {
+    "defaults": {
+      "codexModel": "gpt-5.5"
+    }
+  }
+}
