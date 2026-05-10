@@ -37,14 +37,17 @@ class FocalBCELoss(nn.Module):
         self,
         logits: torch.Tensor,
         targets: torch.Tensor,
+        sample_weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
             logits:  (B,)  raw logits (not sigmoid)
             targets: (B,)  float 0/1 targets
 
+            sample_weight: optional per-sample weights.
+
         Returns:
-            scalar mean focal BCE loss.
+            scalar weighted mean focal BCE loss.
         """
         targets = targets.float()
         bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
@@ -52,4 +55,8 @@ class FocalBCELoss(nn.Module):
         p_t = p * targets + (1 - p) * (1 - targets)
         alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
         focal_weight = alpha_t * (1 - p_t).pow(self.gamma)
-        return (focal_weight * bce).mean()
+        loss = focal_weight * bce
+        if sample_weight is not None:
+            weight = sample_weight.to(device=loss.device, dtype=loss.dtype).reshape_as(loss)
+            return (loss * weight).sum() / weight.sum().clamp_min(1.0)
+        return loss.mean()

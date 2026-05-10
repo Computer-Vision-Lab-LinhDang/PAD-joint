@@ -23,7 +23,7 @@ Config dict keys:
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -39,7 +39,7 @@ from omfr.models.heads.pad_head import PADHead
 from omfr.models.losses.arcface import ArcFaceLoss
 from omfr.models.losses.supcon import SupConLoss
 from omfr.models.losses.orthogonal import OrthogonalityLoss
-from omfr.models.losses.focal_bce import FocalBCELoss
+from omfr.models.losses.pad_loss import PADLoss
 from omfr.models.losses.mixup_consistency import MixUpConsistency
 from omfr.models.losses.sensor_adversarial import (
     SensorAdversarialHead,
@@ -135,10 +135,13 @@ class OMFRModule(L.LightningModule):
             "128": ArcFaceLoss(128, num_classes=num_classes, s=1.0, margin=0.0),
             "256": ArcFaceLoss(256, num_classes=num_classes, s=1.0, margin=0.0),
         })
-        # PAD branch — focal BCE (hard-example mining) + MixUp consistency
-        # (manifold smoothness). Replaces SupCon(tau=0.07), which was
-        # degenerate on binary PAD and plateaued around 4.5 (TASK_01).
-        self.pad_focal_loss = FocalBCELoss(gamma=2.0, alpha=0.5)
+        losses_cfg = config.get("losses", {}) or {}
+        if isinstance(losses_cfg.get("value"), dict):
+            losses_cfg = losses_cfg["value"]
+        # PAD branch — configurable BCE + focal + OHEM + hard-spoof weights.
+        # Defaults are BCE-only so the original 24/4 config remains valid;
+        # the 26/4 checkpoint config enables focal/OHEM/hard-spoof terms.
+        self.pad_loss = PADLoss.from_config(losses_cfg)
         self.pad_mixup_loss = MixUpConsistency(alpha=0.4)
         # Legacy BCE / SupCon kept for back-compat (val only). Unused in
         # training paths after TASK_01.
@@ -153,6 +156,7 @@ class OMFRModule(L.LightningModule):
         # is read from PADDataset.SENSOR_NAMES (default 9) and can be
         # overridden in config.
         num_sensors = int(config.get("num_sensors", 9))
+        self.unknown_sensor_id = int(config.get("unknown_sensor_id", num_sensors - 1))
         self.sensor_adv_head = SensorAdversarialHead(
             in_features=_PADHeadCls.PAD_FEATURES_DIM,
             num_sensors=num_sensors,
@@ -350,6 +354,56 @@ class OMFRModule(L.LightningModule):
         )
         return {"arcface": l_arcface, "supcon": l_supcon, "total": total}
 
+    def _pad_classification_loss(
+        self,
+        pad_logit: torch.Tensor,
+        liveness_labels: torch.Tensor,
+        sensor_labels: Optional[torch.Tensor] = None,
+        material_labels: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Configurable PAD loss used by all phase-2/3 PAD paths."""
+        return self.pad_loss(
+            pad_logit,
+            liveness_labels,
+            sensor_labels=sensor_labels,
+            material_labels=material_labels,
+        )
+
+    def _sensor_adversarial_loss(
+        self,
+        pad_features: torch.Tensor,
+        sensor_labels: torch.Tensor,
+    ) -> torch.Tensor:
+        sensor_logits = self.sensor_adv_head(pad_features, lam=self.lam_adv)
+        sensor = sensor_labels.to(sensor_logits.device).long().reshape(-1)
+        sample_weight = (sensor != self.unknown_sensor_id).to(sensor_logits.dtype)
+        l_sensor = self.sensor_adv_loss(
+            sensor_logits,
+            sensor,
+            sample_weight=sample_weight,
+        )
+        self.log(
+            "train/pad_sensor_adv_unknown_frac",
+            1.0 - sample_weight.mean().detach(),
+            sync_dist=True,
+        )
+        return l_sensor
+
+    def _log_pad_loss_parts(self, pad_parts: Dict[str, torch.Tensor]) -> None:
+        self.log("train/pad_focal_loss", pad_parts["focal"], sync_dist=True)
+        self.log("train/pad_bce_loss",   pad_parts["bce"],   sync_dist=True)
+        self.log("train/pad_cls_loss",   pad_parts["total"], sync_dist=True)
+        self.log(
+            "train/pad_weight_mean",
+            pad_parts["sample_weight_mean"],
+            sync_dist=True,
+        )
+        self.log(
+            "train/pad_weight_max",
+            pad_parts["sample_weight_max"],
+            sync_dist=True,
+        )
+
     # -------------------------------------------------------------------------
     # Phase-specific training steps
     # -------------------------------------------------------------------------
@@ -433,6 +487,7 @@ class OMFRModule(L.LightningModule):
         """
         images, liveness_labels = self._unpack_pad_batch(batch)
         sensor_labels = self._unpack_sensor_labels(batch)
+        material_labels = self._unpack_material_labels(batch)
 
         backbone_out = self._run_backbone(images)
         pad_out      = self._run_pad(backbone_out)
@@ -442,29 +497,32 @@ class OMFRModule(L.LightningModule):
             "stage4_feat": backbone_out["stage4_feat"].detach(),
         })
 
-        l_focal = self.pad_focal_loss(
-            pad_out["pad_logit"].squeeze(-1), liveness_labels.float(),
+        pad_parts = self._pad_classification_loss(
+            pad_out["pad_logit"],
+            liveness_labels,
+            sensor_labels=sensor_labels,
+            material_labels=material_labels,
         )
         
         # MixUp disabled: destroys fingerprint micro-texture and caused NaN in smoke test.
         l_mixup = images.new_zeros(())
         
         if sensor_labels is not None and self.lam_adv > 0:
-            sensor_logits = self.sensor_adv_head(
-                pad_out["pad_features"], lam=self.lam_adv,
+            l_sensor = self._sensor_adversarial_loss(
+                pad_out["pad_features"],
+                sensor_labels,
             )
-            l_sensor = self.sensor_adv_loss(sensor_logits, sensor_labels)
         else:
             l_sensor = images.new_zeros(())
         l_orth    = self.orth_loss(pad_out["pad_embedding"], id_out["identity_embedding"])
         l_balance = sum(backbone_out["balance_losses"])
 
-        loss = (self.alpha * (l_focal + l_mixup)
+        loss = (self.alpha * (pad_parts["total"] + l_mixup)
                 + self.alpha_adv * l_sensor
                 + self.beta * l_orth
                 + self.gamma * l_balance)
 
-        self.log("train/pad_focal_loss", l_focal,   sync_dist=True)
+        self._log_pad_loss_parts(pad_parts)
         self.log("train/pad_mixup_loss", l_mixup,   sync_dist=True)
         self.log("train/pad_sensor_adv", l_sensor,  sync_dist=True)
         self.log("train/orth_loss",      l_orth,    sync_dist=True)
@@ -498,6 +556,7 @@ class OMFRModule(L.LightningModule):
         # --- PAD branch ---
         pad_images, liveness_labels = self._unpack_pad_batch(pad_batch)
         sensor_labels = self._unpack_sensor_labels(pad_batch)
+        material_labels = self._unpack_material_labels(pad_batch)
         # Wrap TinyViT forward for the PAD branch in no_grad: the only
         # gradient we would otherwise get here is a thin one into
         # MoE gate_proj via `expert_weights_gateonly`, which the ID
@@ -507,8 +566,11 @@ class OMFRModule(L.LightningModule):
         pad_backbone = self._run_backbone(pad_images, backbone_no_grad=True)
         pad_out      = self._run_pad(pad_backbone)
 
-        l_focal = self.pad_focal_loss(
-            pad_out["pad_logit"].squeeze(-1), liveness_labels.float(),
+        pad_parts = self._pad_classification_loss(
+            pad_out["pad_logit"],
+            liveness_labels,
+            sensor_labels=sensor_labels,
+            material_labels=material_labels,
         )
         
         # MixUp costs two extra pad_stem forwards (original + mixed). At
@@ -520,10 +582,10 @@ class OMFRModule(L.LightningModule):
         l_balance_pad = sum(pad_backbone["balance_losses"])
 
         if sensor_labels is not None and self.lam_adv > 0:
-            sensor_logits = self.sensor_adv_head(
-                pad_out["pad_features"], lam=self.lam_adv,
+            l_sensor = self._sensor_adversarial_loss(
+                pad_out["pad_features"],
+                sensor_labels,
             )
-            l_sensor = self.sensor_adv_loss(sensor_logits, sensor_labels)
         else:
             l_sensor = pad_images.new_zeros(())
 
@@ -538,7 +600,7 @@ class OMFRModule(L.LightningModule):
         l_balance = 0.5 * (l_balance_id + l_balance_pad)
 
         loss = (id_parts["total"]
-                + self.alpha * (l_focal + l_mixup)
+                + self.alpha * (pad_parts["total"] + l_mixup)
                 + self.alpha_adv * l_sensor
                 + self.beta * l_orth
                 + self.gamma * l_balance)
@@ -546,7 +608,7 @@ class OMFRModule(L.LightningModule):
         self.log("train/identity_loss",  id_parts["total"], prog_bar=True, sync_dist=True)
         self.log("train/id_arcface",     id_parts["arcface"],                sync_dist=True)
         self.log("train/id_supcon",      id_parts["supcon"],                 sync_dist=True)
-        self.log("train/pad_focal_loss", l_focal,                            sync_dist=True)
+        self._log_pad_loss_parts(pad_parts)
         self.log("train/pad_mixup_loss", l_mixup,                            sync_dist=True)
         self.log("train/pad_sensor_adv", l_sensor,                           sync_dist=True)
         self.log("train/orth_loss",      l_orth,                             sync_dist=True)
@@ -573,6 +635,20 @@ class OMFRModule(L.LightningModule):
             images = images.reshape(B * V, C, H, W)
             v_repeat = V
 
+        liveness_labels = None
+        sensor_labels = None
+        material_labels = None
+        if isinstance(batch, dict) and "liveness_labels" in batch:
+            liveness_labels = batch["liveness_labels"]
+            sensor_labels = self._unpack_sensor_labels(batch)
+            material_labels = self._unpack_material_labels(batch)
+            if v_repeat > 1:
+                liveness_labels = liveness_labels.repeat_interleave(v_repeat)
+                if sensor_labels is not None:
+                    sensor_labels = sensor_labels.repeat_interleave(v_repeat)
+                if material_labels is not None:
+                    material_labels = material_labels.repeat_interleave(v_repeat)
+
         backbone_out = self._run_backbone(images)
         id_out       = self._run_identity(backbone_out)
         pad_out      = self._run_pad(backbone_out)
@@ -586,8 +662,8 @@ class OMFRModule(L.LightningModule):
             id_labels = batch["identity_labels"]
             if v_repeat > 1:
                 id_labels = id_labels.repeat_interleave(v_repeat)
-            if "liveness_labels" in batch:
-                live_mask = batch["liveness_labels"] == 1
+            if liveness_labels is not None:
+                live_mask = liveness_labels == 1
                 if live_mask.any():
                     masked_embs = {
                         dim: emb[live_mask]
@@ -606,27 +682,28 @@ class OMFRModule(L.LightningModule):
         # PAD loss — focal + mixup (TASK_01). MixUp runs on the raw
         # images tensor; it computes features via _pad_features_from_images
         # so only pad_stem + pad_head are regularized (backbone not touched).
-        if isinstance(batch, dict) and "liveness_labels" in batch:
-            liveness = batch["liveness_labels"]
-            l_focal = self.pad_focal_loss(
-                pad_out["pad_logit"].squeeze(-1), liveness.float(),
+        if liveness_labels is not None:
+            pad_parts = self._pad_classification_loss(
+                pad_out["pad_logit"],
+                liveness_labels,
+                sensor_labels=sensor_labels,
+                material_labels=material_labels,
             )
             
             # MixUp disabled: destroys fingerprint micro-texture and caused NaN in smoke test.
             l_mixup = images.new_zeros(())
             
-            loss = loss + self.alpha * (l_focal + l_mixup)
-            self.log("train/pad_focal_loss", l_focal, sync_dist=True)
+            loss = loss + self.alpha * (pad_parts["total"] + l_mixup)
+            self._log_pad_loss_parts(pad_parts)
             self.log("train/pad_mixup_loss", l_mixup, sync_dist=True)
 
             # Sensor adversarial if labels available (Phase 3 joint set
             # typically doesn't carry sensor labels — guard with None check).
-            sensor_labels = self._unpack_sensor_labels(batch)
             if sensor_labels is not None and self.lam_adv > 0:
-                sensor_logits = self.sensor_adv_head(
-                    pad_out["pad_features"], lam=self.lam_adv,
+                l_sensor = self._sensor_adversarial_loss(
+                    pad_out["pad_features"],
+                    sensor_labels,
                 )
-                l_sensor = self.sensor_adv_loss(sensor_logits, sensor_labels)
                 loss = loss + self.alpha_adv * l_sensor
                 self.log("train/pad_sensor_adv", l_sensor, sync_dist=True)
 
@@ -965,4 +1042,11 @@ class OMFRModule(L.LightningModule):
         """Returns sensor_labels tensor if available, else None."""
         if isinstance(batch, dict):
             return batch.get("sensor_labels")
+        return None
+
+    @staticmethod
+    def _unpack_material_labels(batch: Any):
+        """Returns material_labels tensor if available, else None."""
+        if isinstance(batch, dict):
+            return batch.get("material_labels")
         return None

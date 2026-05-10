@@ -25,6 +25,7 @@ import yaml
 import lightning as L
 import torch
 from lightning.pytorch.callbacks import (
+    EarlyStopping,
     LearningRateMonitor,
     ModelCheckpoint,
     RichProgressBar,
@@ -37,13 +38,39 @@ from omfr.callbacks.phase_scheduler import PhaseSchedulerCallback
 from omfr.callbacks.gradient_monitor import GradientMonitor
 
 
+class PhaseAwareEarlyStopping(EarlyStopping):
+    """EarlyStopping that only starts checking once Phase 3 is active."""
+
+    def __init__(self, min_phase: int = 3, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.min_phase = int(min_phase)
+
+    def _run_early_stopping_check(self, trainer: L.Trainer) -> None:
+        pl_module = getattr(trainer, "lightning_module", None)
+        current_phase = int(getattr(pl_module, "current_phase", 1))
+        if current_phase < self.min_phase:
+            return
+        super()._run_early_stopping_check(trainer)
+
+
 # ---------------------------------------------------------------------------
 # Config helpers
 # ---------------------------------------------------------------------------
 
 def _load_config(path: str) -> Dict[str, Any]:
     with open(path, "r") as f:
-        return yaml.safe_load(f)
+        return _unwrap_wandb_values(yaml.safe_load(f))
+
+
+def _unwrap_wandb_values(value: Any) -> Any:
+    """Convert W&B exported config blocks from {'value': x} to x."""
+    if isinstance(value, dict):
+        if set(value.keys()) == {"value"}:
+            return _unwrap_wandb_values(value["value"])
+        return {k: _unwrap_wandb_values(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_unwrap_wandb_values(v) for v in value]
+    return value
 
 
 def _apply_overrides(config: Dict[str, Any], overrides: Dict[str, Any]) -> None:
@@ -176,9 +203,15 @@ def build_callbacks(config: Dict[str, Any]) -> list:
     gradient_monitor = GradientMonitor(log_every_n_steps=50)
 
     lr_monitor = LearningRateMonitor(logging_interval="epoch")
+    early_stop = PhaseAwareEarlyStopping(
+        monitor="val/cascaded_IM",
+        mode="max",
+        patience=7,
+        min_phase=3,
+    )
     progress   = RichProgressBar()
 
-    callbacks = [phase_scheduler, gradient_monitor, lr_monitor, progress]
+    callbacks = [phase_scheduler, gradient_monitor, early_stop, lr_monitor, progress]
     if tr_cfg.get("enable_checkpointing", True):
         callbacks.insert(2, ModelCheckpoint(
             dirpath=ckpt_cfg.get("dirpath", "checkpoints/"),

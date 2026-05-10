@@ -66,15 +66,37 @@ class SensorAdversarialHead(nn.Module):
 
 
 class SensorAdversarialLoss(nn.Module):
-    """Standard cross-entropy on sensor logits."""
+    """Cross-entropy on sensor logits with optional per-sample masking."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.ce = nn.CrossEntropyLoss()
 
     def forward(
         self,
         sensor_logits: torch.Tensor,
         sensor_labels: torch.Tensor,
+        sample_weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.ce(sensor_logits, sensor_labels.long())
+        labels = sensor_labels.to(device=sensor_logits.device).long().reshape(-1)
+        if sensor_logits.shape[0] != labels.numel():
+            raise ValueError(
+                "SensorAdversarialLoss labels must match batch size: "
+                f"got {labels.numel()} labels for {sensor_logits.shape[0]} logits"
+            )
+        logits = sensor_logits.reshape(sensor_logits.shape[0], -1)
+        per_sample = F.cross_entropy(logits, labels, reduction="none")
+
+        if sample_weight is None:
+            return per_sample.mean()
+
+        weights = sample_weight.to(device=sensor_logits.device, dtype=per_sample.dtype).reshape(-1)
+        if weights.numel() != per_sample.numel():
+            raise ValueError(
+                "SensorAdversarialLoss sample_weight must match batch size: "
+                f"got {weights.numel()} weights for {per_sample.numel()} samples"
+            )
+
+        weight_sum = weights.sum()
+        if weight_sum <= 0:
+            return per_sample.sum() * 0.0
+        return (per_sample * weights).sum() / weight_sum
