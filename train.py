@@ -29,6 +29,7 @@ from lightning.pytorch.callbacks import (
     LearningRateMonitor,
     ModelCheckpoint,
     RichProgressBar,
+    StochasticWeightAveraging,
 )
 from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
 
@@ -179,6 +180,7 @@ def build_callbacks(config: Dict[str, Any]) -> list:
     phase_cfg = config.get("phases", {})
     ckpt_cfg  = config.get("checkpoint", {})
     tr_cfg    = config.get("trainer", {})
+    cb_cfg    = config.get("callbacks", {})
 
     phase_scheduler = PhaseSchedulerCallback(
         phase1_epochs=phase_cfg.get("phase1_epochs", 50),
@@ -203,15 +205,22 @@ def build_callbacks(config: Dict[str, Any]) -> list:
     gradient_monitor = GradientMonitor(log_every_n_steps=50)
 
     lr_monitor = LearningRateMonitor(logging_interval="epoch")
-    early_stop = PhaseAwareEarlyStopping(
-        monitor="val/cascaded_IM",
-        mode="max",
-        patience=7,
-        min_phase=3,
-    )
+    early_cfg = cb_cfg.get("early_stopping", {}) if isinstance(cb_cfg, dict) else {}
+    early_enabled = early_cfg.get("enabled", True)
+    if early_enabled:
+        early_stop = PhaseAwareEarlyStopping(
+            monitor=early_cfg.get("monitor", "val/cascaded_IM"),
+            mode=early_cfg.get("mode", "max"),
+            patience=int(early_cfg.get("patience", 7)),
+            min_phase=int(early_cfg.get("min_phase", 3)),
+        )
+    else:
+        early_stop = None
     progress   = RichProgressBar()
 
-    callbacks = [phase_scheduler, gradient_monitor, early_stop, lr_monitor, progress]
+    callbacks = [phase_scheduler, gradient_monitor, lr_monitor, progress]
+    if early_stop is not None:
+        callbacks.insert(2, early_stop)
     if tr_cfg.get("enable_checkpointing", True):
         callbacks.insert(2, ModelCheckpoint(
             dirpath=ckpt_cfg.get("dirpath", "checkpoints/"),
@@ -222,6 +231,13 @@ def build_callbacks(config: Dict[str, Any]) -> list:
             mode=ckpt_cfg.get("mode", "max"),
             save_top_k=ckpt_cfg.get("save_top_k", 3),
             save_last=ckpt_cfg.get("save_last", True),
+        ))
+
+    swa_cfg = cb_cfg.get("swa", {}) if isinstance(cb_cfg, dict) else {}
+    if swa_cfg.get("enabled", False):
+        callbacks.append(StochasticWeightAveraging(
+            swa_lrs=float(swa_cfg.get("swa_lrs", 1.0e-4)),
+            swa_epoch_start=int(swa_cfg.get("swa_epoch_start", 40)),
         ))
 
     return callbacks

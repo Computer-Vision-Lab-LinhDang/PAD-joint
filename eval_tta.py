@@ -1,5 +1,5 @@
 """
-eval.py — OMFR Evaluation Script
+eval_tta.py — OMFR Evaluation Script with TTA for identity embeddings
 
 Evaluates a trained OMFR checkpoint on:
     1. Identity matching: Rank-1 accuracy + TAR@FAR on FVC2000/2002/2004
@@ -7,10 +7,10 @@ Evaluates a trained OMFR checkpoint on:
     3. Integrated: Cascaded metrics (PAD gate → identity matching)
 
 Usage:
-    python eval.py --checkpoint checkpoints/last.ckpt
-    python eval.py --checkpoint checkpoints/last.ckpt --fvc_root /path/to/FVC_Dataset
-    python eval.py --checkpoint checkpoints/last.ckpt --far 1e-3
-    python eval.py --checkpoint checkpoints/last.ckpt --mrl_dims 64 128 256
+    python eval_tta.py --checkpoint checkpoints/last.ckpt
+    python eval_tta.py --checkpoint checkpoints/last.ckpt --fvc_root /path/to/FVC_Dataset
+    python eval_tta.py --checkpoint checkpoints/last.ckpt --far 1e-3
+    python eval_tta.py --checkpoint checkpoints/last.ckpt --mrl_dims 64 128 256
 """
 
 from __future__ import annotations
@@ -26,15 +26,17 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-
-if hasattr(torch.serialization, "add_safe_globals"):
-    torch.serialization.add_safe_globals([builtins.getattr])
+from torchvision.transforms import functional as TF
+from torchvision.transforms.functional import InterpolationMode
 
 from omfr.models.omfr import OMFRModule
 from omfr.data.datasets.fvc_dataset import FVCDataset, discover_fvc_dbs
 from omfr.data.datasets.pad_dataset import PADDataset
 from omfr.evaluation.matching_eval import compute_tar_at_far, compute_cmc_curve
 from omfr.evaluation.pad_eval import compute_apcer_bpcer_acer, compute_eer
+
+if hasattr(torch.serialization, "add_safe_globals"):
+    torch.serialization.add_safe_globals([builtins.getattr])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -48,7 +50,7 @@ def extract_identity_embeddings(
     device: torch.device,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Extract L2-normalized identity embeddings for all samples.
+    Extract TTA-averaged identity embeddings for all samples.
 
     Returns:
         embeddings: (N, 256) float32 on CPU
@@ -62,11 +64,23 @@ def extract_identity_embeddings(
         images = batch["images"].to(device)
         labels = batch["identity_labels"]
 
-        backbone_out = model._run_backbone(images)
-        id_out = model._run_identity(backbone_out)
+        def _embed(images_tensor: torch.Tensor) -> torch.Tensor:
+            backbone_out = model._run_backbone(images_tensor)
+            id_out = model._run_identity(backbone_out)
+            return F.normalize(id_out["identity_embedding"], p=2, dim=-1)
 
-        emb = id_out["identity_embedding"].cpu()  # (B, 256), already L2-normed
-        all_embs.append(emb)
+        emb_orig = _embed(images)
+        emb_pos = _embed(
+            TF.rotate(images, angle=5.0, interpolation=InterpolationMode.BILINEAR)
+        )
+        emb_neg = _embed(
+            TF.rotate(images, angle=-5.0, interpolation=InterpolationMode.BILINEAR)
+        )
+
+        emb_mean = (emb_orig + emb_pos + emb_neg) / 3.0
+        emb_mean = F.normalize(emb_mean, p=2, dim=-1)
+
+        all_embs.append(emb_mean.cpu())
         all_labels.append(labels)
 
     return torch.cat(all_embs, dim=0), torch.cat(all_labels, dim=0)
@@ -421,7 +435,6 @@ def main():
                     metrics = eval_pad(model, loader, device)
                     all_pad_results[ds_name] = metrics
                     print_pad_results(ds_name, metrics)
-
                 except Exception as e:
                     print(f"    ERROR: {e}")
         else:

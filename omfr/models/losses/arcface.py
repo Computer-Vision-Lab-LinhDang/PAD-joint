@@ -39,6 +39,7 @@ class ArcFaceLoss(nn.Module):
         s: float = 64.0,
         margin: float = 0.5,
         easy_margin: bool = False,
+        label_smoothing: float = 0.0,
     ):
         super().__init__()
         self.embedding_dim = embedding_dim
@@ -57,7 +58,7 @@ class ArcFaceLoss(nn.Module):
         self.threshold = math.cos(math.pi - margin)  # for easy_margin=False
         self.mm = math.sin(math.pi - margin) * margin  # for easy_margin=False
 
-        self.ce = nn.CrossEntropyLoss()
+        self.ce = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
     def forward(
         self,
@@ -118,5 +119,6 @@ class ArcFaceLoss(nn.Module):
     def extra_repr(self) -> str:
         return (
             f"embedding_dim={self.embedding_dim}, num_classes={self.num_classes}, "
-            f"s={self.s}, margin={self.margin}"
+            f"s={self.s}, margin={self.margin}, "
+            f"label_smoothing={self.ce.label_smoothing}"
         )

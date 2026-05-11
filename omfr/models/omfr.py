@@ -128,16 +128,41 @@ class OMFRModule(L.LightningModule):
         )
 
         # -- Losses --
-        # ArcFace: one per MRL dim, weights stored HERE (not in IdentityHead)
-        # Init with s=1.0, margin=0.0 — PhaseSchedulerCallback warms up to s=32, m=0.5
-        self.arcface_losses = nn.ModuleDict({
-            "64":  ArcFaceLoss(64,  num_classes=num_classes, s=1.0, margin=0.0),
-            "128": ArcFaceLoss(128, num_classes=num_classes, s=1.0, margin=0.0),
-            "256": ArcFaceLoss(256, num_classes=num_classes, s=1.0, margin=0.0),
-        })
         losses_cfg = config.get("losses", {}) or {}
         if isinstance(losses_cfg.get("value"), dict):
             losses_cfg = losses_cfg["value"]
+        arcface_cfg = losses_cfg.get("arcface", {}) or {}
+        label_smoothing = float(
+            arcface_cfg.get(
+                "label_smoothing",
+                losses_cfg.get("identity_label_smoothing", 0.0),
+            )
+        )
+        # ArcFace: one per MRL dim, weights stored HERE (not in IdentityHead)
+        # Init with s=1.0, margin=0.0 — PhaseSchedulerCallback warms up to s=32, m=0.5
+        self.arcface_losses = nn.ModuleDict({
+            "64": ArcFaceLoss(
+                64,
+                num_classes=num_classes,
+                s=1.0,
+                margin=0.0,
+                label_smoothing=label_smoothing,
+            ),
+            "128": ArcFaceLoss(
+                128,
+                num_classes=num_classes,
+                s=1.0,
+                margin=0.0,
+                label_smoothing=label_smoothing,
+            ),
+            "256": ArcFaceLoss(
+                256,
+                num_classes=num_classes,
+                s=1.0,
+                margin=0.0,
+                label_smoothing=label_smoothing,
+            ),
+        })
         # PAD branch — configurable BCE + focal + OHEM + hard-spoof weights.
         # Defaults are BCE-only so the original 24/4 config remains valid;
         # the 26/4 checkpoint config enables focal/OHEM/hard-spoof terms.
