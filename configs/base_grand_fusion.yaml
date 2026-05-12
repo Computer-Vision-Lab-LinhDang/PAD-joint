@@ -58,8 +58,8 @@ losses:
   pad_ohem_weight: 1.5
   identity_supcon_weight: 0.9
   identity_arcface_weight: 0.1
-  pad_mixup_alpha: 0.2
-  pad_mixup_enabled: true
+  pad_mixup_alpha: 0.0
+  pad_mixup_enabled: false
   identity_label_smoothing: 0.1
 optimizer:
   name: AdamW

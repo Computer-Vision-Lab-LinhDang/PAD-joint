@@ -56,25 +56,17 @@ def _discover_nist_subject_dirs(nist_root: Path) -> List[Tuple[str, Path]]:
     if not nist_root.is_dir():
         raise FileNotFoundError(f"NIST root not found: {nist_root}")
 
-    candidates = []
     train_dir = nist_root / "train"
-    val_dir = nist_root / "val"
+    search_dir = train_dir if train_dir.is_dir() else nist_root
 
-    if train_dir.is_dir() or val_dir.is_dir():
-        for split_name, split_dir in (("train", train_dir), ("val", val_dir)):
-            if not split_dir.is_dir():
-                continue
-            for entry in sorted(split_dir.iterdir(), key=lambda p: p.name):
-                if not entry.is_dir() or entry.name.startswith("."):
-                    continue
-                candidates.append((f"nist_{split_name}_{entry.name}", entry))
-    else:
-        for entry in sorted(nist_root.iterdir(), key=lambda p: p.name):
-            if not entry.is_dir() or entry.name.startswith("."):
-                continue
-            candidates.append((f"nist_{entry.name}", entry))
+    candidates: Dict[str, Path] = {}
+    for entry in sorted(search_dir.iterdir(), key=lambda p: p.name):
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        key = f"nist_{entry.name}"
+        candidates[key] = entry
 
-    return candidates
+    return sorted(candidates.items(), key=lambda item: item[0])
 
 
 def _subject_from_fvc_name(filename: str) -> int | None:
@@ -134,6 +126,13 @@ def _ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def _is_within_root(path: Path, root: Path) -> bool:
+    try:
+        return path.resolve().is_relative_to(root.resolve())
+    except OSError:
+        return False
+
+
 def _generate_config(
     base_cfg_path: Path,
     output_cfg_path: Path,
@@ -152,8 +151,8 @@ def _generate_config(
 
     data.setdefault("losses", {})
     data["losses"].setdefault("arcface", {})
-    data["losses"]["pad_mixup_alpha"] = 0.2
-    data["losses"]["pad_mixup_enabled"] = True
+    data["losses"]["pad_mixup_alpha"] = 0.0
+    data["losses"]["pad_mixup_enabled"] = False
     data["losses"]["identity_label_smoothing"] = 0.1
     data["losses"]["arcface"]["label_smoothing"] = 0.1
 
@@ -226,8 +225,13 @@ def main() -> int:
     fvc_root = Path(args.fvc_root)
     nist_root = Path(args.nist_root)
     out_root = Path(args.out_root)
+    train_root = out_root / "train"
 
-    _ensure_dir(out_root)
+    if train_root.exists() and train_root.is_symlink():
+        raise RuntimeError(
+            f"Refusing to use symlinked train dir: {train_root}"
+        )
+    os.makedirs(train_root, exist_ok=True)
 
     fvc_dbs = [
         _discover_fvc_db(fvc_root, "FVC2000", "Db1_a"),
@@ -239,17 +243,21 @@ def main() -> int:
 
     nist_subjects = _discover_nist_subject_dirs(nist_root)
     for subject_name, subject_path in nist_subjects:
-        link_path = out_root / subject_name
+        if _is_within_root(subject_path, out_root):
+            continue
+        link_path = train_root / subject_name
         _safe_symlink(subject_path, link_path)
         subject_dirs[subject_name] = link_path
 
     for dataset_tag, db_path in fvc_dbs:
         for img_path in _list_images_flat(db_path):
+            if _is_within_root(img_path, out_root):
+                continue
             subject_id = _subject_from_fvc_name(img_path.name)
             if subject_id is None:
                 continue
             subject_name = _subject_dir_name(dataset_tag, subject_id)
-            subject_dir = out_root / subject_name
+            subject_dir = train_root / subject_name
             subject_dir.mkdir(parents=True, exist_ok=True)
             link_path = subject_dir / img_path.name
             _safe_symlink(img_path, link_path)
@@ -271,7 +279,7 @@ def main() -> int:
                 empty_subjects.append(subject)
             continue
         for img_path in images:
-            rel = PurePosixPath(subject) / img_path.name
+            rel = PurePosixPath("train") / subject / img_path.name
             train_rel_paths.append(rel)
 
     for subject in val_subjects:
@@ -283,7 +291,7 @@ def main() -> int:
                 empty_subjects.append(subject)
             continue
         for img_path in images:
-            rel = PurePosixPath(subject) / img_path.name
+            rel = PurePosixPath("train") / subject / img_path.name
             val_rel_paths.append(rel)
 
     _write_split_file(out_root, sorted(train_rel_paths), "split_train.txt")
