@@ -43,6 +43,7 @@ losses:
   alpha: 0.0
   beta: 0.0
   gamma: 0.05
+  balancing_loss_weight: 0.01
   pad_bce_weight: 0.5
   pad_focal_alpha: 0.5
   pad_focal_gamma: 1.0
@@ -100,7 +101,7 @@ phases:
   arcface_scale_end: 48.0
   moe_temp_phase1: 2.0
   moe_temp_phase2_end: 1.0
-  moe_temp_phase3_end: 0.5
+  moe_temp_phase3_end: 0.8
 data:
   identity_data_root: /home/linhdang/workspace2/FVC_Processed_Train
   pad_data_root: /home/linhdang/workspace2/PAD-joint
@@ -173,7 +174,7 @@ callbacks:
   swa:
     enabled: true
     swa_lrs: 0.0001
-    swa_epoch_start: 40
+    swa_epoch_start: 45
   early_stopping:
     enabled: true
     monitor: val/cascaded_IM

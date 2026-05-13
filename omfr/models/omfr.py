@@ -18,6 +18,8 @@ Config dict keys:
     weight_decay:  float  — AdamW weight decay (default 0.05)
     total_epochs:  int    — total training epochs (default 60)
     gamma:         float  — MoE balance loss weight (default 0.01)
+    balancing_loss_weight:
+                  float  — Phase-3 MoE balance loss weight (default gamma)
     pretrained:    bool   — load pretrained TinyViT (default True)
 """
 
@@ -195,6 +197,9 @@ class OMFRModule(L.LightningModule):
         self.alpha_adv: float = 0.0  # sensor-adv weight, ramped in Phase 2
         self.lam_adv:   float = 0.0  # GRL lambda, ramped in Phase 2
         self.gamma: float = float(config.get("gamma", 0.01))
+        self.phase3_balancing_loss_weight: float = float(
+            config.get("balancing_loss_weight", self.gamma)
+        )
         # Hybrid identity loss: weighted mix of SupCon (open-set) and
         # ArcFace (class discriminative). SupCon dominates so embeddings
         # generalize across unseen identities (FVC open-set scenario).
@@ -648,6 +653,9 @@ class OMFRModule(L.LightningModule):
     def _phase3_step(self, batch: Any) -> torch.Tensor:
         """Phase 3 — joint refinement. Spoof-masked ArcFace."""
         images = batch["images"] if isinstance(batch, dict) else batch[0]
+        has_identity_labels = isinstance(batch, dict) and "identity_labels" in batch
+        has_liveness_labels = isinstance(batch, dict) and "liveness_labels" in batch
+        is_pad_only = has_liveness_labels and not has_identity_labels
 
         # Multi-view identity sub-batch arrives as (B, V, C, H, W).
         # Flatten before the Gabor stem (which expects (B, 1, H, W)).
@@ -663,7 +671,7 @@ class OMFRModule(L.LightningModule):
         liveness_labels = None
         sensor_labels = None
         material_labels = None
-        if isinstance(batch, dict) and "liveness_labels" in batch:
+        if has_liveness_labels:
             liveness_labels = batch["liveness_labels"]
             sensor_labels = self._unpack_sensor_labels(batch)
             material_labels = self._unpack_material_labels(batch)
@@ -674,16 +682,24 @@ class OMFRModule(L.LightningModule):
                 if material_labels is not None:
                     material_labels = material_labels.repeat_interleave(v_repeat)
 
-        backbone_out = self._run_backbone(images)
+        # Protect the identity backbone from PAD-only LivDet gradients.
+        # Identity and true joint batches keep the full graph. PAD-only
+        # batches still train gabor_pad, pad_stem, pad_head, and sensor
+        # heads through _run_pad(), while FastViT activations are not
+        # retained and cannot receive PAD gradients.
+        backbone_out = self._run_backbone(images, backbone_no_grad=is_pad_only)
         id_out       = self._run_identity(backbone_out)
         pad_out      = self._run_pad(backbone_out)
 
         l_orth    = self.orth_loss(pad_out["pad_embedding"], id_out["identity_embedding"])
         l_balance = sum(backbone_out["balance_losses"])
-        loss: torch.Tensor = self.beta * l_orth + self.gamma * l_balance
+        loss: torch.Tensor = (
+            self.beta * l_orth
+            + self.phase3_balancing_loss_weight * l_balance
+        )
 
         # Identity loss — spoof-masked when liveness labels available
-        if isinstance(batch, dict) and "identity_labels" in batch:
+        if has_identity_labels:
             id_labels = batch["identity_labels"]
             if v_repeat > 1:
                 id_labels = id_labels.repeat_interleave(v_repeat)

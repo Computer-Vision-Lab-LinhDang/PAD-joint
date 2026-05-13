@@ -140,6 +140,10 @@ def _prepare_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "total_epochs", config.get("total_epochs", 60)
     )
     runtime["gamma"] = losses_cfg.get("gamma", config.get("gamma", 0.01))
+    runtime["balancing_loss_weight"] = losses_cfg.get(
+        "balancing_loss_weight",
+        config.get("balancing_loss_weight", runtime["gamma"]),
+    )
     runtime["identity_supcon_weight"] = losses_cfg.get(
         "identity_supcon_weight", config.get("identity_supcon_weight", 0.7)
     )
@@ -378,7 +382,12 @@ def main() -> None:
     trainer    = build_trainer(config, callbacks, logger)
 
     # ── Train ──
-    trainer.fit(model, datamodule=datamodule, ckpt_path=args.resume)
+    fit_kwargs = {"datamodule": datamodule, "ckpt_path": args.resume}
+    if args.resume:
+        # PyTorch 2.6 defaults torch.load(weights_only=True), but resuming
+        # Lightning training needs optimizer/callback/loop state too.
+        fit_kwargs["weights_only"] = False
+    trainer.fit(model, **fit_kwargs)
 
 
 if __name__ == "__main__":
