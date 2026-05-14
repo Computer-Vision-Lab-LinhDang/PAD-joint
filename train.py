@@ -54,6 +54,29 @@ class PhaseAwareEarlyStopping(EarlyStopping):
         super()._run_early_stopping_check(trainer)
 
 
+class FreshStartSWA(StochasticWeightAveraging):
+    """
+    Resume the trainer/optimizer state from a checkpoint, but start SWA fresh.
+
+    Old Phase-3 checkpoints may contain SWA callback state created with a much
+    larger SWA LR. Reusing the same state key lets Lightning route that old
+    state here, then this callback intentionally discards it so the configured
+    `swa_lrs` is the one that takes effect after resume.
+    """
+
+    @property
+    def state_key(self) -> str:
+        return "StochasticWeightAveraging"
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        self.n_averaged = None
+        self._swa_scheduler = None
+        self._initialized = False
+        self._init_n_averaged = 0
+        self._latest_update_epoch = -1
+        self._scheduler_state = None
+
+
 # ---------------------------------------------------------------------------
 # Config helpers
 # ---------------------------------------------------------------------------
@@ -199,11 +222,11 @@ def build_callbacks(config: Dict[str, Any]) -> list:
         arcface_scale_init=phase_cfg.get("arcface_scale_init", 1.0),
         arcface_scale_start=phase_cfg.get("arcface_scale_start", 32.0),
         arcface_scale_end=phase_cfg.get("arcface_scale_end", 64.0),
-        arcface_margin_init=phase_cfg.get("arcface_margin_init", 0.0),
-        arcface_margin_target=phase_cfg.get("arcface_margin_target", 0.5),
+        arcface_margin_init=phase_cfg.get("arcface_margin_init", 0.2),
+        arcface_margin_target=phase_cfg.get("arcface_margin_target", 0.45),
         moe_temp_phase1=phase_cfg.get("moe_temp_phase1", 2.0),
         moe_temp_phase2_end=phase_cfg.get("moe_temp_phase2_end", 1.0),
-        moe_temp_phase3_end=phase_cfg.get("moe_temp_phase3_end", 0.5),
+        moe_temp_phase3_end=phase_cfg.get("moe_temp_phase3_end", 0.8),
     )
 
     gradient_monitor = GradientMonitor(log_every_n_steps=50)
@@ -239,8 +262,8 @@ def build_callbacks(config: Dict[str, Any]) -> list:
 
     swa_cfg = cb_cfg.get("swa", {}) if isinstance(cb_cfg, dict) else {}
     if swa_cfg.get("enabled", False):
-        callbacks.append(StochasticWeightAveraging(
-            swa_lrs=float(swa_cfg.get("swa_lrs", 1.0e-4)),
+        callbacks.append(FreshStartSWA(
+            swa_lrs=float(swa_cfg.get("swa_lrs", 1.0e-5)),
             swa_epoch_start=int(swa_cfg.get("swa_epoch_start", 40)),
         ))
 

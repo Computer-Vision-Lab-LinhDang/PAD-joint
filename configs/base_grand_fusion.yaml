@@ -43,7 +43,7 @@ losses:
   alpha: 0.0
   beta: 0.0
   gamma: 0.05
-  balancing_loss_weight: 0.01
+  balancing_loss_weight: 0.0
   pad_bce_weight: 0.5
   pad_focal_alpha: 0.5
   pad_focal_gamma: 1.0
@@ -91,8 +91,8 @@ phases:
   phase1_warmup_delay: 5
   phase1_warmup_epochs: 5
   arcface_scale_init: 1.0
-  arcface_margin_init: 0.0
-  arcface_margin_target: 0.5
+  arcface_margin_init: 0.2
+  arcface_margin_target: 0.45
   warmup_epochs: 5
   alpha_target: 1.0
   beta_target: 0.02
@@ -173,7 +173,7 @@ export:
 callbacks:
   swa:
     enabled: true
-    swa_lrs: 0.0001
+    swa_lrs: 1.0e-05
     swa_epoch_start: 45
   early_stopping:
     enabled: true

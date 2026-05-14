@@ -19,7 +19,7 @@ Config dict keys:
     total_epochs:  int    — total training epochs (default 60)
     gamma:         float  — MoE balance loss weight (default 0.01)
     balancing_loss_weight:
-                  float  — Phase-3 MoE balance loss weight (default gamma)
+                  float  — legacy Phase-3 MoE balance weight; forced to 0.0 in Phase 3
     pretrained:    bool   — load pretrained TinyViT (default True)
 """
 
@@ -652,6 +652,8 @@ class OMFRModule(L.LightningModule):
 
     def _phase3_step(self, batch: Any) -> torch.Tensor:
         """Phase 3 — joint refinement. Spoof-masked ArcFace."""
+        self.phase3_balancing_loss_weight = 0.0
+
         images = batch["images"] if isinstance(batch, dict) else batch[0]
         has_identity_labels = isinstance(batch, dict) and "identity_labels" in batch
         has_liveness_labels = isinstance(batch, dict) and "liveness_labels" in batch
@@ -750,6 +752,11 @@ class OMFRModule(L.LightningModule):
 
         self.log("train/orth_loss",    l_orth,    sync_dist=True)
         self.log("train/balance_loss", l_balance, sync_dist=True)
+        self.log(
+            "train/balance_loss_weight",
+            self.phase3_balancing_loss_weight,
+            sync_dist=True,
+        )
         self.log("train/total_loss",   loss, prog_bar=True, sync_dist=True)
         return loss
 
@@ -1022,6 +1029,15 @@ class OMFRModule(L.LightningModule):
         )
 
         warmup_epochs = int(self.cfg.get("warmup_epochs", 5))
+        class _SafeSequentialLR(torch.optim.lr_scheduler.SequentialLR):
+            """Tolerate legacy scheduler state dicts without sub-schedulers."""
+
+            def load_state_dict(self, state_dict: dict) -> None:
+                if "_schedulers" not in state_dict:
+                    self.last_epoch = int(state_dict.get("last_epoch", -1))
+                    return
+                super().load_state_dict(state_dict)
+
         warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
             optimizer,
             start_factor=0.01,   # 1% of target LR at epoch 0
@@ -1033,7 +1049,7 @@ class OMFRModule(L.LightningModule):
             T_max=total_epochs - warmup_epochs,
             eta_min=1e-6,
         )
-        scheduler = torch.optim.lr_scheduler.SequentialLR(
+        scheduler = _SafeSequentialLR(
             optimizer,
             schedulers=[warmup_scheduler, cosine_scheduler],
             milestones=[warmup_epochs],

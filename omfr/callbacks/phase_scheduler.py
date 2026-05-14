@@ -9,21 +9,23 @@ Phase schedule (default):
     Phase 3: epochs 40-59 (joint refinement)
 
 Phase 1 warmup (CRITICAL for stability):
-    ArcFace scale:  1.0 -> 32.0   (prevents gradient explosion)
-    ArcFace margin: 0.0 -> 0.5    (gradual angular margin introduction)
-    Warmup over first `phase1_warmup_epochs` epochs.
+    ArcFace scale: configured init -> start value (prevents gradient explosion)
+    Warmup over first `phase1_warmup_epochs` epochs, after optional delay.
 
 Phase 2 ramps (TASK_04 — cosine soft-start):
     alpha:       0.01 * target -> target over first 5 epochs of Phase 2
     beta:        0.01 * target -> target (target = 0.05 after TASK_02 re-norm)
     alpha_adv:   0 -> target over the FULL Phase 2 (DANN-style slow ramp)
     lam_adv:     sigmoid schedule 2/(1+exp(-10p)) - 1 over full Phase 2
-    ArcFace s:   32.0 -> 64.0
+    ArcFace s:   configured start -> configured end
+
+ArcFace margin:
+    Continuous schedule over all phases: 0.2 -> 0.45 by final epoch.
 
 MoE temperature:
     Phase 1: 2.0 (soft routing, exploration)
     Phase 2: 2.0 -> 1.0 (gradual sharpening)
-    Phase 3: 1.0 -> 0.5 (sharp routing, specialization)
+    Phase 3: 1.0 -> 0.8 (conservative sharpening)
 """
 
 from __future__ import annotations
@@ -53,11 +55,11 @@ class PhaseSchedulerCallback(L.Callback):
         arcface_scale_init: float = 1.0,
         arcface_scale_start: float = 32.0,
         arcface_scale_end: float = 64.0,
-        arcface_margin_init: float = 0.0,
-        arcface_margin_target: float = 0.5,
+        arcface_margin_init: float = 0.2,
+        arcface_margin_target: float = 0.45,
         moe_temp_phase1: float = 2.0,
         moe_temp_phase2_end: float = 1.0,
-        moe_temp_phase3_end: float = 0.5,
+        moe_temp_phase3_end: float = 0.8,
     ) -> None:
         super().__init__()
         self.phase1_epochs = phase1_epochs
@@ -80,6 +82,7 @@ class PhaseSchedulerCallback(L.Callback):
 
         self._phase2_start = phase1_epochs
         self._phase3_start = phase1_epochs + phase2_epochs
+        self._total_phase_epochs = phase1_epochs + phase2_epochs + phase3_epochs
 
     # ------------------------------------------------------------------
     # Ramp helper
@@ -112,6 +115,18 @@ class PhaseSchedulerCallback(L.Callback):
         p = (epoch - start) / max(end - start, 1)
         return 2.0 / (1.0 + math.exp(-10.0 * p)) - 1.0
 
+    def _arcface_margin_for_epoch(self, epoch: int) -> float:
+        """Linear margin schedule across the full three-phase run."""
+        p = min(max(epoch, 0) / max(self._total_phase_epochs - 1, 1), 1.0)
+        return self.arcface_margin_init + p * (
+            self.arcface_margin_target - self.arcface_margin_init
+        )
+
+    @staticmethod
+    def _set_arcface_margin(pl_module: Any, margin: float) -> None:
+        for af_loss in pl_module.arcface_losses.values():
+            af_loss.set_margin(margin)
+
     # ------------------------------------------------------------------
     # Lightning callback hooks
     # ------------------------------------------------------------------
@@ -122,6 +137,7 @@ class PhaseSchedulerCallback(L.Callback):
         pl_module: Any,
     ) -> None:
         epoch = trainer.current_epoch
+        arcface_margin = self._arcface_margin_for_epoch(epoch)
 
         # Phase transitions
         if epoch == self._phase2_start:
@@ -138,12 +154,9 @@ class PhaseSchedulerCallback(L.Callback):
             scale = self.arcface_scale_init + p1_progress * (
                 self.arcface_scale_start - self.arcface_scale_init
             )
-            margin = self.arcface_margin_init + p1_progress * (
-                self.arcface_margin_target - self.arcface_margin_init
-            )
             for af_loss in pl_module.arcface_losses.values():
                 af_loss.set_scale(scale)
-                af_loss.set_margin(margin)
+            self._set_arcface_margin(pl_module, arcface_margin)
 
             pl_module.alpha = 0.0
             pl_module.beta = 0.0
@@ -155,7 +168,7 @@ class PhaseSchedulerCallback(L.Callback):
             trainer.logger.log_metrics(
                 {
                     "phase/arcface_scale": scale,
-                    "phase/arcface_margin": margin,
+                    "phase/arcface_margin": arcface_margin,
                     "phase/moe_temperature": self.moe_temp_phase1,
                     "phase/current": 1.0,
                 },
@@ -191,6 +204,7 @@ class PhaseSchedulerCallback(L.Callback):
             )
             for af_loss in pl_module.arcface_losses.values():
                 af_loss.set_scale(new_scale)
+            self._set_arcface_margin(pl_module, arcface_margin)
 
             # MoE temperature: linear 2.0 -> 1.0 across Phase 2
             p2_progress = min(
@@ -209,6 +223,7 @@ class PhaseSchedulerCallback(L.Callback):
                     "phase/alpha_adv": pl_module.alpha_adv,
                     "phase/lam_adv": pl_module.lam_adv,
                     "phase/arcface_scale": new_scale,
+                    "phase/arcface_margin": arcface_margin,
                     "phase/moe_temperature": moe_temp,
                     "phase/current": 2.0,
                 },
@@ -224,11 +239,14 @@ class PhaseSchedulerCallback(L.Callback):
             pl_module.beta = self.beta_target
             pl_module.alpha_adv = self.alpha_adv_target
             pl_module.lam_adv = 1.0
+            if hasattr(pl_module, "phase3_balancing_loss_weight"):
+                pl_module.phase3_balancing_loss_weight = 0.0
 
             moe_temp = self.moe_temp_phase2_end + phase3_progress * (
                 self.moe_temp_phase3_end - self.moe_temp_phase2_end
             )
             self._set_moe_temperature(pl_module, moe_temp)
+            self._set_arcface_margin(pl_module, arcface_margin)
 
             trainer.logger.log_metrics(
                 {
@@ -236,7 +254,13 @@ class PhaseSchedulerCallback(L.Callback):
                     "phase/beta": pl_module.beta,
                     "phase/alpha_adv": pl_module.alpha_adv,
                     "phase/lam_adv": pl_module.lam_adv,
+                    "phase/arcface_margin": arcface_margin,
                     "phase/moe_temperature": moe_temp,
+                    "phase/balancing_loss_weight": getattr(
+                        pl_module,
+                        "phase3_balancing_loss_weight",
+                        0.0,
+                    ),
                     "phase/current": 3.0,
                 },
                 step=trainer.global_step,
@@ -262,7 +286,10 @@ class PhaseSchedulerCallback(L.Callback):
 
         for af_loss in pl_module.arcface_losses.values():
             af_loss.set_scale(self.arcface_scale_start)
-            af_loss.set_margin(self.arcface_margin_target)
+        self._set_arcface_margin(
+            pl_module,
+            self._arcface_margin_for_epoch(trainer.current_epoch),
+        )
 
         self._set_moe_temperature(pl_module, self.moe_temp_phase1)
 
@@ -291,6 +318,12 @@ class PhaseSchedulerCallback(L.Callback):
 
         for af_loss in pl_module.arcface_losses.values():
             af_loss.set_scale(self.arcface_scale_end)
+        self._set_arcface_margin(
+            pl_module,
+            self._arcface_margin_for_epoch(trainer.current_epoch),
+        )
+        if hasattr(pl_module, "phase3_balancing_loss_weight"):
+            pl_module.phase3_balancing_loss_weight = 0.0
 
         self._set_moe_temperature(pl_module, self.moe_temp_phase2_end)
 
