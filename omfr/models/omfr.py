@@ -210,6 +210,8 @@ class OMFRModule(L.LightningModule):
             config.get("identity_arcface_weight", 0.3)
         )
 
+        self._pcgrad_state: Optional[Dict[str, Any]] = None
+
         # -- Phase state --
         self.current_phase: int = 1
 
@@ -263,6 +265,97 @@ class OMFRModule(L.LightningModule):
             "stage3_feat": backbone_out["stage3_feat"],
             "stage4_feat": backbone_out["stage4_feat"],
         })
+
+    def _pcgrad_shared_params(self) -> List[nn.Parameter]:
+        return [p for p in self.backbone.parameters() if p.requires_grad]
+
+    def _pcgrad_scale_loss(self, loss: torch.Tensor) -> torch.Tensor:
+        if not hasattr(self, "trainer") or self.trainer is None:
+            return loss
+        scaler = getattr(self.trainer.precision_plugin, "scaler", None)
+        if scaler is None or not scaler.is_enabled():
+            return loss
+        return scaler.scale(loss)
+
+    def _stash_pcgrad(
+        self,
+        id_loss: torch.Tensor,
+        pad_loss: torch.Tensor,
+    ) -> None:
+        params = self._pcgrad_shared_params()
+        if not params:
+            return
+
+        id_loss = self._pcgrad_scale_loss(id_loss)
+        pad_loss = self._pcgrad_scale_loss(pad_loss)
+        id_grads = torch.autograd.grad(
+            id_loss,
+            params,
+            retain_graph=True,
+            allow_unused=True,
+        )
+        pad_grads = torch.autograd.grad(
+            pad_loss,
+            params,
+            retain_graph=True,
+            allow_unused=True,
+        )
+
+        with torch.no_grad():
+            dot = None
+            id_norm_sq = None
+            pad_norm_sq = None
+            overlap_count = 0
+            for g_id, g_pad in zip(id_grads, pad_grads):
+                if g_id is None or g_pad is None:
+                    continue
+                overlap_count += 1
+                g_id_det = g_id.detach()
+                g_pad_det = g_pad.detach()
+                prod = (g_id_det * g_pad_det).sum().float()
+                dot = prod if dot is None else dot + prod
+                id_part = (g_id_det * g_id_det).sum().float()
+                pad_part = (g_pad_det * g_pad_det).sum().float()
+                id_norm_sq = id_part if id_norm_sq is None else id_norm_sq + id_part
+                pad_norm_sq = pad_part if pad_norm_sq is None else pad_norm_sq + pad_part
+
+            conflict = (
+                overlap_count > 0
+                and dot is not None
+                and id_norm_sq is not None
+                and pad_norm_sq is not None
+                and dot.item() < 0.0
+                and id_norm_sq.item() > 0.0
+                and pad_norm_sq.item() > 0.0
+            )
+
+            if conflict:
+                id_coeff = dot / pad_norm_sq
+                pad_coeff = dot / id_norm_sq
+            else:
+                id_coeff = None
+                pad_coeff = None
+
+        combined_grads: List[Optional[torch.Tensor]] = []
+        for g_id, g_pad in zip(id_grads, pad_grads):
+            g_total = None
+            if g_id is not None:
+                g_id_use = g_id - id_coeff * g_pad if conflict and g_pad is not None else g_id
+                g_total = g_id_use if g_total is None else g_total + g_id_use
+            if g_pad is not None:
+                g_pad_use = g_pad - pad_coeff * g_id if conflict and g_id is not None else g_pad
+                g_total = g_pad_use if g_total is None else g_total + g_pad_use
+            combined_grads.append(g_total.detach() if g_total is not None else None)
+
+        self._pcgrad_state = {"params": params, "grads": combined_grads}
+        if overlap_count > 0:
+            self.log(
+                "train/pcgrad_conflict_rate",
+                1.0 if conflict else 0.0,
+                sync_dist=True,
+            )
+
+        del id_grads, pad_grads
 
     def _run_pad(self, backbone_out: Dict) -> Dict:
         """PAD head reading stage1 + stage2 features + routing stats.
@@ -629,11 +722,11 @@ class OMFRModule(L.LightningModule):
 
         l_balance = 0.5 * (l_balance_id + l_balance_pad)
 
-        loss = (id_parts["total"]
-                + self.alpha * (pad_parts["total"] + l_mixup)
-                + self.alpha_adv * l_sensor
-                + self.beta * l_orth
-                + self.gamma * l_balance)
+        base_loss = self.beta * l_orth + self.gamma * l_balance
+        pad_loss = self.alpha * (pad_parts["total"] + l_mixup) + self.alpha_adv * l_sensor
+        loss = id_parts["total"] + pad_loss + base_loss
+
+        self._stash_pcgrad(id_parts["total"], pad_loss)
 
         self.log("train/identity_loss",  id_parts["total"], prog_bar=True, sync_dist=True)
         self.log("train/id_arcface",     id_parts["arcface"],                sync_dist=True)
@@ -652,8 +745,6 @@ class OMFRModule(L.LightningModule):
 
     def _phase3_step(self, batch: Any) -> torch.Tensor:
         """Phase 3 — joint refinement. Spoof-masked ArcFace."""
-        self.phase3_balancing_loss_weight = 0.0
-
         images = batch["images"] if isinstance(batch, dict) else batch[0]
         has_identity_labels = isinstance(batch, dict) and "identity_labels" in batch
         has_liveness_labels = isinstance(batch, dict) and "liveness_labels" in batch
@@ -695,12 +786,14 @@ class OMFRModule(L.LightningModule):
 
         l_orth    = self.orth_loss(pad_out["pad_embedding"], id_out["identity_embedding"])
         l_balance = sum(backbone_out["balance_losses"])
-        loss: torch.Tensor = (
+        base_loss: torch.Tensor = (
             self.beta * l_orth
             + self.phase3_balancing_loss_weight * l_balance
         )
+        loss = base_loss
 
         # Identity loss — spoof-masked when liveness labels available
+        id_parts = None
         if has_identity_labels:
             id_labels = batch["identity_labels"]
             if v_repeat > 1:
@@ -725,6 +818,7 @@ class OMFRModule(L.LightningModule):
         # PAD loss — focal + mixup (TASK_01). MixUp runs on the raw
         # images tensor; it computes features via _pad_features_from_images
         # so only pad_stem + pad_head are regularized (backbone not touched).
+        pad_loss = None
         if liveness_labels is not None:
             pad_parts = self._pad_classification_loss(
                 pad_out["pad_logit"],
@@ -736,7 +830,8 @@ class OMFRModule(L.LightningModule):
             # MixUp disabled: destroys fingerprint micro-texture and caused NaN in smoke test.
             l_mixup = images.new_zeros(())
             
-            loss = loss + self.alpha * (pad_parts["total"] + l_mixup)
+            pad_loss = self.alpha * (pad_parts["total"] + l_mixup)
+            loss = loss + pad_loss
             self._log_pad_loss_parts(pad_parts)
             self.log("train/pad_mixup_loss", l_mixup, sync_dist=True)
 
@@ -747,8 +842,14 @@ class OMFRModule(L.LightningModule):
                     pad_out["pad_features"],
                     sensor_labels,
                 )
+                if pad_loss is None:
+                    pad_loss = images.new_zeros(())
+                pad_loss = pad_loss + self.alpha_adv * l_sensor
                 loss = loss + self.alpha_adv * l_sensor
                 self.log("train/pad_sensor_adv", l_sensor, sync_dist=True)
+
+        if id_parts is not None and pad_loss is not None:
+            self._stash_pcgrad(id_parts["total"], pad_loss)
 
         self.log("train/orth_loss",    l_orth,    sync_dist=True)
         self.log("train/balance_loss", l_balance, sync_dist=True)
@@ -802,9 +903,21 @@ class OMFRModule(L.LightningModule):
         # but every gradient ends up zero.
         if not torch.isfinite(loss):
             self.log("train/nonfinite_step", 1.0, prog_bar=True, sync_dist=True)
+            self._pcgrad_state = None
             anchor = next(p for p in self.parameters() if p.requires_grad)
             return anchor.sum() * 0.0
         return loss
+
+    def on_after_backward(self) -> None:
+        if not self._pcgrad_state:
+            return
+        params = self._pcgrad_state["params"]
+        grads = self._pcgrad_state["grads"]
+        for param, grad in zip(params, grads):
+            if grad is None:
+                continue
+            param.grad = grad
+        self._pcgrad_state = None
 
     # -------------------------------------------------------------------------
     # Checkpoint persistence for phase-schedule state

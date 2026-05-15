@@ -43,7 +43,7 @@ losses:
   alpha: 0.0
   beta: 0.0
   gamma: 0.05
-  balancing_loss_weight: 0.0
+  balancing_loss_weight: 0.005
   pad_bce_weight: 0.5
   pad_focal_alpha: 0.5
   pad_focal_gamma: 1.0

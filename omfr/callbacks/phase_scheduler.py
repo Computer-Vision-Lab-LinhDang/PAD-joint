@@ -239,8 +239,6 @@ class PhaseSchedulerCallback(L.Callback):
             pl_module.beta = self.beta_target
             pl_module.alpha_adv = self.alpha_adv_target
             pl_module.lam_adv = 1.0
-            if hasattr(pl_module, "phase3_balancing_loss_weight"):
-                pl_module.phase3_balancing_loss_weight = 0.0
 
             moe_temp = self.moe_temp_phase2_end + phase3_progress * (
                 self.moe_temp_phase3_end - self.moe_temp_phase2_end
