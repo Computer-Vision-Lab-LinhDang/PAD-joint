@@ -29,6 +29,8 @@ checkpoints/
 logs/
 exports/
 wandb/
+checkpoints_distill/
+checkpoints_sa24_dynamic/
 
 # Data (large, downloaded separately)
 data/raw/
@@ -51,3 +53,4 @@ data/processed/
 *.key
 LivDet2013
 LivDet2015
+data_10_percent/

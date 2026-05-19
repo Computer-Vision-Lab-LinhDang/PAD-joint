@@ -222,6 +222,23 @@ class IdentityDataset(Dataset):
     def get_labels(self) -> List[int]:
         return [label for _, label in self.samples]
 
+    def get_groups(self) -> List[str]:
+        """Per-sample dataset group: ``"fvc"`` or ``"nist"``.
+
+        Derived from the *original* directory name (the immediate parent
+        of the image file), so it is robust to ``group_by_subject`` —
+        NIST subjects collapse to ``subj_XXXX`` class names that no
+        longer contain ``"nist"``, but the on-disk folder
+        (``nist_a300_subj_...``) still does. Used by
+        ``GroupBalancedPKSampler`` to keep every batch FVC/NIST-balanced
+        despite NIST having ~70× more classes than FVC.
+        """
+        groups: List[str] = []
+        for path, _ in self.samples:
+            name = path.parent.name.lower()
+            groups.append("fvc" if "fvc" in name else "nist")
+        return groups
+
 
 def build_identity_dataset(
     root: str,

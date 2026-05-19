@@ -117,10 +117,14 @@ class PADHead(nn.Module):
         stage2_dim: int = 128,
         pad_stem_dim: int = 256,
         dropout: float = 0.1,
+        num_classes: int = 1,
+        proj_dropout: float | None = None,
     ):
         super().__init__()
 
         self.pad_stem_dim = pad_stem_dim
+        if proj_dropout is None:
+            proj_dropout = dropout
 
         # Aux feature path on detached backbone stages
         self.block_s1 = PADConvBlock(stage1_dim, self.FEAT_CH_PER_STAGE)
@@ -145,7 +149,20 @@ class PADHead(nn.Module):
 
         # Parallel output branches from pad_features
         self.embedding_proj = nn.Linear(self.PAD_FEATURES_DIM, self.PAD_EMBEDDING_DIM)
-        self.logit_head = nn.Linear(self.PAD_FEATURES_DIM, 1)
+
+        # Non-linear PAD projector head (replaces the old single Linear).
+        # Gives the PAD branch dedicated capacity to learn spoof-material
+        # cues WITHOUT forcing the shared backbone to change — the extra
+        # parameters live entirely inside the head.
+        # Structure: Linear(d,d) -> BatchNorm1d -> GELU -> Dropout -> Linear(d, num_classes)
+        d = self.PAD_FEATURES_DIM
+        self.logit_head = nn.Sequential(
+            nn.Linear(d, d),
+            nn.BatchNorm1d(d),
+            nn.GELU(),
+            nn.Dropout(proj_dropout),
+            nn.Linear(d, num_classes),
+        )
 
     def _extract_routing_features(self, stats: Dict) -> torch.Tensor:
         """

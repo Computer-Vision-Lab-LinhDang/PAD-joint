@@ -119,6 +119,9 @@ class OMFRModule(L.LightningModule):
         self.pad_head = PADHead(
             stage1_dim=int(pad_cfg.get("stage1_dim", default_stage1)),
             stage2_dim=int(pad_cfg.get("stage2_dim", default_stage2)),
+            dropout=float(pad_cfg.get("dropout", 0.1)),
+            num_classes=int(pad_cfg.get("num_classes", 1)),
+            proj_dropout=pad_cfg.get("proj_dropout", None),
         )
         self.identity_head = IdentityHead(
             embed_dim=int(id_cfg.get("embed_dim", 256)),
@@ -210,7 +213,14 @@ class OMFRModule(L.LightningModule):
             config.get("identity_arcface_weight", 0.3)
         )
 
-        self._pcgrad_state: Optional[Dict[str, Any]] = None
+        # -- Phase-2 "absolute freeze" recipe --
+        # PAD is hard-detached from the backbone (see _run_pad) and the
+        # backbone + identity head are frozen via LR=0 at the Phase-2
+        # boundary. There is therefore no PAD->backbone gradient, so the
+        # old gradient-conflict guards (Feature Distillation teacher +
+        # PCGrad) are no longer needed and have been removed. Only the
+        # gabor_pad -> pad_stem -> pad_head projector learns in Phase 2.
+        self._phase2_lr_applied: bool = False         # idempotency guard
 
         # -- Phase state --
         self.current_phase: int = 1
@@ -266,120 +276,23 @@ class OMFRModule(L.LightningModule):
             "stage4_feat": backbone_out["stage4_feat"],
         })
 
-    def _pcgrad_shared_params(self) -> List[nn.Parameter]:
-        return [p for p in self.backbone.parameters() if p.requires_grad]
-
-    def _pcgrad_scale_loss(self, loss: torch.Tensor) -> torch.Tensor:
-        if not hasattr(self, "trainer") or self.trainer is None:
-            return loss
-        scaler = getattr(self.trainer.precision_plugin, "scaler", None)
-        if scaler is None or not scaler.is_enabled():
-            return loss
-        return scaler.scale(loss)
-
-    def _stash_pcgrad(
-        self,
-        id_loss: torch.Tensor,
-        pad_loss: torch.Tensor,
-    ) -> None:
-        params = self._pcgrad_shared_params()
-        if not params:
-            return
-
-        id_loss = self._pcgrad_scale_loss(id_loss)
-        pad_loss = self._pcgrad_scale_loss(pad_loss)
-        id_grads = torch.autograd.grad(
-            id_loss,
-            params,
-            retain_graph=True,
-            allow_unused=True,
-        )
-        pad_grads = torch.autograd.grad(
-            pad_loss,
-            params,
-            retain_graph=True,
-            allow_unused=True,
-        )
-
-        with torch.no_grad():
-            dot = None
-            id_norm_sq = None
-            pad_norm_sq = None
-            overlap_count = 0
-            for g_id, g_pad in zip(id_grads, pad_grads):
-                if g_id is None or g_pad is None:
-                    continue
-                overlap_count += 1
-                g_id_det = g_id.detach()
-                g_pad_det = g_pad.detach()
-                prod = (g_id_det * g_pad_det).sum().float()
-                dot = prod if dot is None else dot + prod
-                id_part = (g_id_det * g_id_det).sum().float()
-                pad_part = (g_pad_det * g_pad_det).sum().float()
-                id_norm_sq = id_part if id_norm_sq is None else id_norm_sq + id_part
-                pad_norm_sq = pad_part if pad_norm_sq is None else pad_norm_sq + pad_part
-
-            conflict = (
-                overlap_count > 0
-                and dot is not None
-                and id_norm_sq is not None
-                and pad_norm_sq is not None
-                and dot.item() < 0.0
-                and id_norm_sq.item() > 0.0
-                and pad_norm_sq.item() > 0.0
-            )
-
-            if conflict:
-                id_coeff = dot / pad_norm_sq
-                pad_coeff = dot / id_norm_sq
-            else:
-                id_coeff = None
-                pad_coeff = None
-
-        combined_grads: List[Optional[torch.Tensor]] = []
-        for g_id, g_pad in zip(id_grads, pad_grads):
-            g_total = None
-            if g_id is not None:
-                g_id_use = g_id - id_coeff * g_pad if conflict and g_pad is not None else g_id
-                g_total = g_id_use if g_total is None else g_total + g_id_use
-            if g_pad is not None:
-                g_pad_use = g_pad - pad_coeff * g_id if conflict and g_id is not None else g_pad
-                g_total = g_pad_use if g_total is None else g_total + g_pad_use
-            combined_grads.append(g_total.detach() if g_total is not None else None)
-
-        self._pcgrad_state = {"params": params, "grads": combined_grads}
-        if overlap_count > 0:
-            self.log(
-                "train/pcgrad_conflict_rate",
-                1.0 if conflict else 0.0,
-                sync_dist=True,
-            )
-
-        del id_grads, pad_grads
-
     def _run_pad(self, backbone_out: Dict) -> Dict:
         """PAD head reading stage1 + stage2 features + routing stats.
 
-        ALL tensors coming out of the backbone are detached before they
-        reach the PAD head. Rationale:
+        HARD STOP-GRADIENT ("Đóng Băng Tuyệt Đối"): every tensor taken
+        from the shared FastViT trunk — the stage1/stage2 feature maps
+        AND all MoE routing stats — is ``.detach()``ed before it reaches
+        the PAD head. PAD loss therefore CANNOT back-propagate into the
+        backbone at all (no gradient to early stages, no gradient to the
+        MoE gate). This protects the low-level identity features (the
+        "móng nhà") that Phase 1 built.
 
-          * stage1/stage2 feature maps — without the detach, PAD
-            BCE/SupCon back-propagates through the 5.4 M-param TinyViT
-            backbone. LivDet datasets have strong sensor signatures, so
-            the backbone quickly memorizes sensor -> class shortcuts.
-            Observed symptoms: identity_loss jumps from ~5 to ~12 at
-            the Phase 2 boundary (backbone features shift away from
-            what identity head expects), val BPCER climbs to ~80% on
-            held-out sensors (test prints look "alien", head defaults
-            to spoof). The fix is to make the PAD head a pure read-only
-            classifier on top of identity-shaped features.
-          * routing_stats — same reason for the MoE gate: if PAD loss
-            could shape routing, the gate would encode liveness as a
-            sensor fingerprint and fail cross-split.
-
-        Net effect: the backbone is shaped only by L_identity (Phase 1,
-        2-identity, 3-joint) + balance loss. PAD head trains its own
-        ~340K params from a frozen view of the backbone.
+        The only trainable pixel path on the PAD branch is the dedicated
+        ``gabor_pad -> pad_stem -> pad_head`` stack, which is a separate
+        filter bank from the identity Gabor and never touches the trunk.
+        Because the cut is absolute, the previous gradient-conflict
+        guards (Feature Distillation teacher + PCGrad) are unnecessary
+        and have been removed.
         """
         rs = backbone_out["routing_stats"]
 
@@ -388,40 +301,16 @@ class OMFRModule(L.LightningModule):
                 "expert_weights": stats["expert_weights"].detach(),
                 "token_entropy":  stats["token_entropy"].detach(),
             }
-            # [NEW] Đảm bảo vector tần số cũng được truyền qua an toàn
+            # Frequency-band vector also passed through detached.
             if "gate_input_gateonly" in stats:
                 res["gate_input_gateonly"] = stats["gate_input_gateonly"].detach()
             return res
 
-        def _gateonly_stats(stats: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-            # "Gate-only" routing copy — grad can reach gate_proj
-            # weights but stops at gate_input (see moe_ffn.forward).
-            res = {
-                "expert_weights": stats["expert_weights_gateonly"],
-                "token_entropy":  stats["token_entropy_gateonly"],
-            }
-            # [NEW] Bypass 3 dải tần số gốc để PAD trực tiếp phân tích bọt khí/nhiễu
-            if "gate_input_gateonly" in stats:
-                res["gate_input_gateonly"] = stats["gate_input_gateonly"]
-            return res
-
-        # Phase-gated routing un-detach: from Phase 2 on, let PAD
-        # gradients flow back into the MoE gate projection only
-        # (~200 params/layer × 3 layers ≈ 600 params). Expert bodies,
-        # stage features, and the upstream tokens that feed FrequencyGate
-        # stay isolated — PAD can bias routing toward spoof-texture
-        # experts without reshaping the backbone.
-        # Phase 1: keep everything detached — backbone is still
-        # converging on identity and we don't want a noisy PAD head
-        # steering routing before it has a useful signal.
-        if self.current_phase >= 2:
-            rs_s2  = _gateonly_stats(rs["s2"])
-            rs_s3a = _gateonly_stats(rs["s3a"])
-            rs_s3b = _gateonly_stats(rs["s3b"])
-        else:
-            rs_s2  = _detach_stats(rs["s2"])
-            rs_s3a = _detach_stats(rs["s3a"])
-            rs_s3b = _detach_stats(rs["s3b"])
+        # Routing stats are ALWAYS fully detached now (no phase gating,
+        # no gate-only copy): PAD never reshapes the MoE router either.
+        rs_s2  = _detach_stats(rs["s2"])
+        rs_s3a = _detach_stats(rs["s3a"])
+        rs_s3b = _detach_stats(rs["s3b"])
 
         # Dedicated PAD stem runs on the PAD-specific Gabor bank
         # (self.gabor_pad). Because it's a separate filter bank from
@@ -432,12 +321,106 @@ class OMFRModule(L.LightningModule):
 
         return self.pad_head({
             "pad_stem_feat":     pad_stem_feat,
+            # HARD detach: PAD gradient never reaches the backbone.
             "stage1_feat":       backbone_out["stage1_feat"].detach(),
             "stage2_feat":       backbone_out["stage2_feat"].detach(),
             "routing_stats_s2":  rs_s2,
             "routing_stats_s3a": rs_s3a,
             "routing_stats_s3b": rs_s3b,
         })
+
+    # -------------------------------------------------------------------------
+    # Phase-2 LR surgery (backbone + identity head freeze)
+    # -------------------------------------------------------------------------
+
+    def apply_phase2_lr_multipliers(self, trainer: Any) -> None:
+        """Hard re-scale per-group LR at the dynamic Phase-2 boundary.
+
+        "Đóng Băng Tuyệt Đối" — Phase 1 ran backbone/id at x1.0; PAD
+        parked. At Phase 2 the entire identity side is frozen and the
+        PAD projector is unleashed:
+          * backbone + MoE + identity Gabor + ArcFace
+                              -> backbone_phase2  (default 0.0 — frozen)
+          * identity_head     -> identity_head_phase2 / id_head_phase2
+                                                  (default 0.0 — frozen)
+          * pad_stem/pad_head -> pad_head_phase2  (default 5.00 — full send)
+
+        With backbone_phase2 = identity_head_phase2 = 0.0 the ID trunk
+        cannot move at all, so the Phase-1 identity result is preserved
+        exactly while PAD learns on its detached projector.
+
+        The subtle part: ``CosineAnnealingLR`` recomputes
+        ``group['lr']`` from its captured ``base_lrs`` every epoch, so
+        merely writing ``group['lr']`` is reverted on the next
+        ``scheduler.step()``. We therefore rewrite, for every affected
+        group i: the group's ``lr`` and ``initial_lr`` AND
+        ``base_lrs[i]`` of every sub-scheduler inside the SequentialLR.
+        Idempotent via a guard flag.
+        """
+        if getattr(self, "_phase2_lr_applied", False):
+            return
+
+        opt_cfg = self.cfg.get("optimizer", {}) or {}
+        m = opt_cfg.get("lr_multipliers", {}) or {}
+        base_lr = float(self.cfg.get("lr", 1e-4))
+
+        bb_p2 = float(m.get("backbone_phase2", 0.0))
+        # Accept both spellings; `identity_head_phase2` is the documented
+        # key, `id_head_phase2` is kept for back-compat with old configs.
+        id_p2 = float(
+            m.get("identity_head_phase2", m.get("id_head_phase2", 0.0))
+        )
+        pad_p2 = float(m.get("pad_head_phase2", 5.0))
+
+        # The identity Gabor stem and the ArcFace classifiers are part of
+        # the identity path — fold them into the backbone freeze group so
+        # backbone_phase2 = 0.0 is a TRUE absolute freeze (nothing on the
+        # identity side can drift while PAD trains).
+        phase2_mult = {
+            "gabor":          bb_p2,
+            "backbone_embed": bb_p2,
+            "backbone_early": bb_p2,
+            "backbone_late":  bb_p2,
+            "moe_experts":    bb_p2,
+            "arcface":        bb_p2,
+            "identity_head":  id_p2,
+            "pad_stem":       pad_p2,
+            "pad_head":       pad_p2,
+        }
+
+        optimizers = trainer.optimizers if trainer.optimizers else []
+        if not optimizers:
+            print("[phase2-lr] no optimizer found — skipping LR surgery")
+            return
+        optimizer = optimizers[0]
+
+        # Collect every LR scheduler object (unwrap SequentialLR).
+        sched_objs = []
+        for cfg in getattr(trainer, "lr_scheduler_configs", []):
+            s = cfg.scheduler
+            sched_objs.append(s)
+            sched_objs.extend(getattr(s, "_schedulers", []))
+
+        changes = []
+        for i, group in enumerate(optimizer.param_groups):
+            name = group.get("name", "")
+            if name not in phase2_mult:
+                continue
+            new_lr = base_lr * phase2_mult[name]
+            old_lr = group["lr"]
+            group["lr"] = new_lr
+            group["initial_lr"] = new_lr
+            for s in sched_objs:
+                bl = getattr(s, "base_lrs", None)
+                if bl is not None and i < len(bl):
+                    bl[i] = new_lr
+                ll = getattr(s, "_last_lr", None)
+                if ll is not None and i < len(ll):
+                    ll[i] = new_lr
+            changes.append(f"{name}: {old_lr:.2e} -> {new_lr:.2e}")
+
+        self._phase2_lr_applied = True
+        print("[phase2-lr] " + " | ".join(changes))
 
     def _arcface_loss(
         self,
@@ -592,7 +575,9 @@ class OMFRModule(L.LightningModule):
         id_parts  = self._identity_loss(id_out["mrl_embeddings"], identity_labels)
         l_orth    = self.orth_loss(pad_out["pad_embedding"], id_out["identity_embedding"])
         l_balance = sum(backbone_out["balance_losses"])
-        loss      = id_parts["total"] + self.beta * l_orth + self.gamma * l_balance
+        loss      = (id_parts["total"]
+                     + self.beta * l_orth
+                     + self.gamma * l_balance)
 
         self.log("train/identity_loss", id_parts["total"], prog_bar=True, sync_dist=True)
         self.log("train/id_arcface",    id_parts["arcface"],                sync_dist=True)
@@ -663,9 +648,14 @@ class OMFRModule(L.LightningModule):
         Adam's second-moment tracking (TASK_04).
 
         Forward structure:
-          1. Identity branch on id_batch — full grad to backbone + id head.
-          2. PAD branch on pad_batch — grad into pad_stem + pad_head only
-             (backbone stage1/2 still detached inside _run_pad).
+          1. Identity branch on id_batch — graph retained, but backbone
+             + identity head are frozen via LR=0 at the Phase-2 boundary
+             (apply_phase2_lr_multipliers), so identity weights do not
+             move; the branch only supplies the orthogonality target.
+          2. PAD branch on pad_batch — backbone forward under
+             ``torch.no_grad()`` (backbone_no_grad=True) to free VRAM,
+             and _run_pad hard-detaches every backbone tensor. PAD
+             gradient reaches ONLY gabor_pad + pad_stem + pad_head.
           3. Orth loss on matched subset of the two embedding sets.
           4. Optional sensor-adversarial via GRL on pad_features.
         """
@@ -680,12 +670,12 @@ class OMFRModule(L.LightningModule):
         pad_images, liveness_labels = self._unpack_pad_batch(pad_batch)
         sensor_labels = self._unpack_sensor_labels(pad_batch)
         material_labels = self._unpack_material_labels(pad_batch)
-        # Wrap TinyViT forward for the PAD branch in no_grad: the only
-        # gradient we would otherwise get here is a thin one into
-        # MoE gate_proj via `expert_weights_gateonly`, which the ID
-        # branch (above) is already driving. All other outputs are
-        # detached inside `_run_pad` anyway. Releases ~40% of Phase-2
-        # activation memory — the fix for the epoch-20 OOM jump.
+        # ABSOLUTE FREEZE: the PAD-branch backbone forward runs under
+        # torch.no_grad() so its activations are never retained — only
+        # ONE backbone graph (the identity branch) exists, which frees
+        # the VRAM the old two-graph un-chained scheme consumed. _run_pad
+        # additionally hard-detaches every backbone tensor, so even this
+        # graph-less forward cannot leak PAD gradient into the trunk.
         pad_backbone = self._run_backbone(pad_images, backbone_no_grad=True)
         pad_out      = self._run_pad(pad_backbone)
 
@@ -722,11 +712,13 @@ class OMFRModule(L.LightningModule):
 
         l_balance = 0.5 * (l_balance_id + l_balance_pad)
 
+        # No distillation / PCGrad: PAD is hard-detached from the trunk
+        # and the trunk + id head are LR-frozen, so id and pad gradients
+        # live in disjoint parameter sets and cannot conflict. Losses are
+        # simply summed.
         base_loss = self.beta * l_orth + self.gamma * l_balance
         pad_loss = self.alpha * (pad_parts["total"] + l_mixup) + self.alpha_adv * l_sensor
         loss = id_parts["total"] + pad_loss + base_loss
-
-        self._stash_pcgrad(id_parts["total"], pad_loss)
 
         self.log("train/identity_loss",  id_parts["total"], prog_bar=True, sync_dist=True)
         self.log("train/id_arcface",     id_parts["arcface"],                sync_dist=True)
@@ -848,9 +840,6 @@ class OMFRModule(L.LightningModule):
                 loss = loss + self.alpha_adv * l_sensor
                 self.log("train/pad_sensor_adv", l_sensor, sync_dist=True)
 
-        if id_parts is not None and pad_loss is not None:
-            self._stash_pcgrad(id_parts["total"], pad_loss)
-
         self.log("train/orth_loss",    l_orth,    sync_dist=True)
         self.log("train/balance_loss", l_balance, sync_dist=True)
         self.log(
@@ -864,6 +853,36 @@ class OMFRModule(L.LightningModule):
     # -------------------------------------------------------------------------
     # LightningModule interface
     # -------------------------------------------------------------------------
+
+    def _lock_identity_eval(self) -> None:
+        """Force the entire identity side into ``eval()`` for Phase 2.
+
+        LR=0 + ``.detach()`` freeze the *weights* of the identity trunk,
+        but FastViT (and any BatchNorm-bearing submodule) still mutates
+        ``running_mean`` / ``running_var`` on EVERY forward while in
+        ``train()`` mode. In Phase 2 the PAD batch flows through the
+        shared backbone, so those running stats get poisoned by spoof
+        data — identity validation then collapses even though no weight
+        moved ("BatchNorm Statistics Corruption").
+
+        Pinning the identity modules to ``eval()`` makes BN use its
+        frozen Phase-1 buffers and stop accumulating — a TRUE absolute
+        freeze. ``pad_stem`` / ``pad_head`` / ``gabor_pad`` /
+        ``sensor_adv_head`` are deliberately left in ``train()`` so the
+        PAD projector keeps learning (dropout/BN active).
+        """
+        self.backbone.eval()
+        self.identity_head.eval()
+        self.gabor.eval()
+        self.arcface_losses.eval()
+
+    def on_train_batch_start(self, batch: Any, batch_idx: int) -> None:
+        # Runs after Lightning's per-epoch ``model.train()`` and after any
+        # validation ``eval()`` toggle, so this is the last word before the
+        # training forward — guaranteeing the identity side is never in
+        # train mode during a Phase-2 step.
+        if self.current_phase == 2:
+            self._lock_identity_eval()
 
     def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
         if self.current_phase == 1:
@@ -903,21 +922,9 @@ class OMFRModule(L.LightningModule):
         # but every gradient ends up zero.
         if not torch.isfinite(loss):
             self.log("train/nonfinite_step", 1.0, prog_bar=True, sync_dist=True)
-            self._pcgrad_state = None
             anchor = next(p for p in self.parameters() if p.requires_grad)
             return anchor.sum() * 0.0
         return loss
-
-    def on_after_backward(self) -> None:
-        if not self._pcgrad_state:
-            return
-        params = self._pcgrad_state["params"]
-        grads = self._pcgrad_state["grads"]
-        for param, grad in zip(params, grads):
-            if grad is None:
-                continue
-            param.grad = grad
-        self._pcgrad_state = None
 
     # -------------------------------------------------------------------------
     # Checkpoint persistence for phase-schedule state
@@ -944,6 +951,7 @@ class OMFRModule(L.LightningModule):
             "lam_adv": float(self.lam_adv),
             "arcface": arc,
             "moe_temperatures": moe_temps,
+            "phase2_lr_applied": bool(self._phase2_lr_applied),
         }
 
     def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
@@ -951,6 +959,7 @@ class OMFRModule(L.LightningModule):
         if not st:
             return
         self.current_phase = int(st.get("current_phase", self.current_phase))
+        self._phase2_lr_applied = bool(st.get("phase2_lr_applied", False))
         self.alpha = float(st.get("alpha", self.alpha))
         self.beta  = float(st.get("beta",  self.beta))
         self.alpha_adv = float(st.get("alpha_adv", self.alpha_adv))
@@ -1043,6 +1052,23 @@ class OMFRModule(L.LightningModule):
         weight_decay  = float(self.cfg.get("weight_decay", 0.05))
         total_epochs  = int(  self.cfg.get("total_epochs", 60))
 
+        # Differential LR multipliers — read from config so configs are
+        # authoritative (previously hardcoded, which silently ignored the
+        # optimizer.lr_multipliers block). Defaults reproduce the prior
+        # hardcoded behavior exactly.
+        opt_cfg = self.cfg.get("optimizer", {}) or {}
+        m = opt_cfg.get("lr_multipliers", {}) or {}
+
+        def mul(key: str, default: float) -> float:
+            return float(m.get(key, default))
+
+        # pad_stem / pad_head share the "fast PAD branch" multiplier. The
+        # phase-1 vs phase-2 split is collapsed to pad_head_phase2 because
+        # configure_optimizers runs once at fit start (Phase 1) and Phase 1
+        # is identity-only (pad_head receives no gradient), so the higher
+        # multiplier is safe to apply from the start.
+        pad_fast_mul = mul("pad_head_phase2", mul("pad_head", 2.0))
+
         # MoE params need separate group — exclude from backbone groups
         moe_ids = {id(p) for p in self.backbone.get_moe_params()}
 
@@ -1061,7 +1087,7 @@ class OMFRModule(L.LightningModule):
             # Identity Gabor stem — low LR (only 16 params, stable)
             {
                 "params": list(self.gabor.parameters()),
-                "lr":     lr * 0.1,
+                "lr":     lr * mul("gabor", 0.1),
                 "name":   "gabor",
             },
             # PAD Gabor stem — starts from scratch (pore frequencies),
@@ -1069,67 +1095,67 @@ class OMFRModule(L.LightningModule):
             # the same number of epochs. Only 16 params.
             {
                 "params": list(self.gabor_pad.parameters()),
-                "lr":     lr * 1.0,
+                "lr":     lr * mul("gabor_pad", 1.0),
                 "name":   "gabor_pad",
             },
             # Patch embed — standard LR
             {
                 "params": list(self.backbone.get_embed_params()),
-                "lr":     lr,
+                "lr":     lr * mul("backbone_embed", 1.0),
                 "name":   "backbone_embed",
             },
-            # Backbone stages 0+1 (early, PAD-relevant) — standard LR
+            # Backbone stages 0+1 (early). Phase-1 LR here; at the
+            # Phase-2 boundary apply_phase2_lr_multipliers freezes this
+            # group (backbone_phase2 = 0.0) so PAD never perturbs it.
             {
                 "params": backbone_early,
-                "lr":     lr,
+                "lr":     lr * mul("backbone_early", mul("backbone", 1.0)),
                 "name":   "backbone_early",
             },
             # Backbone stages 2+3 (late, identity-relevant) — standard LR
             {
                 "params": backbone_late,
-                "lr":     lr,
+                "lr":     lr * mul("backbone_late", mul("backbone", 1.0)),
                 "name":   "backbone_late",
             },
-            # MoE experts + gates — 2x LR (newly initialized)
+            # MoE experts + gates — newly initialized, need to catch up
             {
                 "params": list(self.backbone.get_moe_params()),
-                "lr":     lr * 2.0,
+                "lr":     lr * mul("moe_experts", 2.0),
                 "name":   "moe_experts",
             },
             # Identity Head — standard LR
             {
                 "params": list(self.identity_head.parameters()),
-                "lr":     lr,
+                "lr":     lr * mul("identity_head", 1.0),
                 "name":   "identity_head",
             },
-            # Dedicated PAD stem — always 2x. The previous conditional
-            # (2x only in Phase 2) was a bug: configure_optimizers runs
-            # once at fit start when current_phase is still 1, so the
-            # 2x multiplier never actually applied. Pinning to 2x keeps
-            # the PAD extractor converging fast throughout training.
+            # Dedicated PAD stem — fast PAD-branch multiplier.
             {
                 "params": list(self.pad_stem.parameters()),
-                "lr":     lr * 2.0,
+                "lr":     lr * pad_fast_mul,
                 "name":   "pad_stem",
             },
-            # PAD Head — always 2x (same reasoning as pad_stem).
+            # PAD Head (non-linear projector) — fast PAD-branch multiplier
+            # (pad_head_phase2). The extra MLP capacity + high LR lets PAD
+            # learn spoof material fast WITHOUT dragging the backbone.
             {
                 "params": list(self.pad_head.parameters()),
-                "lr":     lr * 2.0,
+                "lr":     lr * pad_fast_mul,
                 "name":   "pad_head",
             },
             # ArcFace classifiers — 1x LR (reduced from 10x to prevent gradient explosion)
             {
                 "params": [p for af in self.arcface_losses.values()
                            for p in af.parameters()],
-                "lr":     lr * 1.0,
+                "lr":     lr * mul("arcface", 1.0),
                 "name":   "arcface",
             },
             # Sensor adversarial head — standard LR; trained normally while
             # the GRL flips grad into pad_features.
             {
                 "params": list(self.sensor_adv_head.parameters()),
-                "lr":     lr,
+                "lr":     lr * mul("sensor_adv_head", 1.0),
                 "name":   "sensor_adv_head",
             },
         ]

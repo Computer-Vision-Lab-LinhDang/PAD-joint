@@ -1,0 +1,210 @@
+# configs/grand_fusion_sa24_dynamic.yaml
+# ════════════════════════════════════════════════════════════════════
+# OMFR — FastViT-SA24 | DYNAMIC 2-phase multi-task
+#
+#   Phase 1  Identity foundation. Runs until `val/cascaded_IM` plateaus
+#            (patience=5) OR phase1_max_epochs (80). Never stops.
+#   Phase 2  "Đóng Băng Tuyệt Đối" — PAD is HARD-detached from the
+#            backbone (no gradient to the trunk at all) and the entire
+#            identity side (Gabor + backbone + MoE + id-head + ArcFace)
+#            is frozen via LR=0. Only the gabor_pad -> pad_stem ->
+#            pad_head projector learns. No distillation, no PCGrad.
+#
+#   On the dynamic transition: loader swap -> LR surgery
+#   (identity side x0.0, pad x5.0).
+#
+#   Checkpoints: best_phase1.ckpt (Phase-1 anchor / resume point) and
+#   best_phase2.ckpt (deployable) are tracked SEPARATELY per phase.
+# ════════════════════════════════════════════════════════════════════
+
+backbone:
+  name: fastvit_sa24            # ~20.6M — more capacity for 256-D MRL
+  pretrained: true
+  in_chans: 8
+  num_experts: 4
+  top_k: 2
+  grad_checkpoint: true          # mandatory: 2 backbone graphs in Phase 2
+
+gabor:
+  n_orientations: 8
+  kernel_size: 31
+  init_frequency: 0.12
+
+identity_head:
+  embed_dim: 256
+  num_heads: 8
+  grid_size: 14
+  num_queries: 4
+  stage3_dim: 256
+  stage4_dim: 512
+  mrl_dims: [64, 128, 256]
+  num_classes: 5000              # auto-detected at runtime
+
+pad_head:
+  stage1_dim: 64
+  stage2_dim: 128
+  dropout: 0.1
+  proj_dropout: 0.2              # dropout inside the MLP projector
+  num_classes: 1
+  pad_features_dim: 128
+  pad_embedding_dim: 32
+
+losses:
+  arcface:
+    margin: 0.5
+    scale_phase1: 32.0
+    scale_final: 48.0
+    easy_margin: false
+    label_smoothing: 0.1
+  supcon:
+    temperature: 0.07
+    contrast_mode: all
+    base_temperature: 0.07
+  orthogonality:
+    eps: 1.0e-08
+  alpha: 0.0
+  beta: 0.0
+  gamma: 0.05
+  balancing_loss_weight: 0.005
+  pad_bce_weight: 0.5
+  pad_focal_alpha: 0.5
+  pad_focal_gamma: 1.0
+  pad_focal_weight: 1.0
+  pad_hard_spoof_sensor_ids: [6]
+  pad_hard_spoof_material_ids: [4, 6, 7]
+  pad_hard_spoof_weight: 2.0
+  pad_ohem_fraction: 0.25
+  pad_ohem_weight: 1.5
+  identity_supcon_weight: 0.9
+  identity_arcface_weight: 0.1
+  identity_label_smoothing: 0.1
+
+# ─────────────────────────────────────────────────────────────────
+# Optimizer — Phase-1 base x1.0; Phase-2 surgery applies the *_phase2
+# multipliers (relative to base lr) at the dynamic transition.
+# ─────────────────────────────────────────────────────────────────
+optimizer:
+  name: AdamW
+  lr: 1.0e-4
+  weight_decay: 0.05
+  betas: [0.9, 0.999]
+  lr_multipliers:
+    # Phase-1 effective multipliers
+    gabor: 0.1
+    gabor_pad: 1.0
+    backbone_embed: 1.0
+    backbone_early: 1.0
+    backbone_late: 1.0
+    moe_experts: 2.0
+    identity_head: 1.0
+    arcface: 0.1
+    sensor_adv_head: 1.0
+    # Phase-2 surgery targets (relative to base lr) — ABSOLUTE FREEZE
+    backbone_phase2: 0.0         # freeze the shared trunk completely
+    identity_head_phase2: 0.0    # freeze the identity head completely
+    pad_head_phase2: 5.0         # full send for the MLP PAD projector
+
+scheduler:
+  name: CosineAnnealingLR
+  T_max: 120
+  eta_min: 1.0e-06
+
+# ─────────────────────────────────────────────────────────────────
+# DYNAMIC phases (no fixed Phase-1 length, no Phase 3)
+# ─────────────────────────────────────────────────────────────────
+phases:
+  phase1_max_epochs: 80          # hard cap on Phase 1
+  phase2_epochs: 40              # Phase 2 length once triggered
+  total_epochs: 120              # = max possible (80 + 40); cosine T_max
+  patience: 5                    # plateau patience on val/cascaded_IM
+  phase1_warmup_delay: 5
+  phase1_warmup_epochs: 10
+  arcface_scale_init: 1.0
+  arcface_margin_init: 0.0
+  arcface_margin_target: 0.5
+  warmup_epochs: 5               # Phase-2 alpha/beta ramp length
+  alpha_target: 1.0
+  beta_target: 0.02
+  alpha_adv_target: 0.0
+  arcface_scale_start: 32.0
+  arcface_scale_end: 48.0
+  moe_temp_phase1: 2.0
+  moe_temp_phase2_end: 1.0
+
+callbacks:
+  dynamic_phase:
+    monitor: val/cascaded_IM
+    mode: max
+    patience: 5
+    min_delta: 1.0e-4
+  early_stopping:
+    enabled: false               # never stop — we transition instead
+  swa:
+    enabled: false
+
+data:
+  # ── DATA CHUẨN: FVC + NIST (required root) ──
+  identity_data_root: /home/linhdang/workspace2/FVC_Processed_Train
+  pad_data_root: /home/linhdang/workspace2/PAD-joint
+  joint_data_root: ""
+  identity_datasets: [nist_sd300, fvc2000_db1_a, fvc2002_db1_a, fvc2004_db1_a]
+  # + style-transferred LivDet (HF: tourmii/style-transfered-20{13,15}).
+  # Run `python prepare_hf_pad.py` first so the dirs exist; the
+  # datamodule resolves these names to PAD-joint/StyleTransfer20{13,15}.
+  pad_datasets: [LivDet2013, LivDet2015, StyleTransfer2013, StyleTransfer2015]
+  joint_datasets: []
+  image_size: 224
+  grayscale: true
+  group_by_subject: true
+  # Data-centric ID rebalance: force every identity batch to be
+  # FVC/NIST class-balanced (NIST has ~70× more classes than FVC, so a
+  # plain PKSampler made the 24M net overfit NIST and ignore FVC).
+  balanced_identity_groups: true
+  identity_fvc_ratio: 0.5        # 50/50 FVC:NIST classes per batch
+  pk_p: 16
+  pk_k: 2
+  pad_batch_size: 32             # safe on 11GiB (PAD backbone is no-grad now; can raise)
+  identity_num_views: 2
+  identity_preset: fingerprint_hard
+  num_workers: 8
+  pin_memory: true
+  val_split: 0.1
+
+trainer:
+  accelerator: gpu
+  devices: 1
+  precision: 16-mixed
+  max_epochs: 120
+  gradient_clip_val: 0.5
+  accumulate_grad_batches: 4     # effective batch ~ 256
+  log_every_n_steps: 10
+  check_val_every_n_epoch: 1
+  enable_progress_bar: true
+  deterministic: false
+
+checkpoint:
+  dirpath: checkpoints_sa24_dynamic/
+  monitor: val/cascaded_IM
+  mode: max
+
+logging:
+  name: omfr_sa24_dynamic
+  save_dir: logs/
+  version: null
+  wandb:
+    enabled: true
+    project: omfr
+    name: sa24_dynamic
+    log_model: false
+
+evaluation:
+  pad_threshold: 0.5
+  far: 1.0e-4
+  cmc_max_rank: 10
+  mrl_eval_dims: [64, 128, 256]
+
+export:
+  output_dir: exports/
+  onnx_opset: 17
+  input_shape: [1, 1, 224, 224]
+  simplify: true

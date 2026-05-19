@@ -54,6 +54,45 @@ class PhaseAwareEarlyStopping(EarlyStopping):
         super()._run_early_stopping_check(trainer)
 
 
+class PhaseGatedModelCheckpoint(ModelCheckpoint):
+    """ModelCheckpoint that only tracks/saves during ONE training phase.
+
+    Fixes the "tricked checkpoint" bug: a single checkpoint monitoring
+    `val/cascaded_IM` kept a Phase-1 epoch (PAD untrained) as global
+    best, so eval EER was ~50%. Two gated instances give a clean
+    `best_phase1` (identity teacher source) and `best_phase2` (the
+    deployable joint model) — each best-tracked only within its phase.
+    """
+
+    def __init__(self, phase_tag: int, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.omfr_phase_tag = int(phase_tag)
+
+    @property
+    def state_key(self) -> str:
+        # Two instances coexist (phase 1 & 2). Lightning requires a
+        # unique state_key per stateful callback, otherwise it raises
+        # "Found more than one stateful callback of type ...". Tag the
+        # base ModelCheckpoint state_key with the phase so checkpoint
+        # callback state round-trips correctly on resume.
+        return self._generate_state_key(
+            monitor=self.monitor,
+            mode=self.mode,
+            omfr_phase_tag=self.omfr_phase_tag,
+        )
+
+    def _in_phase(self, trainer: L.Trainer) -> bool:
+        pl = getattr(trainer, "lightning_module", None)
+        return int(getattr(pl, "current_phase", 1)) == self.omfr_phase_tag
+
+    def on_validation_end(self, trainer: L.Trainer, pl_module: Any) -> None:
+        # Skip entirely (incl. monitor/best bookkeeping) outside the
+        # target phase, so best is chosen only among in-phase epochs.
+        if not self._in_phase(trainer):
+            return
+        super().on_validation_end(trainer, pl_module)
+
+
 class FreshStartSWA(StochasticWeightAveraging):
     """
     Resume the trainer/optimizer state from a checkpoint, but start SWA fresh.
@@ -209,24 +248,33 @@ def build_callbacks(config: Dict[str, Any]) -> list:
     tr_cfg    = config.get("trainer", {})
     cb_cfg    = config.get("callbacks", {})
 
+    plateau_cfg = (
+        cb_cfg.get("dynamic_phase", {}) if isinstance(cb_cfg, dict) else {}
+    )
     phase_scheduler = PhaseSchedulerCallback(
-        phase1_epochs=phase_cfg.get("phase1_epochs", 50),
-        phase2_epochs=phase_cfg.get("phase2_epochs", 50),
-        phase3_epochs=phase_cfg.get("phase3_epochs", 30),
+        phase1_max_epochs=phase_cfg.get(
+            "phase1_max_epochs", phase_cfg.get("phase1_epochs", 80)
+        ),
+        phase2_epochs=phase_cfg.get("phase2_epochs", 40),
+        plateau_patience=plateau_cfg.get(
+            "patience", phase_cfg.get("patience", 5)
+        ),
+        plateau_monitor=plateau_cfg.get("monitor", "val/cascaded_IM"),
+        plateau_mode=plateau_cfg.get("mode", "max"),
+        plateau_min_delta=float(plateau_cfg.get("min_delta", 1.0e-4)),
         warmup_epochs=phase_cfg.get("warmup_epochs", 5),
         phase1_warmup_epochs=phase_cfg.get("phase1_warmup_epochs", 5),
         phase1_warmup_delay=phase_cfg.get("phase1_warmup_delay", 5),
         alpha_target=phase_cfg.get("alpha_target", 1.0),
-        beta_target=phase_cfg.get("beta_target", 0.05),
-        alpha_adv_target=phase_cfg.get("alpha_adv_target", 0.1),
+        beta_target=phase_cfg.get("beta_target", 0.02),
+        alpha_adv_target=phase_cfg.get("alpha_adv_target", 0.0),
         arcface_scale_init=phase_cfg.get("arcface_scale_init", 1.0),
         arcface_scale_start=phase_cfg.get("arcface_scale_start", 32.0),
-        arcface_scale_end=phase_cfg.get("arcface_scale_end", 64.0),
-        arcface_margin_init=phase_cfg.get("arcface_margin_init", 0.2),
-        arcface_margin_target=phase_cfg.get("arcface_margin_target", 0.45),
+        arcface_scale_end=phase_cfg.get("arcface_scale_end", 48.0),
+        arcface_margin_init=phase_cfg.get("arcface_margin_init", 0.0),
+        arcface_margin_target=phase_cfg.get("arcface_margin_target", 0.5),
         moe_temp_phase1=phase_cfg.get("moe_temp_phase1", 2.0),
         moe_temp_phase2_end=phase_cfg.get("moe_temp_phase2_end", 1.0),
-        moe_temp_phase3_end=phase_cfg.get("moe_temp_phase3_end", 0.8),
     )
 
     gradient_monitor = GradientMonitor(log_every_n_steps=50)
@@ -249,16 +297,39 @@ def build_callbacks(config: Dict[str, Any]) -> list:
     if early_stop is not None:
         callbacks.insert(2, early_stop)
     if tr_cfg.get("enable_checkpointing", True):
-        callbacks.insert(2, ModelCheckpoint(
-            dirpath=ckpt_cfg.get("dirpath", "checkpoints/"),
-            filename=ckpt_cfg.get(
-                "filename", "omfr-{epoch:03d}-{val/cascaded_IM:.4f}"
-            ),
-            monitor=ckpt_cfg.get("monitor", "val/cascaded_IM"),
-            mode=ckpt_cfg.get("mode", "max"),
-            save_top_k=ckpt_cfg.get("save_top_k", 3),
-            save_last=ckpt_cfg.get("save_last", True),
-        ))
+        dirpath = ckpt_cfg.get("dirpath", "checkpoints/")
+        monitor = ckpt_cfg.get("monitor", "val/cascaded_IM")
+        mode    = ckpt_cfg.get("mode", "max")
+        # Phase-1 best — fixed filename so the teacher path is stable.
+        ckpt_phase1 = PhaseGatedModelCheckpoint(
+            phase_tag=1,
+            dirpath=dirpath,
+            filename="best_phase1",
+            monitor=monitor,
+            mode=mode,
+            save_top_k=1,
+            save_last=False,
+        )
+        # Phase-2 best — the deployable joint model (PAD trained).
+        ckpt_phase2 = PhaseGatedModelCheckpoint(
+            phase_tag=2,
+            dirpath=dirpath,
+            filename="best_phase2",
+            monitor=monitor,
+            mode=mode,
+            save_top_k=1,
+            save_last=False,
+        )
+        # Phase-agnostic rolling `last.ckpt` for crash/resume safety.
+        ckpt_last = ModelCheckpoint(
+            dirpath=dirpath,
+            filename="omfr-{epoch:03d}",
+            save_top_k=0,
+            save_last=True,
+        )
+        callbacks.insert(2, ckpt_phase1)
+        callbacks.insert(3, ckpt_phase2)
+        callbacks.insert(4, ckpt_last)
 
     swa_cfg = cb_cfg.get("swa", {}) if isinstance(cb_cfg, dict) else {}
     if swa_cfg.get("enabled", False):

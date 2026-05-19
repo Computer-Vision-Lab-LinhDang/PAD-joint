@@ -280,6 +280,13 @@ class IdentityHead(nn.Module):
         pooled = self.attn_pool(tokens)                           # (B, 256)
         pooled = self.final_norm(pooled)
 
+        # Pre-L2norm representation Z. Exposed for Feature Distillation:
+        # MSE on the *normalized* embedding collapses to ~1e-4 (every
+        # vector lies on the unit sphere), so the distillation signal
+        # vanishes. The pre-norm `identity_feat` keeps real magnitude,
+        # giving L_distill a meaningful gradient when lambda is large.
+        identity_feat = pooled                                    # (B, 256)
+
         # L2 normalize for identity embedding
         identity_embedding = F.normalize(pooled, p=2, dim=-1)     # (B, 256)
 
@@ -292,6 +299,7 @@ class IdentityHead(nn.Module):
 
         return {
             'identity_embedding': identity_embedding,
+            'identity_feat': identity_feat,
             'mrl_embeddings': mrl_embeddings,
         }
 

@@ -34,6 +34,7 @@ from torch.utils.data import DataLoader
 
 from omfr.data.samplers.pk_sampler import PKSampler
 from omfr.data.samplers.balanced_pad_sampler import BalancedPADSampler
+from omfr.data.samplers.group_balanced_pk_sampler import GroupBalancedPKSampler
 
 
 class OMFRDataModule(L.LightningDataModule):
@@ -159,10 +160,7 @@ class OMFRDataModule(L.LightningDataModule):
         if phase == 1:
             assert self.identity_ds is not None, \
                 "identity_ds not loaded — check identity_root in config"
-            sampler = PKSampler(
-                labels=self.identity_ds.get_labels(),
-                P=P, K=K,
-            )
+            sampler = self._make_identity_sampler(P, K)
             return DataLoader(
                 self.identity_ds,
                 batch_sampler=sampler,
@@ -174,9 +172,7 @@ class OMFRDataModule(L.LightningDataModule):
             assert self.identity_ds is not None and self.pad_ds is not None, \
                 "identity_ds and pad_ds required for Phase 2"
             workers_each = 0 if num_workers == 0 else max(num_workers // 2, 1)
-            id_sampler  = PKSampler(
-                labels=self.identity_ds.get_labels(), P=P, K=K,
-            )
+            id_sampler  = self._make_identity_sampler(P, K)
             pad_sampler = BalancedPADSampler(
                 liveness_labels=self.pad_ds.get_liveness_labels(),
                 batch_size=pad_bs,
@@ -201,9 +197,7 @@ class OMFRDataModule(L.LightningDataModule):
             loaders = {}
 
             if self.identity_ds is not None:
-                id_sampler = PKSampler(
-                    labels=self.identity_ds.get_labels(), P=P, K=K,
-                )
+                id_sampler = self._make_identity_sampler(P, K)
                 loaders["identity"] = DataLoader(
                     self.identity_ds,
                     batch_sampler=id_sampler,
@@ -266,6 +260,33 @@ class OMFRDataModule(L.LightningDataModule):
     # ─────────────────────────────────────────────────────────────────────────
     # Helpers
     # ─────────────────────────────────────────────────────────────────────────
+
+    def _make_identity_sampler(self, P: int, K: int):
+        """PKSampler, or GroupBalancedPKSampler when FVC/NIST rebalancing
+        is enabled and the identity set actually spans >1 group.
+
+        Keeps every batch FVC/NIST-balanced so the 24M backbone stops
+        overfitting the (≈70× larger) NIST class pool.
+        """
+        labels = self.identity_ds.get_labels()
+        use_balanced = bool(self._cfg_get(
+            "balanced_identity_groups",
+            "data.balanced_identity_groups",
+            default=False,
+        ))
+        if use_balanced and hasattr(self.identity_ds, "get_groups"):
+            groups = self.identity_ds.get_groups()
+            if len(set(groups)) > 1:
+                fvc_ratio = float(self._cfg_get(
+                    "identity_fvc_ratio",
+                    "data.identity_fvc_ratio",
+                    default=0.5,
+                ))
+                return GroupBalancedPKSampler(
+                    labels=labels, groups=groups,
+                    P=P, K=K, fvc_ratio=fvc_ratio,
+                )
+        return PKSampler(labels=labels, P=P, K=K)
 
     def _current_phase(self) -> int:
         """Read current training phase from the Lightning module."""

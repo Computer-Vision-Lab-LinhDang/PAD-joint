@@ -1,73 +1,74 @@
 """
-phase_scheduler.py — PhaseSchedulerCallback
+phase_scheduler.py — PhaseSchedulerCallback (DYNAMIC STATE MACHINE)
 
-Manages transitions between OMFR training phases and ramps loss weights.
+Two-phase dynamic schedule (no fixed Phase-1 length, no Phase 3):
 
-Phase schedule (default):
-    Phase 1: epochs 0-19  (identity foundation)
-    Phase 2: epochs 20-39 (PAD integration, joint batches via TASK_04)
-    Phase 3: epochs 40-59 (joint refinement)
+    Phase 1  — identity foundation. Runs UNTIL EITHER:
+                 * `val/cascaded_IM` has not improved for `plateau_patience`
+                   validation rounds (min_delta gated), OR
+                 * `phase1_max_epochs` reached (hard cap, default 80).
+               Training NEVER stops — it transitions to Phase 2.
 
-Phase 1 warmup (CRITICAL for stability):
-    ArcFace scale: configured init -> start value (prevents gradient explosion)
-    Warmup over first `phase1_warmup_epochs` epochs, after optional delay.
+    Phase 2  — PAD on a fully detached projector, identity side frozen
+               ("Đóng Băng Tuyệt Đối"). Lasts `phase2_epochs`. On the
+               transition epoch (a Lightning epoch-start hook, OUTSIDE
+               the autograd region) we, in order:
+                 1. swap identity-only loader -> combined id+pad loader,
+                 2. hard re-scale the optimizer LR groups
+                    (entire identity side -> 0.0, PAD unleashed),
+                 3. start the alpha/beta/arcface ramps anchored at the
+                    dynamic transition epoch.
 
-Phase 2 ramps (TASK_04 — cosine soft-start):
-    alpha:       0.01 * target -> target over first 5 epochs of Phase 2
-    beta:        0.01 * target -> target (target = 0.05 after TASK_02 re-norm)
-    alpha_adv:   0 -> target over the FULL Phase 2 (DANN-style slow ramp)
-    lam_adv:     sigmoid schedule 2/(1+exp(-10p)) - 1 over full Phase 2
-    ArcFace s:   configured start -> configured end
-
-ArcFace margin:
-    Continuous schedule over all phases: 0.2 -> 0.45 by final epoch.
-
-MoE temperature:
-    Phase 1: 2.0 (soft routing, exploration)
-    Phase 2: 2.0 -> 1.0 (gradual sharpening)
-    Phase 3: 1.0 -> 0.8 (conservative sharpening)
+Phase 1 ArcFace warmup is unchanged (scale init -> start after a delay).
 """
 
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, Optional
 
 import lightning as L
 
 
 class PhaseSchedulerCallback(L.Callback):
-    """
-    Controls phase transitions, loss-weight ramps, and dataloader switching.
-    """
+    """Dynamic phase-transition + loss-weight ramps + loader switching."""
 
     def __init__(
         self,
-        phase1_epochs: int = 20,
-        phase2_epochs: int = 20,
-        phase3_epochs: int = 20,
+        phase1_max_epochs: int = 80,
+        phase2_epochs: int = 40,
+        plateau_patience: int = 5,
+        plateau_monitor: str = "val/cascaded_IM",
+        plateau_mode: str = "max",
+        plateau_min_delta: float = 1.0e-4,
         warmup_epochs: int = 5,
         phase1_warmup_epochs: int = 5,
         phase1_warmup_delay: int = 5,
         alpha_target: float = 1.0,
-        beta_target: float = 0.05,
-        alpha_adv_target: float = 0.1,
+        beta_target: float = 0.02,
+        alpha_adv_target: float = 0.0,
         arcface_scale_init: float = 1.0,
         arcface_scale_start: float = 32.0,
-        arcface_scale_end: float = 64.0,
-        arcface_margin_init: float = 0.2,
-        arcface_margin_target: float = 0.45,
+        arcface_scale_end: float = 48.0,
+        arcface_margin_init: float = 0.0,
+        arcface_margin_target: float = 0.5,
         moe_temp_phase1: float = 2.0,
         moe_temp_phase2_end: float = 1.0,
-        moe_temp_phase3_end: float = 0.8,
+        # legacy/back-compat kwargs (ignored by the dynamic machine)
+        phase1_epochs: Optional[int] = None,
+        phase3_epochs: Optional[int] = None,
+        moe_temp_phase3_end: Optional[float] = None,
     ) -> None:
         super().__init__()
-        self.phase1_epochs = phase1_epochs
-        self.phase2_epochs = phase2_epochs
-        self.phase3_epochs = phase3_epochs
-        self.warmup_epochs = warmup_epochs
-        self.phase1_warmup_epochs = phase1_warmup_epochs
-        self.phase1_warmup_delay = phase1_warmup_delay
+        self.phase1_max_epochs = int(phase1_max_epochs)
+        self.phase2_epochs = int(phase2_epochs)
+        self.plateau_patience = int(plateau_patience)
+        self.plateau_monitor = str(plateau_monitor)
+        self.plateau_mode = str(plateau_mode)
+        self.plateau_min_delta = float(plateau_min_delta)
+        self.warmup_epochs = int(warmup_epochs)
+        self.phase1_warmup_epochs = int(phase1_warmup_epochs)
+        self.phase1_warmup_delay = int(phase1_warmup_delay)
         self.alpha_target = alpha_target
         self.beta_target = beta_target
         self.alpha_adv_target = alpha_adv_target
@@ -78,25 +79,23 @@ class PhaseSchedulerCallback(L.Callback):
         self.arcface_margin_target = arcface_margin_target
         self.moe_temp_phase1 = moe_temp_phase1
         self.moe_temp_phase2_end = moe_temp_phase2_end
-        self.moe_temp_phase3_end = moe_temp_phase3_end
 
-        self._phase2_start = phase1_epochs
-        self._phase3_start = phase1_epochs + phase2_epochs
-        self._total_phase_epochs = phase1_epochs + phase2_epochs + phase3_epochs
+        # Dynamic state
+        self._best: Optional[float] = None
+        self._no_improve: int = 0
+        self._pending_phase2: bool = False
+        self._phase2_started: bool = False
+        self._phase2_start: int = self.phase1_max_epochs   # dynamic anchor
+        self._total_phase_epochs = self.phase1_max_epochs + self.phase2_epochs
 
     # ------------------------------------------------------------------
-    # Ramp helper
+    # Ramp helpers
     # ------------------------------------------------------------------
 
     @staticmethod
     def _cosine_ramp(
-        epoch: int,
-        start: int,
-        end: int,
-        target: float,
-        min_frac: float = 0.01,
+        epoch: int, start: int, end: int, target: float, min_frac: float = 0.01,
     ) -> float:
-        """Cosine ramp from min_frac*target (epoch=start) to target (epoch>=end)."""
         if epoch < start:
             return 0.0
         if epoch >= end:
@@ -107,7 +106,6 @@ class PhaseSchedulerCallback(L.Callback):
 
     @staticmethod
     def _dann_lambda(epoch: int, start: int, end: int) -> float:
-        """DANN schedule lam(p) = 2/(1+exp(-10p)) - 1, p in [0, 1]."""
         if epoch < start:
             return 0.0
         if epoch >= end:
@@ -116,7 +114,6 @@ class PhaseSchedulerCallback(L.Callback):
         return 2.0 / (1.0 + math.exp(-10.0 * p)) - 1.0
 
     def _arcface_margin_for_epoch(self, epoch: int) -> float:
-        """Linear margin schedule across the full three-phase run."""
         p = min(max(epoch, 0) / max(self._total_phase_epochs - 1, 1), 1.0)
         return self.arcface_margin_init + p * (
             self.arcface_margin_target - self.arcface_margin_init
@@ -127,31 +124,84 @@ class PhaseSchedulerCallback(L.Callback):
         for af_loss in pl_module.arcface_losses.values():
             af_loss.set_margin(margin)
 
+    @staticmethod
+    def _set_moe_temperature(pl_module: Any, temperature: float) -> None:
+        if hasattr(pl_module, "backbone") and hasattr(
+            pl_module.backbone, "set_moe_temperature"
+        ):
+            pl_module.backbone.set_moe_temperature(temperature)
+
     # ------------------------------------------------------------------
-    # Lightning callback hooks
+    # Plateau tracking (Phase 1 only)
     # ------------------------------------------------------------------
 
-    def on_train_epoch_start(
-        self,
-        trainer: L.Trainer,
-        pl_module: Any,
-    ) -> None:
+    def _is_improvement(self, value: float) -> bool:
+        if self._best is None:
+            return True
+        if self.plateau_mode == "max":
+            return value > self._best + self.plateau_min_delta
+        return value < self._best - self.plateau_min_delta
+
+    def on_validation_epoch_end(self, trainer: L.Trainer, pl_module: Any) -> None:
+        # Skip the pre-train sanity validation and anything past Phase 1.
+        if trainer.sanity_checking:
+            return
+        if getattr(pl_module, "current_phase", 1) != 1 or self._phase2_started:
+            return
+
+        metric = trainer.callback_metrics.get(self.plateau_monitor)
+        if metric is None:
+            return
+        value = float(metric)
+
+        if self._is_improvement(value):
+            self._best = value
+            self._no_improve = 0
+        else:
+            self._no_improve += 1
+
         epoch = trainer.current_epoch
+        plateaued = self._no_improve >= self.plateau_patience
+        capped = (epoch + 1) >= self.phase1_max_epochs
+        if plateaued or capped:
+            self._pending_phase2 = True
+            reason = "plateau" if plateaued else "max-epochs cap"
+            print(
+                f"\n[phase-sm] Phase-2 ARMED at epoch {epoch} "
+                f"({reason}); best {self.plateau_monitor}={self._best:.4f}, "
+                f"no_improve={self._no_improve}/{self.plateau_patience}"
+            )
+
+        trainer.logger.log_metrics(
+            {
+                "phase/p1_best_metric": self._best if self._best is not None else 0.0,
+                "phase/p1_no_improve": float(self._no_improve),
+            },
+            step=trainer.global_step,
+        )
+
+    # ------------------------------------------------------------------
+    # Epoch-start: transitions + ramps
+    # ------------------------------------------------------------------
+
+    def on_train_epoch_start(self, trainer: L.Trainer, pl_module: Any) -> None:
+        epoch = trainer.current_epoch
+
+        # Fire the dynamic transition (idempotent).
+        if (
+            getattr(pl_module, "current_phase", 1) == 1
+            and not self._phase2_started
+            and (self._pending_phase2 or epoch >= self.phase1_max_epochs)
+        ):
+            self._transition_to_phase2(pl_module, trainer)
+
         arcface_margin = self._arcface_margin_for_epoch(epoch)
 
-        # Phase transitions
-        if epoch == self._phase2_start:
-            self._transition_to_phase2(pl_module, trainer)
-        elif epoch == self._phase3_start:
-            self._transition_to_phase3(pl_module, trainer)
-
-        # Phase 1: ArcFace warmup + MoE temp
         if pl_module.current_phase == 1:
             delay = max(self.phase1_warmup_delay, 0)
             effective_epoch = max(epoch - delay, 0)
-            p1_progress = min(effective_epoch / max(self.phase1_warmup_epochs, 1), 1.0)
-
-            scale = self.arcface_scale_init + p1_progress * (
+            p1 = min(effective_epoch / max(self.phase1_warmup_epochs, 1), 1.0)
+            scale = self.arcface_scale_init + p1 * (
                 self.arcface_scale_start - self.arcface_scale_init
             )
             for af_loss in pl_module.arcface_losses.values():
@@ -162,7 +212,6 @@ class PhaseSchedulerCallback(L.Callback):
             pl_module.beta = 0.0
             pl_module.alpha_adv = 0.0
             pl_module.lam_adv = 0.0
-
             self._set_moe_temperature(pl_module, self.moe_temp_phase1)
 
             trainer.logger.log_metrics(
@@ -175,29 +224,24 @@ class PhaseSchedulerCallback(L.Callback):
                 step=trainer.global_step,
             )
 
-        # Phase 2: cosine soft-start on alpha/beta (5-epoch ramp),
-        # sigmoid DANN ramp on lam_adv over full Phase 2, cosine ramp
-        # on alpha_adv over full Phase 2.
-        if pl_module.current_phase == 2:
-            phase2_start = self._phase2_start
-            phase2_end   = self._phase2_start + self.phase2_epochs
-            ramp_end_short = min(phase2_start + 5, phase2_end)
+        elif pl_module.current_phase == 2:
+            p2_start = self._phase2_start
+            p2_end = self._phase2_start + self.phase2_epochs
+            ramp_end_short = min(p2_start + self.warmup_epochs, p2_end)
 
             pl_module.alpha = self._cosine_ramp(
-                epoch, phase2_start, ramp_end_short, self.alpha_target,
+                epoch, p2_start, ramp_end_short, self.alpha_target,
             )
             pl_module.beta = self._cosine_ramp(
-                epoch, phase2_start, ramp_end_short, self.beta_target,
+                epoch, p2_start, ramp_end_short, self.beta_target,
             )
             pl_module.alpha_adv = self._cosine_ramp(
-                epoch, phase2_start, phase2_end, self.alpha_adv_target,
+                epoch, p2_start, p2_end, self.alpha_adv_target,
             )
-            pl_module.lam_adv = self._dann_lambda(epoch, phase2_start, phase2_end)
+            pl_module.lam_adv = self._dann_lambda(epoch, p2_start, p2_end)
 
-            # ArcFace scale: 32 -> 64 over the short warmup too (tied to
-            # identity stability). Safer than stretching it over full P2.
             scale_progress = self._cosine_ramp(
-                epoch, phase2_start, ramp_end_short, 1.0, min_frac=0.0,
+                epoch, p2_start, ramp_end_short, 1.0, min_frac=0.0,
             )
             new_scale = self.arcface_scale_start + scale_progress * (
                 self.arcface_scale_end - self.arcface_scale_start
@@ -206,12 +250,10 @@ class PhaseSchedulerCallback(L.Callback):
                 af_loss.set_scale(new_scale)
             self._set_arcface_margin(pl_module, arcface_margin)
 
-            # MoE temperature: linear 2.0 -> 1.0 across Phase 2
-            p2_progress = min(
-                (epoch - phase2_start) / max(self.phase2_epochs - 1, 1),
-                1.0,
+            p2p = min(
+                (epoch - p2_start) / max(self.phase2_epochs - 1, 1), 1.0,
             )
-            moe_temp = self.moe_temp_phase1 + p2_progress * (
+            moe_temp = self.moe_temp_phase1 + p2p * (
                 self.moe_temp_phase2_end - self.moe_temp_phase1
             )
             self._set_moe_temperature(pl_module, moe_temp)
@@ -230,54 +272,21 @@ class PhaseSchedulerCallback(L.Callback):
                 step=trainer.global_step,
             )
 
-        # Phase 3: everything at target, only MoE temp keeps decaying.
-        if pl_module.current_phase == 3:
-            phase3_epoch = epoch - self._phase3_start
-            phase3_progress = min(phase3_epoch / max(self.phase3_epochs - 1, 1), 1.0)
-
-            pl_module.alpha = self.alpha_target
-            pl_module.beta = self.beta_target
-            pl_module.alpha_adv = self.alpha_adv_target
-            pl_module.lam_adv = 1.0
-
-            moe_temp = self.moe_temp_phase2_end + phase3_progress * (
-                self.moe_temp_phase3_end - self.moe_temp_phase2_end
-            )
-            self._set_moe_temperature(pl_module, moe_temp)
-            self._set_arcface_margin(pl_module, arcface_margin)
-
-            trainer.logger.log_metrics(
-                {
-                    "phase/alpha": pl_module.alpha,
-                    "phase/beta": pl_module.beta,
-                    "phase/alpha_adv": pl_module.alpha_adv,
-                    "phase/lam_adv": pl_module.lam_adv,
-                    "phase/arcface_margin": arcface_margin,
-                    "phase/moe_temperature": moe_temp,
-                    "phase/balancing_loss_weight": getattr(
-                        pl_module,
-                        "phase3_balancing_loss_weight",
-                        0.0,
-                    ),
-                    "phase/current": 3.0,
-                },
-                step=trainer.global_step,
-            )
-
     # ------------------------------------------------------------------
-    # Transition helpers
+    # Transition Phase 1 -> Phase 2
     # ------------------------------------------------------------------
 
     def _transition_to_phase2(self, pl_module: Any, trainer: L.Trainer) -> None:
-        """Phase 1 -> Phase 2: swap loader, reset ramped weights to near-zero."""
+        epoch = trainer.current_epoch
         pl_module.current_phase = 2
+        self._phase2_started = True
+        self._phase2_start = epoch          # dynamic ramp anchor
+
         pl_module.alpha = 0.0
         pl_module.beta = 0.0
         pl_module.alpha_adv = 0.0
         pl_module.lam_adv = 0.0
 
-        # Phase 2 activation-memory pattern differs from Phase 1. Free
-        # fragmented Phase-1 blocks before the new pattern settles.
         import torch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -285,61 +294,28 @@ class PhaseSchedulerCallback(L.Callback):
         for af_loss in pl_module.arcface_losses.values():
             af_loss.set_scale(self.arcface_scale_start)
         self._set_arcface_margin(
-            pl_module,
-            self._arcface_margin_for_epoch(trainer.current_epoch),
+            pl_module, self._arcface_margin_for_epoch(epoch),
         )
-
         self._set_moe_temperature(pl_module, self.moe_temp_phase1)
 
-        # Reload dataloaders to switch from identity-only to combined
+        # (1) swap identity-only loader -> combined id+pad loader
         if hasattr(trainer, "datamodule") and trainer.datamodule is not None:
             trainer.datamodule.current_phase = 2
         trainer.fit_loop._combined_loader = None
         trainer.fit_loop.setup_data()
 
-        print(
-            f"\n{'='*60}\n"
-            f"  PHASE 2 START (epoch {trainer.current_epoch})\n"
-            f"  Joint ID+PAD batches (TASK_04)\n"
-            f"  alpha target: {self.alpha_target}, beta target: {self.beta_target}\n"
-            f"  alpha_adv target: {self.alpha_adv_target}\n"
-            f"  Cosine soft-start over first 5 epochs; DANN ramp over full P2\n"
-            f"{'='*60}\n"
-        )
-
-    def _transition_to_phase3(self, pl_module: Any, trainer: L.Trainer) -> None:
-        pl_module.current_phase = 3
-        pl_module.alpha = self.alpha_target
-        pl_module.beta = self.beta_target
-        pl_module.alpha_adv = self.alpha_adv_target
-        pl_module.lam_adv = 1.0
-
-        for af_loss in pl_module.arcface_losses.values():
-            af_loss.set_scale(self.arcface_scale_end)
-        self._set_arcface_margin(
-            pl_module,
-            self._arcface_margin_for_epoch(trainer.current_epoch),
-        )
-        if hasattr(pl_module, "phase3_balancing_loss_weight"):
-            pl_module.phase3_balancing_loss_weight = 0.0
-
-        self._set_moe_temperature(pl_module, self.moe_temp_phase2_end)
-
-        if hasattr(trainer, "datamodule") and trainer.datamodule is not None:
-            trainer.datamodule.current_phase = 3
-        trainer.fit_loop._combined_loader = None
-        trainer.fit_loop.setup_data()
+        # (2) absolute freeze: brake the entire identity side to LR 0,
+        #     unleash the PAD projector (backbone_phase2 = 0.0,
+        #     identity_head_phase2 = 0.0, pad_head_phase2 = 5.0).
+        if hasattr(pl_module, "apply_phase2_lr_multipliers"):
+            pl_module.apply_phase2_lr_multipliers(trainer)
 
         print(
-            f"\n{'='*60}\n"
-            f"  PHASE 3 START (epoch {trainer.current_epoch})\n"
-            f"  Joint refinement — all losses at target\n"
-            f"  alpha={pl_module.alpha}, beta={pl_module.beta}, "
-            f"alpha_adv={pl_module.alpha_adv}\n"
-            f"{'='*60}\n"
+            f"\n{'='*64}\n"
+            f"  PHASE 2 START (epoch {epoch}) — DYNAMIC TRANSITION\n"
+            f"  reason: {'plateau/armed' if self._pending_phase2 else 'max-epoch cap'}\n"
+            f"  mode: ABSOLUTE FREEZE (identity side LR=0, PAD detached)\n"
+            f"  alpha->{self.alpha_target}, beta->{self.beta_target}, "
+            f"phase2 length={self.phase2_epochs} ep\n"
+            f"{'='*64}\n"
         )
-
-    @staticmethod
-    def _set_moe_temperature(pl_module: Any, temperature: float) -> None:
-        if hasattr(pl_module, 'backbone') and hasattr(pl_module.backbone, 'set_moe_temperature'):
-            pl_module.backbone.set_moe_temperature(temperature)

@@ -291,6 +291,38 @@ class _RandomErasingBig:
         return img
 
 
+class _RandomErasingSmall:
+    """Many small cut-outs — speckle-style occlusion regularizer.
+
+    Complements ``_RandomErasingBig``: instead of one large mask it
+    drops a few tiny patches, which discourages the 24M backbone from
+    memorising fixed minutiae constellations (a key overfit mode on the
+    large NIST pool) without destroying the global ridge flow.
+    """
+
+    def __init__(self, p: float = 0.5, max_area: float = 0.06, n_patches: int = 3):
+        self.p = p
+        self.max_area = max_area
+        self.n_patches = n_patches
+
+    def __call__(self, img: torch.Tensor) -> torch.Tensor:
+        if random.random() > self.p:
+            return img
+        C, H, W = img.shape
+        img = img.clone()
+        for _ in range(random.randint(1, self.n_patches)):
+            area = random.uniform(0.005, self.max_area) * H * W
+            aspect = random.uniform(0.4, 2.5)
+            h = int((area * aspect) ** 0.5)
+            w = int((area / aspect) ** 0.5)
+            if h <= 0 or w <= 0 or h >= H or w >= W:
+                continue
+            top = random.randint(0, H - h)
+            left = random.randint(0, W - w)
+            img[:, top:top + h, left:left + w] = 0.0
+        return img
+
+
 class FingerprintHardTransform:
     """FVC2004-mimicking augmentation for identity training.
 
@@ -303,6 +335,10 @@ class FingerprintHardTransform:
       - Partial capture: RandomResizedPartial with scale in [0.6, 1.0].
       - Wider brightness/contrast jitter (0.4 each): sensor difference.
       - Larger RandomErasing (up to 30% of area): latex/dirt occlusion.
+      - Light secondary elastic (alpha=12, sigma=4): extra micro-warp so
+        the 24M net cannot lock onto exact ridge geometry.
+      - Small speckle erasing: many tiny cut-outs — anti-overfit on the
+        large NIST pool.
     """
 
     def __init__(self, output_size: int = 224):
@@ -312,7 +348,9 @@ class FingerprintHardTransform:
             _RandomResizedPartial(output_size=output_size, scale=(0.6, 1.0), p=0.7),
             RandomBrightnessContrast(brightness=0.4, contrast=0.4, p=0.9),
             RandomGaussianNoise(std=0.03, p=0.4),
+            ElasticDeformation(alpha=12.0, sigma=4.0, p=0.4),
             _RandomErasingBig(p=0.35, max_area=0.30),
+            _RandomErasingSmall(p=0.5, max_area=0.06, n_patches=3),
         ]
 
     def __call__(self, img: torch.Tensor) -> torch.Tensor:
