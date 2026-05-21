@@ -113,9 +113,9 @@ scheduler:
 # DYNAMIC phases (no fixed Phase-1 length, no Phase 3)
 # ─────────────────────────────────────────────────────────────────
 phases:
-  phase1_max_epochs: 80          # hard cap on Phase 1
+  phase1_max_epochs: 100          # hard cap on Phase 1
   phase2_epochs: 40              # Phase 2 length once triggered
-  total_epochs: 120              # = max possible (80 + 40); cosine T_max
+  total_epochs: 140              # = max possible (100 + 40); cosine T_max
   patience: 5                    # plateau patience on val/cascaded_IM
   phase1_warmup_delay: 5
   phase1_warmup_epochs: 10

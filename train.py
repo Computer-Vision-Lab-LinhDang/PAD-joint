@@ -67,6 +67,10 @@ class PhaseGatedModelCheckpoint(ModelCheckpoint):
     def __init__(self, phase_tag: int, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.omfr_phase_tag = int(phase_tag)
+        # Not persisted in state_dict — guarantees a one-time reset the
+        # first time THIS process sees its phase active, even if state
+        # was restored from a prior run's checkpoint.
+        self._reset_done_this_run = False
 
     @property
     def state_key(self) -> str:
@@ -90,6 +94,17 @@ class PhaseGatedModelCheckpoint(ModelCheckpoint):
         # target phase, so best is chosen only among in-phase epochs.
         if not self._in_phase(trainer):
             return
+        if not self._reset_done_this_run:
+            # First time this RUN enters our phase. Drop any best_score
+            # restored from a previous run's state_dict — a Phase-1
+            # `val/cascaded_IM` peak must not block Phase-2 saves once
+            # PAD's BPCER filter trims genuine accept rate.
+            self.best_model_score = None
+            self.best_k_models = {}
+            self.kth_best_model_path = ""
+            self.best_model_path = ""
+            self.current_score = None
+            self._reset_done_this_run = True
         super().on_validation_end(trainer, pl_module)
 
 
@@ -300,6 +315,11 @@ def build_callbacks(config: Dict[str, Any]) -> list:
         dirpath = ckpt_cfg.get("dirpath", "checkpoints/")
         monitor = ckpt_cfg.get("monitor", "val/cascaded_IM")
         mode    = ckpt_cfg.get("mode", "max")
+        # Phase-2 uses a PAD-native metric: cascaded_IM is unfair across
+        # phases (BPCER trims genuine acceptance once PAD turns on), so
+        # the deployable joint model is selected by PAD quality directly.
+        phase2_monitor = ckpt_cfg.get("phase2_monitor", "val/pad_accuracy")
+        phase2_mode    = ckpt_cfg.get("phase2_mode", "max")
         # Phase-1 best — fixed filename so the teacher path is stable.
         ckpt_phase1 = PhaseGatedModelCheckpoint(
             phase_tag=1,
@@ -309,16 +329,18 @@ def build_callbacks(config: Dict[str, Any]) -> list:
             mode=mode,
             save_top_k=1,
             save_last=False,
+            enable_version_counter=False,
         )
         # Phase-2 best — the deployable joint model (PAD trained).
         ckpt_phase2 = PhaseGatedModelCheckpoint(
             phase_tag=2,
             dirpath=dirpath,
             filename="best_phase2",
-            monitor=monitor,
-            mode=mode,
+            monitor=phase2_monitor,
+            mode=phase2_mode,
             save_top_k=1,
             save_last=False,
+            enable_version_counter=False,
         )
         # Phase-agnostic rolling `last.ckpt` for crash/resume safety.
         ckpt_last = ModelCheckpoint(
