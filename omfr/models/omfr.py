@@ -122,6 +122,11 @@ class OMFRModule(L.LightningModule):
             dropout=float(pad_cfg.get("dropout", 0.1)),
             num_classes=int(pad_cfg.get("num_classes", 1)),
             proj_dropout=pad_cfg.get("proj_dropout", None),
+            align_ch=int(pad_cfg.get("align_ch", 128)),
+            fusion_ch=int(pad_cfg.get("fusion_ch", 192)),
+            embedding_dim=int(pad_cfg.get("embedding_dim", 64)),
+            stage1_dw_kernel=int(pad_cfg.get("stage1_dw_kernel", 9)),
+            stage2_dw_kernel=int(pad_cfg.get("stage2_dw_kernel", 5)),
         )
         self.identity_head = IdentityHead(
             embed_dim=int(id_cfg.get("embed_dim", 256)),
@@ -176,6 +181,12 @@ class OMFRModule(L.LightningModule):
         # Legacy BCE / SupCon kept for back-compat (val only). Unused in
         # training paths after TASK_01.
         self.bce_loss = nn.BCEWithLogitsLoss()
+        supcon_cfg = losses_cfg.get("supcon", {}) or {}
+        self.supcon_pad_loss = SupConLoss(
+            temperature=float(supcon_cfg.get("temperature", 0.07)),
+            contrast_mode=str(supcon_cfg.get("contrast_mode", "all")),
+            base_temperature=float(supcon_cfg.get("base_temperature", 0.07)),
+        )
         # Dedicated SupCon for identity embeddings — higher temperature so
         # the contrastive signal is smoother across many identities.
         self.supcon_identity_loss = SupConLoss(temperature=0.1)
@@ -187,21 +198,35 @@ class OMFRModule(L.LightningModule):
         # overridden in config.
         num_sensors = int(config.get("num_sensors", 9))
         self.unknown_sensor_id = int(config.get("unknown_sensor_id", num_sensors - 1))
+        pad_features_dim = int(
+            getattr(self.pad_head, "PAD_FEATURES_DIM", _PADHeadCls.PAD_FEATURES_DIM)
+        )
         self.sensor_adv_head = SensorAdversarialHead(
-            in_features=_PADHeadCls.PAD_FEATURES_DIM,
+            in_features=pad_features_dim,
             num_sensors=num_sensors,
             hidden_dim=128,
         )
         self.sensor_adv_loss = SensorAdversarialLoss()
 
         # -- Loss weights --
-        self.alpha: float = 0.0   # PAD weight — ramped in Phase 2
-        self.beta:  float = 0.0   # Orth weight — ramped in Phase 2
+        self.alpha: float = 0.0   # PAD weight
+        self.beta:  float = 0.0   # Orth weight
+        self.identity_weight: float = 0.0  # Phase-2 identity ramp ("gamma" in logs)
         self.alpha_adv: float = 0.0  # sensor-adv weight, ramped in Phase 2
         self.lam_adv:   float = 0.0  # GRL lambda, ramped in Phase 2
         self.gamma: float = float(config.get("gamma", 0.01))
         self.phase3_balancing_loss_weight: float = float(
             config.get("balancing_loss_weight", self.gamma)
+        )
+        self.pad_supcon_weight: float = float(config.get("pad_supcon_weight", 1.0))
+        self.pad_bce_phase_weight: float = float(
+            config.get("pad_bce_phase_weight", 1.0)
+        )
+        self.phase2_freeze_identity: bool = bool(
+            config.get(
+                "phase2_freeze_identity",
+                (config.get("phases", {}) or {}).get("phase2_freeze_identity", True),
+            )
         )
         # Hybrid identity loss: weighted mix of SupCon (open-set) and
         # ArcFace (class discriminative). SupCon dominates so embeddings
@@ -276,16 +301,17 @@ class OMFRModule(L.LightningModule):
             "stage4_feat": backbone_out["stage4_feat"],
         })
 
-    def _run_pad(self, backbone_out: Dict) -> Dict:
+    def _run_pad(
+        self,
+        backbone_out: Dict,
+        detach_backbone_features: bool = True,
+        detach_routing_stats: bool = True,
+    ) -> Dict:
         """PAD head reading stage1 + stage2 features + routing stats.
 
-        HARD STOP-GRADIENT ("Đóng Băng Tuyệt Đối"): every tensor taken
-        from the shared FastViT trunk — the stage1/stage2 feature maps
-        AND all MoE routing stats — is ``.detach()``ed before it reaches
-        the PAD head. PAD loss therefore CANNOT back-propagate into the
-        backbone at all (no gradient to early stages, no gradient to the
-        MoE gate). This protects the low-level identity features (the
-        "móng nhà") that Phase 1 built.
+        By default this keeps the old hard stop-gradient behavior. The
+        PAD-first scheduler calls it with ``detach_backbone_features=False``
+        so MS-TAH can train the shared early texture stages directly.
 
         The only trainable pixel path on the PAD branch is the dedicated
         ``gabor_pad -> pad_stem -> pad_head`` stack, which is a separate
@@ -296,14 +322,23 @@ class OMFRModule(L.LightningModule):
         """
         rs = backbone_out["routing_stats"]
 
+        def _maybe_detach(tensor: torch.Tensor, enabled: bool) -> torch.Tensor:
+            return tensor.detach() if enabled else tensor
+
         def _detach_stats(stats: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
             res = {
-                "expert_weights": stats["expert_weights"].detach(),
-                "token_entropy":  stats["token_entropy"].detach(),
+                "expert_weights": _maybe_detach(
+                    stats["expert_weights"], detach_routing_stats,
+                ),
+                "token_entropy": _maybe_detach(
+                    stats["token_entropy"], detach_routing_stats,
+                ),
             }
             # Frequency-band vector also passed through detached.
             if "gate_input_gateonly" in stats:
-                res["gate_input_gateonly"] = stats["gate_input_gateonly"].detach()
+                res["gate_input_gateonly"] = _maybe_detach(
+                    stats["gate_input_gateonly"], detach_routing_stats,
+                )
             return res
 
         # Routing stats are ALWAYS fully detached now (no phase gating,
@@ -317,13 +352,22 @@ class OMFRModule(L.LightningModule):
         # the identity Gabor, PAD gradients never touch identity σ/γ —
         # no detach needed. The PAD bank is free to learn pore- and
         # texture-scale frequencies throughout all phases.
-        pad_stem_feat = self.pad_stem(backbone_out["gabor_pad_feat"])
+        if bool(getattr(self.pad_head, "USES_PAD_STEM", False)):
+            pad_stem_feat = self.pad_stem(backbone_out["gabor_pad_feat"])
+        else:
+            pad_stem_feat = backbone_out["stage2_feat"].new_zeros(
+                backbone_out["stage2_feat"].shape[0],
+                int(getattr(self.pad_stem, "out_dim", 256)),
+            )
 
         return self.pad_head({
             "pad_stem_feat":     pad_stem_feat,
-            # HARD detach: PAD gradient never reaches the backbone.
-            "stage1_feat":       backbone_out["stage1_feat"].detach(),
-            "stage2_feat":       backbone_out["stage2_feat"].detach(),
+            "stage1_feat": _maybe_detach(
+                backbone_out["stage1_feat"], detach_backbone_features,
+            ),
+            "stage2_feat": _maybe_detach(
+                backbone_out["stage2_feat"], detach_backbone_features,
+            ),
             "routing_stats_s2":  rs_s2,
             "routing_stats_s3a": rs_s3a,
             "routing_stats_s3b": rs_s3b,
@@ -365,27 +409,37 @@ class OMFRModule(L.LightningModule):
         base_lr = float(self.cfg.get("lr", 1e-4))
 
         bb_p2 = float(m.get("backbone_phase2", 0.0))
+        gabor_p2 = float(m.get("gabor_phase2", bb_p2))
+        gabor_pad_p2 = float(m.get("gabor_pad_phase2", m.get("gabor_pad", 1.0)))
+        embed_p2 = float(m.get("backbone_embed_phase2", bb_p2))
+        early_p2 = float(m.get("backbone_early_phase2", bb_p2))
+        late_p2 = float(m.get("backbone_late_phase2", bb_p2))
+        moe_p2 = float(m.get("moe_experts_phase2", bb_p2))
         # Accept both spellings; `identity_head_phase2` is the documented
         # key, `id_head_phase2` is kept for back-compat with old configs.
         id_p2 = float(
             m.get("identity_head_phase2", m.get("id_head_phase2", 0.0))
         )
         pad_p2 = float(m.get("pad_head_phase2", 5.0))
+        pad_stem_p2 = float(m.get("pad_stem_phase2", pad_p2))
+        arcface_p2 = float(m.get("arcface_phase2", id_p2))
+        sensor_adv_p2 = float(m.get("sensor_adv_head_phase2", m.get("sensor_adv_head", 1.0)))
 
-        # The identity Gabor stem and the ArcFace classifiers are part of
-        # the identity path — fold them into the backbone freeze group so
-        # backbone_phase2 = 0.0 is a TRUE absolute freeze (nothing on the
-        # identity side can drift while PAD trains).
+        # Phase-2 multipliers are explicit per group so PAD-first schedules
+        # can turn identity heads on while keeping the backbone trainable.
+        # Older absolute-freeze configs still work by leaving these keys unset.
         phase2_mult = {
-            "gabor":          bb_p2,
-            "backbone_embed": bb_p2,
-            "backbone_early": bb_p2,
-            "backbone_late":  bb_p2,
-            "moe_experts":    bb_p2,
-            "arcface":        bb_p2,
+            "gabor":          gabor_p2,
+            "gabor_pad":      gabor_pad_p2,
+            "backbone_embed": embed_p2,
+            "backbone_early": early_p2,
+            "backbone_late":  late_p2,
+            "moe_experts":    moe_p2,
+            "arcface":        arcface_p2,
             "identity_head":  id_p2,
-            "pad_stem":       pad_p2,
+            "pad_stem":       pad_stem_p2,
             "pad_head":       pad_p2,
+            "sensor_adv_head": sensor_adv_p2,
         }
 
         optimizers = trainer.optimizers if trainer.optimizers else []
@@ -475,6 +529,35 @@ class OMFRModule(L.LightningModule):
             material_labels=material_labels,
         )
 
+    def _pad_foundation_loss(
+        self,
+        pad_out: Dict[str, torch.Tensor],
+        liveness_labels: torch.Tensor,
+        sensor_labels: Optional[torch.Tensor] = None,
+        material_labels: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """PAD foundation objective: SupCon on MS-TAH features + BCE logit loss."""
+        pad_parts = self._pad_classification_loss(
+            pad_out["pad_logit"],
+            liveness_labels,
+            sensor_labels=sensor_labels,
+            material_labels=material_labels,
+        )
+        labels = liveness_labels.to(
+            device=pad_out["pad_features"].device,
+            dtype=torch.long,
+        ).reshape(-1)
+        l_supcon = self.supcon_pad_loss(pad_out["pad_features"], labels)
+        l_bce = pad_parts["bce"]
+        total = self.pad_supcon_weight * l_supcon + self.pad_bce_phase_weight * l_bce
+        result = dict(pad_parts)
+        result.update({
+            "supcon": l_supcon,
+            "bce_phase": l_bce,
+            "foundation_total": total,
+        })
+        return result
+
     def _sensor_adversarial_loss(
         self,
         pad_features: torch.Tensor,
@@ -499,6 +582,14 @@ class OMFRModule(L.LightningModule):
         self.log("train/pad_focal_loss", pad_parts["focal"], sync_dist=True)
         self.log("train/pad_bce_loss",   pad_parts["bce"],   sync_dist=True)
         self.log("train/pad_cls_loss",   pad_parts["total"], sync_dist=True)
+        if "supcon" in pad_parts:
+            self.log("train/pad_supcon_loss", pad_parts["supcon"], sync_dist=True)
+        if "foundation_total" in pad_parts:
+            self.log(
+                "train/pad_foundation_loss",
+                pad_parts["foundation_total"],
+                sync_dist=True,
+            )
         self.log(
             "train/pad_weight_mean",
             pad_parts["sample_weight_mean"],
@@ -515,21 +606,24 @@ class OMFRModule(L.LightningModule):
     # -------------------------------------------------------------------------
 
     def _phase1_step(self, batch: Any) -> torch.Tensor:
-        """Phase 1 — identity only."""
-        images, identity_labels = self._unpack_identity_batch(batch)
+        """Phase 1 - PAD foundation: SupCon(PAD features) + BCE."""
+        images, liveness_labels = self._unpack_pad_batch(batch)
+        sensor_labels = self._unpack_sensor_labels(batch)
+        material_labels = self._unpack_material_labels(batch)
 
         backbone_out = self._run_backbone(images)
-        id_out       = self._run_identity(backbone_out)
+        pad_out = self._run_pad(backbone_out, detach_backbone_features=False)
+        pad_parts = self._pad_foundation_loss(
+            pad_out,
+            liveness_labels,
+            sensor_labels=sensor_labels,
+            material_labels=material_labels,
+        )
+        loss = self.alpha * pad_parts["foundation_total"]
 
-        id_parts  = self._identity_loss(id_out["mrl_embeddings"], identity_labels)
-        l_balance = sum(backbone_out["balance_losses"])
-        loss      = id_parts["total"] + self.gamma * l_balance
-
-        self.log("train/identity_loss",  id_parts["total"], prog_bar=True, sync_dist=True)
-        self.log("train/id_arcface",     id_parts["arcface"],                sync_dist=True)
-        self.log("train/id_supcon",      id_parts["supcon"],                 sync_dist=True)
-        self.log("train/balance_loss",   l_balance,                          sync_dist=True)
-        self.log("train/total_loss",     loss,              prog_bar=True, sync_dist=True)
+        self._log_pad_loss_parts(pad_parts)
+        self.log("train/alpha", self.alpha, sync_dist=True)
+        self.log("train/total_loss", loss, prog_bar=True, sync_dist=True)
         return loss
 
     def _pad_features_from_images(self, images: torch.Tensor) -> torch.Tensor:
@@ -565,25 +659,23 @@ class OMFRModule(L.LightningModule):
         return out["pad_features"]
 
     def _phase2_identity_step(self, batch: Any) -> torch.Tensor:
-        """Phase 2 — identity batch. Full gradients to backbone + identity head."""
+        """Phase 2 identity integration step: gamma * ArcFace/SupCon + beta * orth."""
         images, identity_labels = self._unpack_identity_batch(batch)
 
         backbone_out = self._run_backbone(images)
         id_out       = self._run_identity(backbone_out)
-        pad_out      = self._run_pad(backbone_out)
+        pad_out      = self._run_pad(backbone_out, detach_backbone_features=False)
 
         id_parts  = self._identity_loss(id_out["mrl_embeddings"], identity_labels)
         l_orth    = self.orth_loss(pad_out["pad_embedding"], id_out["identity_embedding"])
-        l_balance = sum(backbone_out["balance_losses"])
-        loss      = (id_parts["total"]
-                     + self.beta * l_orth
-                     + self.gamma * l_balance)
+        loss      = self.identity_weight * id_parts["total"] + self.beta * l_orth
 
         self.log("train/identity_loss", id_parts["total"], prog_bar=True, sync_dist=True)
         self.log("train/id_arcface",    id_parts["arcface"],                sync_dist=True)
         self.log("train/id_supcon",     id_parts["supcon"],                 sync_dist=True)
         self.log("train/orth_loss",     l_orth,            sync_dist=True)
-        self.log("train/balance_loss",  l_balance,         sync_dist=True)
+        self.log("train/identity_weight", self.identity_weight, sync_dist=True)
+        self.log("train/beta", self.beta, sync_dist=True)
         self.log("train/total_loss",    loss,              prog_bar=True, sync_dist=True)
         return loss
 
@@ -598,43 +690,38 @@ class OMFRModule(L.LightningModule):
         material_labels = self._unpack_material_labels(batch)
 
         backbone_out = self._run_backbone(images)
-        pad_out      = self._run_pad(backbone_out)
+        pad_out      = self._run_pad(backbone_out, detach_backbone_features=False)
 
         id_out = self.identity_head({
-            "stage3_feat": backbone_out["stage3_feat"].detach(),
-            "stage4_feat": backbone_out["stage4_feat"].detach(),
+            "stage3_feat": backbone_out["stage3_feat"],
+            "stage4_feat": backbone_out["stage4_feat"],
         })
 
-        pad_parts = self._pad_classification_loss(
-            pad_out["pad_logit"],
+        pad_parts = self._pad_foundation_loss(
+            pad_out,
             liveness_labels,
             sensor_labels=sensor_labels,
             material_labels=material_labels,
         )
-        
-        # MixUp disabled: destroys fingerprint micro-texture and caused NaN in smoke test.
-        l_mixup = images.new_zeros(())
-        
+
         if sensor_labels is not None and self.lam_adv > 0:
             l_sensor = self._sensor_adversarial_loss(
                 pad_out["pad_features"],
                 sensor_labels,
-            )
+                )
         else:
             l_sensor = images.new_zeros(())
         l_orth    = self.orth_loss(pad_out["pad_embedding"], id_out["identity_embedding"])
-        l_balance = sum(backbone_out["balance_losses"])
 
-        loss = (self.alpha * (pad_parts["total"] + l_mixup)
+        loss = (self.alpha * pad_parts["foundation_total"]
                 + self.alpha_adv * l_sensor
-                + self.beta * l_orth
-                + self.gamma * l_balance)
+                + self.beta * l_orth)
 
         self._log_pad_loss_parts(pad_parts)
-        self.log("train/pad_mixup_loss", l_mixup,   sync_dist=True)
         self.log("train/pad_sensor_adv", l_sensor,  sync_dist=True)
         self.log("train/orth_loss",      l_orth,    sync_dist=True)
-        self.log("train/balance_loss",   l_balance, sync_dist=True)
+        self.log("train/alpha", self.alpha, sync_dist=True)
+        self.log("train/beta", self.beta, sync_dist=True)
         self.log("train/total_loss",     loss, prog_bar=True, sync_dist=True)
         return loss
 
@@ -881,7 +968,7 @@ class OMFRModule(L.LightningModule):
         # validation ``eval()`` toggle, so this is the last word before the
         # training forward — guaranteeing the identity side is never in
         # train mode during a Phase-2 step.
-        if self.current_phase == 2:
+        if self.current_phase == 2 and self.phase2_freeze_identity:
             self._lock_identity_eval()
 
     def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
@@ -889,11 +976,13 @@ class OMFRModule(L.LightningModule):
             loss = self._phase1_step(batch)
 
         elif self.current_phase == 2:
-            # TASK_04: concatenate identity + PAD into one optimizer step so
-            # Adam's second-moment tracks a stable loss landscape (was:
-            # batch_idx % 2 alternation, which caused total_loss spikes).
             if isinstance(batch, dict) and "identity" in batch and "pad" in batch:
-                loss = self._phase2_joint_step(batch["identity"], batch["pad"])
+                if batch_idx % 2 == 0:
+                    loss = self._phase2_identity_step(batch["identity"])
+                    self.log("train/phase2_branch", 0.0, sync_dist=True)
+                else:
+                    loss = self._phase2_pad_step(batch["pad"])
+                    self.log("train/phase2_branch", 1.0, sync_dist=True)
             elif isinstance(batch, dict) and "liveness_labels" in batch:
                 loss = self._phase2_pad_step(batch)
             else:
@@ -947,6 +1036,7 @@ class OMFRModule(L.LightningModule):
             "current_phase": int(self.current_phase),
             "alpha": float(self.alpha),
             "beta": float(self.beta),
+            "identity_weight": float(self.identity_weight),
             "alpha_adv": float(self.alpha_adv),
             "lam_adv": float(self.lam_adv),
             "arcface": arc,
@@ -962,6 +1052,7 @@ class OMFRModule(L.LightningModule):
         self._phase2_lr_applied = bool(st.get("phase2_lr_applied", False))
         self.alpha = float(st.get("alpha", self.alpha))
         self.beta  = float(st.get("beta",  self.beta))
+        self.identity_weight = float(st.get("identity_weight", self.identity_weight))
         self.alpha_adv = float(st.get("alpha_adv", self.alpha_adv))
         self.lam_adv   = float(st.get("lam_adv",   self.lam_adv))
         for k, params in st.get("arcface", {}).items():
@@ -976,12 +1067,21 @@ class OMFRModule(L.LightningModule):
     def validation_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0) -> None:
         images = batch["images"] if isinstance(batch, dict) else batch[0]
 
+        if self.current_phase == 1 and (
+            not isinstance(batch, dict) or "liveness_labels" not in batch
+        ):
+            return
+
         backbone_out = self._run_backbone(images)
-        id_out       = self._run_identity(backbone_out)
-        pad_out      = self._run_pad(backbone_out)
+        id_out = None
+        if self.current_phase >= 2 and (
+            isinstance(batch, dict) and "identity_labels" in batch
+        ):
+            id_out = self._run_identity(backbone_out)
+        pad_out = self._run_pad(backbone_out)
 
         if isinstance(batch, dict):
-            if "identity_labels" in batch:
+            if "identity_labels" in batch and id_out is not None:
                 self._val_id_embeddings.append(id_out["identity_embedding"].detach().cpu())
                 self._val_id_labels.append(batch["identity_labels"].detach().cpu())
                 # Store PAD logit for same identity samples → cascaded_IM
@@ -1003,12 +1103,16 @@ class OMFRModule(L.LightningModule):
             # Detailed PAD metrics
             live_mask  = labels == 1
             spoof_mask = labels == 0
+            apcer = torch.tensor(0.0, device=labels.device)
+            bpcer = torch.tensor(0.0, device=labels.device)
             if live_mask.any():
                 bpcer = 1.0 - (preds[live_mask] == labels[live_mask]).float().mean()
                 self.log("val/bpcer", bpcer, sync_dist=True)
             if spoof_mask.any():
                 apcer = 1.0 - (preds[spoof_mask] == labels[spoof_mask]).float().mean()
                 self.log("val/apcer", apcer, sync_dist=True)
+            acer = 0.5 * (apcer + bpcer)
+            self.log("val/acer", acer, sync_dist=True, prog_bar=True)
 
         # ── Identity rank-1 accuracy (256-D cosine) ──
         cascaded_im = torch.tensor(0.0)
@@ -1062,12 +1166,8 @@ class OMFRModule(L.LightningModule):
         def mul(key: str, default: float) -> float:
             return float(m.get(key, default))
 
-        # pad_stem / pad_head share the "fast PAD branch" multiplier. The
-        # phase-1 vs phase-2 split is collapsed to pad_head_phase2 because
-        # configure_optimizers runs once at fit start (Phase 1) and Phase 1
-        # is identity-only (pad_head receives no gradient), so the higher
-        # multiplier is safe to apply from the start.
-        pad_fast_mul = mul("pad_head_phase2", mul("pad_head", 2.0))
+        pad_head_mul = mul("pad_head", 1.0)
+        pad_stem_mul = mul("pad_stem", pad_head_mul)
 
         # MoE params need separate group — exclude from backbone groups
         moe_ids = {id(p) for p in self.backbone.get_moe_params()}
@@ -1133,7 +1233,7 @@ class OMFRModule(L.LightningModule):
             # Dedicated PAD stem — fast PAD-branch multiplier.
             {
                 "params": list(self.pad_stem.parameters()),
-                "lr":     lr * pad_fast_mul,
+                "lr":     lr * pad_stem_mul,
                 "name":   "pad_stem",
             },
             # PAD Head (non-linear projector) — fast PAD-branch multiplier
@@ -1141,7 +1241,7 @@ class OMFRModule(L.LightningModule):
             # learn spoof material fast WITHOUT dragging the backbone.
             {
                 "params": list(self.pad_head.parameters()),
-                "lr":     lr * pad_fast_mul,
+                "lr":     lr * pad_head_mul,
                 "name":   "pad_head",
             },
             # ArcFace classifiers — 1x LR (reduced from 10x to prevent gradient explosion)

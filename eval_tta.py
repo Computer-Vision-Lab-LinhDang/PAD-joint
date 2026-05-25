@@ -107,8 +107,22 @@ def extract_pad_scores(
         images = batch["images"].to(device)
         labels = batch["liveness_labels"]
 
-        backbone_out = model._run_backbone(images)
-        pad_out = model._run_pad(backbone_out)
+        if hasattr(model, "_run_pad_branch"):
+            _, pad_out = model._run_pad_branch(images, backbone_no_grad=True)
+        elif hasattr(model, "_phase2_pad_backbone_policy"):
+            policy = model._phase2_pad_backbone_policy()
+            backbone_out = model._run_backbone(
+                images,
+                backbone_input=policy["backbone_input"],
+            )
+            pad_out = model._run_pad(
+                backbone_out,
+                detach_backbone_features=policy["detach_backbone_features"],
+                detach_routing_stats=policy["detach_routing_stats"],
+            )
+        else:
+            backbone_out = model._run_backbone(images)
+            pad_out = model._run_pad(backbone_out)
 
         scores = torch.sigmoid(pad_out["pad_logit"].squeeze(-1)).cpu().numpy()
         all_scores.append(scores)

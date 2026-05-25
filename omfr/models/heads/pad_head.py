@@ -1,115 +1,154 @@
 """
-pad_head.py — PAD Branch Head (v4: Dedicated Stem + DS-Conv Aux + Routing)
+pad_head.py - MS-TAH PAD Branch Head.
 
-Input: {
-    'pad_stem_feat':     (B, 128),              # from PADStem (TRAINABLE)
-    'stage1_feat':       (B, 64, 56, 56),       # detached backbone feature
-    'stage2_feat':       (B, 128, 28, 28),      # detached backbone feature
-    'routing_stats_s2':  {'expert_weights': ..., 'token_entropy': ..., 'gate_input_gateonly': (B, 784, 3)},
-    'routing_stats_s3a': {'expert_weights': ..., 'token_entropy': ..., 'gate_input_gateonly': (B, 196, 3)},
-    'routing_stats_s3b': {'expert_weights': ..., 'token_entropy': ..., 'gate_input_gateonly': (B, 196, 3)},
-}
+MS-TAH (Multi-Scale Texture Aggregation Head) is intentionally narrower in
+feature sources than the previous PAD head: it consumes only early spatial
+backbone stages and does not fuse PADStem vectors or MoE routing statistics.
+That removes the most obvious shortcut path for sensor/year/material routing
+patterns while preserving local texture structure until the last projection.
 
-Output: {
-    'pad_embedding': (B, 32),    # L2-normalized, for SupCon + orthogonality
-    'pad_logit':     (B, 1),     # Raw logit for BCE
-    'pad_features':  (B, 128),   # Pre-projection features for SupCon
-}
+Input:
+    stage1_feat: (B, 64, 56, 56)
+    stage2_feat: (B, 128, 28, 28)
 
-[NEW] v4.1 Update:
-    Added 3-band frequency energy (gate_input) directly to the routing stats.
-    This bypasses the MoE Softmax temperature collapse (T=0.5) that previously
-    squashed token_entropy to 0. PAD now extracts statistical features (mean,
-    std, max, min) for each frequency band, adding 12 robust features per MoE layer.
+Output:
+    pad_features:  (B, 192) for sensor adversarial / PAD supervision
+    pad_embedding: (B, 64)  L2-normalized, for orthogonality / retrieval
+    pad_logit:     (B, 1)   raw logit for BCE/focal PAD loss
 """
+
+from __future__ import annotations
+
+from typing import Dict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict
 
 
-class PADConvBlock(nn.Module):
+def _pick_groups(channels: int, preferred: int = 8) -> int:
+    """Pick a GroupNorm group count that divides the channel count."""
+    for groups in (preferred, 4, 2, 1):
+        if channels % groups == 0:
+            return groups
+    return 1
+
+
+class TextureBlock(nn.Module):
     """
-    Depthwise-separable conv block preserving spatial resolution.
+    Texture-sensitive feature transform.
 
-    Flow: DW3x3 -> GN -> GELU -> PW1x1 -> GN -> GELU -> DW3x3 -> GN -> GELU
+    Depthwise large-kernel convolution captures local texture statistics;
+    pointwise convolution mixes channels. Stage 1 uses stride 2 to align
+    56x56 features to Stage 2's 28x28 grid.
     """
 
-    def __init__(self, in_ch: int, out_ch: int):
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        stride: int = 1,
+        dw_kernel: int = 7,
+    ) -> None:
         super().__init__()
-        gn_in = self._pick_groups(in_ch)
-        gn_out = self._pick_groups(out_ch)
-
-        self.block = nn.Sequential(
-            # DW 3x3 on input channels
-            nn.Conv2d(in_ch, in_ch, kernel_size=3, padding=1,
-                      groups=in_ch, bias=False),
-            nn.GroupNorm(gn_in, in_ch),
-            nn.GELU(),
-            # PW 1x1 to change channel count
-            nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False),
-            nn.GroupNorm(gn_out, out_ch),
-            nn.GELU(),
-            # DW 3x3 to refine on new channel basis
-            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1,
-                      groups=out_ch, bias=False),
-            nn.GroupNorm(gn_out, out_ch),
-            nn.GELU(),
+        padding = dw_kernel // 2
+        self.dw = nn.Conv2d(
+            in_ch,
+            in_ch,
+            dw_kernel,
+            stride=stride,
+            padding=padding,
+            groups=in_ch,
+            bias=False,
         )
-
-    @staticmethod
-    def _pick_groups(channels: int) -> int:
-        for g in (8, 4, 2, 1):
-            if channels % g == 0:
-                return g
-        return 1
+        self.pw = nn.Conv2d(in_ch, out_ch, 1, bias=False)
+        self.norm = nn.GroupNorm(_pick_groups(out_ch), out_ch)
+        self.act = nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.block(x)
+        x = self.dw(x)
+        x = self.pw(x)
+        x = self.norm(x)
+        return self.act(x)
+
+
+class FusionBlock(nn.Module):
+    """
+    Spatial mixer for concatenated Stage 1 + Stage 2 texture features.
+
+    A 1x1 reduction controls channel count, then a 3x3 convolution mixes local
+    spatial context before aggregation.
+    """
+
+    def __init__(self, in_ch: int = 256, out_ch: int = 192) -> None:
+        super().__init__()
+        self.reduce = nn.Conv2d(in_ch, out_ch, 1, bias=False)
+        self.norm1 = nn.GroupNorm(_pick_groups(out_ch), out_ch)
+        self.act1 = nn.GELU()
+        self.spatial = nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False)
+        self.norm2 = nn.GroupNorm(_pick_groups(out_ch), out_ch)
+        self.act2 = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.act1(self.norm1(self.reduce(x)))
+        x = self.act2(self.norm2(self.spatial(x)))
+        return x
+
+
+class MultiScaleAggregator(nn.Module):
+    """
+    Aggregate texture maps at global, mid, and local spatial granularities.
+
+    Global: GAP -> contextual texture statistics
+    Mid:    28x28 -> 14x14 -> GAP
+    Local:  28x28 -> 7x7  -> GAP
+
+    Output is a concatenation of three embed_dim vectors.
+    """
+
+    def __init__(self, in_ch: int = 192, embed_dim: int = 192) -> None:
+        super().__init__()
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+
+        self.mid_conv = nn.Sequential(
+            nn.Conv2d(in_ch, in_ch, 3, stride=2, padding=1, groups=in_ch, bias=False),
+            nn.Conv2d(in_ch, embed_dim, 1, bias=False),
+            nn.GroupNorm(_pick_groups(embed_dim), embed_dim),
+            nn.GELU(),
+        )
+        self.mid_pool = nn.AdaptiveAvgPool2d(1)
+
+        self.local_conv = nn.Sequential(
+            nn.Conv2d(in_ch, in_ch, 3, stride=2, padding=1, groups=in_ch, bias=False),
+            nn.GroupNorm(_pick_groups(in_ch), in_ch),
+            nn.GELU(),
+            nn.Conv2d(in_ch, in_ch, 3, stride=2, padding=1, groups=in_ch, bias=False),
+            nn.Conv2d(in_ch, embed_dim, 1, bias=False),
+            nn.GroupNorm(_pick_groups(embed_dim), embed_dim),
+            nn.GELU(),
+        )
+        self.local_pool = nn.AdaptiveAvgPool2d(1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch = x.shape[0]
+        global_vec = self.global_pool(x).view(batch, -1)
+        mid_vec = self.mid_pool(self.mid_conv(x)).view(batch, -1)
+        local_vec = self.local_pool(self.local_conv(x)).view(batch, -1)
+        return torch.cat([global_vec, mid_vec, local_vec], dim=-1)
 
 
 class PADHead(nn.Module):
     """
-    Multi-scale feature aggregation + dedicated PAD stem + MoE routing.
+    MS-TAH: Multi-Scale Texture Aggregation Head for fingerprint PAD.
 
-    Architecture (v4.1):
-        -- PAD stem path (TRAINABLE, runs upstream in OMFRModule) --
-        pad_stem_feat (B, 128)
-
-        -- Aux feature path on detached backbone stages --
-        stage1_feat (B,64,56,56)  -> PADConvBlock(64->128)  -> GAP -> (B,128)
-        stage2_feat (B,128,28,28) -> PADConvBlock(128->128) -> GAP -> (B,128)
-        -> concat -> (B, 256)
-
-        -- Routing path (20 features per MoE layer x 3 layers = 60) -- [NEW]
-        Per MoE layer:
-            expert_weights: mean over tokens -> (B, 4)
-            token_entropy:  [mean, std, max, min] -> (B, 4)
-            gate_input:     [mean, std, max, min] x 3 bands -> (B, 12)
-        -> concat all 3 layers -> (B, 60)
-
-        -- Fusion --
-        concat(pad_stem_128, feature_256, routing_60) -> (B, 444) [NEW]
-        -> LayerNorm -> MLP -> pad_features (B, 128)
-
-        -- Two PARALLEL output branches --
-        pad_features -> Linear(128, 32) -> L2Norm -> pad_embedding
-        pad_features -> Linear(128, 1) -> pad_logit
+    The constructor keeps legacy argument names used by OMFRModule/configs, but
+    the head architecture only depends on stage1/stage2 spatial features.
     """
 
-    FEAT_CH_PER_STAGE = 128
-    PAD_STEM_DIM = 256
-    
-    # [NEW] Updated dimension: 4 expert + 4 entropy + 12 gate_input (3 bands * 4 stats) = 20
-    ROUTE_DIM_PER_LAYER = 20   
-    NUM_MOE_LAYERS = 3
-    
-    # [NEW] 20 * 3 = 60
-    ROUTE_DIM = ROUTE_DIM_PER_LAYER * NUM_MOE_LAYERS   
-    
-    PAD_FEATURES_DIM = 128
-    PAD_EMBEDDING_DIM = 32
+    PAD_FEATURES_DIM = 192
+    PAD_EMBEDDING_DIM = 64
+    USES_PAD_STEM = False
+    USES_ROUTING_STATS = False
 
     def __init__(
         self,
@@ -119,130 +158,124 @@ class PADHead(nn.Module):
         dropout: float = 0.1,
         num_classes: int = 1,
         proj_dropout: float | None = None,
-    ):
+        align_ch: int = 128,
+        fusion_ch: int | None = None,
+        embedding_dim: int | None = None,
+        stage1_dw_kernel: int = 9,
+        stage2_dw_kernel: int = 5,
+        pad_features_dim: int | None = None,
+        pad_embedding_dim: int | None = None,
+        **_: object,
+    ) -> None:
         super().__init__()
+        del pad_stem_dim  # Kept only for compatibility with older configs.
+        if int(num_classes) != 1:
+            raise ValueError(
+                "MS-TAH PADHead is a binary PAD head and must emit one logit; "
+                f"got num_classes={num_classes}."
+            )
 
-        self.pad_stem_dim = pad_stem_dim
+        if fusion_ch is None:
+            fusion_ch = pad_features_dim or self.PAD_FEATURES_DIM
+        if embedding_dim is None:
+            embedding_dim = pad_embedding_dim or self.PAD_EMBEDDING_DIM
         if proj_dropout is None:
             proj_dropout = dropout
 
-        # Aux feature path on detached backbone stages
-        self.block_s1 = PADConvBlock(stage1_dim, self.FEAT_CH_PER_STAGE)
-        self.block_s2 = PADConvBlock(stage2_dim, self.FEAT_CH_PER_STAGE)
-        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.PAD_FEATURES_DIM = int(fusion_ch)
+        self.PAD_EMBEDDING_DIM = int(embedding_dim)
 
-        feat_dim = self.FEAT_CH_PER_STAGE * 2              # 256
-        
-        # [NEW] fusion_in automatically adapts to 128 + 256 + 60 = 444
-        fusion_in = pad_stem_dim + feat_dim + self.ROUTE_DIM   
-
-        self.fusion_mlp = nn.Sequential(
-            nn.LayerNorm(fusion_in),
-            nn.Linear(fusion_in, 512),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(512, 256),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(256, self.PAD_FEATURES_DIM),
+        self.tb1 = TextureBlock(
+            in_ch=int(stage1_dim),
+            out_ch=int(align_ch),
+            stride=2,
+            dw_kernel=int(stage1_dw_kernel),
+        )
+        self.tb2 = TextureBlock(
+            in_ch=int(stage2_dim),
+            out_ch=int(align_ch),
+            stride=1,
+            dw_kernel=int(stage2_dw_kernel),
         )
 
-        # Parallel output branches from pad_features
-        self.embedding_proj = nn.Linear(self.PAD_FEATURES_DIM, self.PAD_EMBEDDING_DIM)
-
-        # Non-linear PAD projector head (replaces the old single Linear).
-        # Gives the PAD branch dedicated capacity to learn spoof-material
-        # cues WITHOUT forcing the shared backbone to change — the extra
-        # parameters live entirely inside the head.
-        # Structure: Linear(d,d) -> BatchNorm1d -> GELU -> Dropout -> Linear(d, num_classes)
-        d = self.PAD_FEATURES_DIM
-        self.logit_head = nn.Sequential(
-            nn.Linear(d, d),
-            nn.BatchNorm1d(d),
-            nn.GELU(),
-            nn.Dropout(proj_dropout),
-            nn.Linear(d, num_classes),
+        self.fusion = FusionBlock(
+            in_ch=int(align_ch) * 2,
+            out_ch=self.PAD_FEATURES_DIM,
+        )
+        self.aggregator = MultiScaleAggregator(
+            in_ch=self.PAD_FEATURES_DIM,
+            embed_dim=self.PAD_FEATURES_DIM,
         )
 
-    def _extract_routing_features(self, stats: Dict) -> torch.Tensor:
-        """
-        Extract 20-D feature vector from a single MoE layer's routing stats.
-        """
-        # Note: Depending on how OMFRModule passes the dict, the keys might have 
-        # '_gateonly' suffix. We use .get() for robust fallback.
-        ew = stats.get('expert_weights_gateonly', stats.get('expert_weights'))   # (B, N, 4)
-        ent = stats.get('token_entropy_gateonly', stats.get('token_entropy'))    # (B, N)
-        
-        # [NEW] Retrieve the detached gate_input we added in moe_ffn.py
-        gate_input = stats.get('gate_input_gateonly', stats.get('gate_input'))   # (B, N, 3)
+        agg_dim = self.PAD_FEATURES_DIM * 3
+        self.proj = nn.Sequential(
+            nn.Linear(agg_dim, self.PAD_FEATURES_DIM),
+            nn.LayerNorm(self.PAD_FEATURES_DIM),
+            nn.GELU(),
+        )
 
-        # 1. Expert load: mean across tokens -> (B, 4)
-        load_mean = ew.mean(dim=1)
+        self.embedding_branch = nn.Sequential(
+            nn.Linear(self.PAD_FEATURES_DIM, self.PAD_FEATURES_DIM // 2),
+            nn.GELU(),
+            nn.Linear(self.PAD_FEATURES_DIM // 2, self.PAD_EMBEDDING_DIM),
+        )
 
-        # 2. Entropy statistics: [mean, std, max, min] -> (B, 4)
-        ent_stats = torch.stack([
-            ent.mean(dim=1),
-            ent.std(dim=1),
-            ent.max(dim=1).values,
-            ent.min(dim=1).values,
-        ], dim=-1)
+        self.logit_branch = nn.Sequential(
+            nn.Linear(self.PAD_FEATURES_DIM, self.PAD_FEATURES_DIM // 2),
+            nn.GELU(),
+            nn.Dropout(float(proj_dropout)),
+            nn.Linear(self.PAD_FEATURES_DIM // 2, 1),
+        )
 
-        features_list = [load_mean, ent_stats]
+        self._init_weights()
 
-        # 3. Gate Input statistics [NEW]
-        # Calculates mean, std, max, min for EACH of the 3 frequency bands
-        if gate_input is not None:
-            gate_stats = torch.cat([
-                gate_input.mean(dim=1),          # (B, 3)
-                gate_input.std(dim=1),           # (B, 3)
-                gate_input.max(dim=1).values,    # (B, 3)
-                gate_input.min(dim=1).values,    # (B, 3)
-            ], dim=-1)                           # Result: (B, 12)
-            features_list.append(gate_stats)
+    def _init_weights(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(module, nn.Linear):
+                nn.init.trunc_normal_(module.weight, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
 
-        # Concat all into (B, 20)
-        return torch.cat(features_list, dim=-1)  
+    def forward(self, features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        s1 = features["stage1_feat"]
+        s2 = features["stage2_feat"]
+        self._validate_stage_shapes(s1, s2)
 
-    def forward(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """
-        Args:
-            inputs: Dictionary containing pad_stem_feat, stage1/2 feats, and routing stats.
-        """
-        pad_stem = inputs['pad_stem_feat']    # (B, 128)
-        s1 = inputs['stage1_feat']            # (B, 64, 56, 56)
-        s2 = inputs['stage2_feat']            # (B, 128, 28, 28)
+        s1_aligned = self.tb1(s1)
+        s2_aligned = self.tb2(s2)
 
-        # -- Aux feature path --
-        f1 = self.block_s1(s1)                 # (B, 128, 56, 56)
-        f2 = self.block_s2(s2)                 # (B, 128, 28, 28)
-        f1 = self.gap(f1).flatten(1)           # (B, 128)
-        f2 = self.gap(f2).flatten(1)           # (B, 128)
-        feat_combined = torch.cat([f1, f2], dim=-1)  # (B, 256)
+        fused = torch.cat([s1_aligned, s2_aligned], dim=1)
+        mixed = self.fusion(fused)
+        agg = self.aggregator(mixed)
+        pad_features = self.proj(agg)
 
-        # -- Routing path --
-        # [NEW] These are now (B, 20) each
-        r_s2 = self._extract_routing_features(inputs['routing_stats_s2'])    
-        r_s3a = self._extract_routing_features(inputs['routing_stats_s3a'])  
-        r_s3b = self._extract_routing_features(inputs['routing_stats_s3b'])  
-        
-        # [NEW] route_combined is now (B, 60)
-        route_combined = torch.cat([r_s2, r_s3a, r_s3b], dim=-1)  
-
-        # -- Fusion --
-        # [NEW] all_features is now (B, 444) -> 128 + 256 + 60
-        all_features = torch.cat(
-            [pad_stem, feat_combined, route_combined], dim=-1,
-        )  
-        pad_features = self.fusion_mlp(all_features)  # (B, 128)
-
-        # -- Parallel output branches --
-        pad_embedding = F.normalize(
-            self.embedding_proj(pad_features), p=2, dim=-1
-        )  # (B, 32)
-        pad_logit = self.logit_head(pad_features)  # (B, 1)
+        embedding = self.embedding_branch(pad_features)
+        pad_embedding = F.normalize(embedding, p=2, dim=-1)
+        pad_logit = self.logit_branch(pad_features)
 
         return {
-            'pad_features': pad_features,
-            'pad_embedding': pad_embedding,
-            'pad_logit': pad_logit,
+            "pad_features": pad_features,
+            "pad_embedding": pad_embedding,
+            "pad_logit": pad_logit,
         }
+
+    @staticmethod
+    def _validate_stage_shapes(s1: torch.Tensor, s2: torch.Tensor) -> None:
+        if s1.ndim != 4 or s2.ndim != 4:
+            raise ValueError(
+                "PADHead expects 4D stage tensors: "
+                f"stage1_feat={tuple(s1.shape)}, stage2_feat={tuple(s2.shape)}"
+            )
+        if s1.shape[0] != s2.shape[0]:
+            raise ValueError(
+                "PADHead stage tensors must have same batch size: "
+                f"stage1={s1.shape[0]}, stage2={s2.shape[0]}"
+            )
+        if s1.shape[-2] != 2 * s2.shape[-2] or s1.shape[-1] != 2 * s2.shape[-1]:
+            raise ValueError(
+                "Expected stage1 spatial size to be 2x stage2 spatial size, "
+                f"got stage1={tuple(s1.shape[-2:])}, "
+                f"stage2={tuple(s2.shape[-2:])}."
+            )

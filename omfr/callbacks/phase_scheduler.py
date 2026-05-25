@@ -3,16 +3,13 @@ phase_scheduler.py — PhaseSchedulerCallback (DYNAMIC STATE MACHINE)
 
 Two-phase dynamic schedule (no fixed Phase-1 length, no Phase 3):
 
-    Phase 1  — identity foundation. Runs UNTIL EITHER:
-                 * `val/cascaded_IM` has not improved for `plateau_patience`
-                   validation rounds (min_delta gated), OR
-                 * `phase1_max_epochs` reached (hard cap, default 80).
-               Training NEVER stops — it transitions to Phase 2.
+    Phase 1  — identity foundation by default, or PAD foundation when
+               phases.phase1_task=pad. Runs until `phase1_max_epochs` unless
+               plateau transition is explicitly enabled.
 
-    Phase 2  — PAD on a fully detached projector, identity side frozen
-               ("Đóng Băng Tuyệt Đối"). Lasts `phase2_epochs`. On the
-               transition epoch (a Lightning epoch-start hook, OUTSIDE
-               the autograd region) we, in order:
+    Phase 2  — identity integration. Lasts `phase2_epochs`. On the transition
+               epoch (a Lightning epoch-start hook, OUTSIDE the autograd
+               region) we, in order:
                  1. swap identity-only loader -> combined id+pad loader,
                  2. hard re-scale the optimizer LR groups
                     (entire identity side -> 0.0, PAD unleashed),
@@ -46,6 +43,7 @@ class PhaseSchedulerCallback(L.Callback):
         phase1_warmup_delay: int = 5,
         alpha_target: float = 1.0,
         beta_target: float = 0.02,
+        gamma_target: float = 1.0,
         alpha_adv_target: float = 0.0,
         arcface_scale_init: float = 1.0,
         arcface_scale_start: float = 32.0,
@@ -54,6 +52,8 @@ class PhaseSchedulerCallback(L.Callback):
         arcface_margin_target: float = 0.5,
         moe_temp_phase1: float = 2.0,
         moe_temp_phase2_end: float = 1.0,
+        phase1_task: str = "identity",
+        transition_on_plateau: bool = True,
         # legacy/back-compat kwargs (ignored by the dynamic machine)
         phase1_epochs: Optional[int] = None,
         phase3_epochs: Optional[int] = None,
@@ -71,6 +71,7 @@ class PhaseSchedulerCallback(L.Callback):
         self.phase1_warmup_delay = int(phase1_warmup_delay)
         self.alpha_target = alpha_target
         self.beta_target = beta_target
+        self.gamma_target = gamma_target
         self.alpha_adv_target = alpha_adv_target
         self.arcface_scale_init = arcface_scale_init
         self.arcface_scale_start = arcface_scale_start
@@ -79,6 +80,8 @@ class PhaseSchedulerCallback(L.Callback):
         self.arcface_margin_target = arcface_margin_target
         self.moe_temp_phase1 = moe_temp_phase1
         self.moe_temp_phase2_end = moe_temp_phase2_end
+        self.phase1_task = str(phase1_task).lower()
+        self.transition_on_plateau = bool(transition_on_plateau)
 
         # Dynamic state
         self._best: Optional[float] = None
@@ -146,6 +149,8 @@ class PhaseSchedulerCallback(L.Callback):
         # Skip the pre-train sanity validation and anything past Phase 1.
         if trainer.sanity_checking:
             return
+        if not self.transition_on_plateau:
+            return
         if getattr(pl_module, "current_phase", 1) != 1 or self._phase2_started:
             return
 
@@ -198,18 +203,24 @@ class PhaseSchedulerCallback(L.Callback):
         arcface_margin = self._arcface_margin_for_epoch(epoch)
 
         if pl_module.current_phase == 1:
-            delay = max(self.phase1_warmup_delay, 0)
-            effective_epoch = max(epoch - delay, 0)
-            p1 = min(effective_epoch / max(self.phase1_warmup_epochs, 1), 1.0)
-            scale = self.arcface_scale_init + p1 * (
-                self.arcface_scale_start - self.arcface_scale_init
-            )
+            if self.phase1_task in {"pad", "pad_foundation"}:
+                scale = self.arcface_scale_start
+                pl_module.alpha = self.alpha_target
+            else:
+                delay = max(self.phase1_warmup_delay, 0)
+                effective_epoch = max(epoch - delay, 0)
+                p1 = min(effective_epoch / max(self.phase1_warmup_epochs, 1), 1.0)
+                scale = self.arcface_scale_init + p1 * (
+                    self.arcface_scale_start - self.arcface_scale_init
+                )
+                pl_module.alpha = 0.0
             for af_loss in pl_module.arcface_losses.values():
                 af_loss.set_scale(scale)
             self._set_arcface_margin(pl_module, arcface_margin)
 
-            pl_module.alpha = 0.0
             pl_module.beta = 0.0
+            if hasattr(pl_module, "identity_weight"):
+                pl_module.identity_weight = 0.0
             pl_module.alpha_adv = 0.0
             pl_module.lam_adv = 0.0
             self._set_moe_temperature(pl_module, self.moe_temp_phase1)
@@ -219,6 +230,9 @@ class PhaseSchedulerCallback(L.Callback):
                     "phase/arcface_scale": scale,
                     "phase/arcface_margin": arcface_margin,
                     "phase/moe_temperature": self.moe_temp_phase1,
+                    "phase/alpha": pl_module.alpha,
+                    "phase/gamma_identity": getattr(pl_module, "identity_weight", 0.0),
+                    "phase/beta": pl_module.beta,
                     "phase/current": 1.0,
                 },
                 step=trainer.global_step,
@@ -229,12 +243,14 @@ class PhaseSchedulerCallback(L.Callback):
             p2_end = self._phase2_start + self.phase2_epochs
             ramp_end_short = min(p2_start + self.warmup_epochs, p2_end)
 
-            pl_module.alpha = self._cosine_ramp(
-                epoch, p2_start, ramp_end_short, self.alpha_target,
-            )
+            pl_module.alpha = self.alpha_target
             pl_module.beta = self._cosine_ramp(
-                epoch, p2_start, ramp_end_short, self.beta_target,
+                epoch, p2_start, ramp_end_short, self.beta_target, min_frac=0.0,
             )
+            if hasattr(pl_module, "identity_weight"):
+                pl_module.identity_weight = self._cosine_ramp(
+                    epoch, p2_start, ramp_end_short, self.gamma_target, min_frac=0.0,
+                )
             pl_module.alpha_adv = self._cosine_ramp(
                 epoch, p2_start, p2_end, self.alpha_adv_target,
             )
@@ -262,6 +278,7 @@ class PhaseSchedulerCallback(L.Callback):
                 {
                     "phase/alpha": pl_module.alpha,
                     "phase/beta": pl_module.beta,
+                    "phase/gamma_identity": getattr(pl_module, "identity_weight", 0.0),
                     "phase/alpha_adv": pl_module.alpha_adv,
                     "phase/lam_adv": pl_module.lam_adv,
                     "phase/arcface_scale": new_scale,
@@ -284,6 +301,8 @@ class PhaseSchedulerCallback(L.Callback):
 
         pl_module.alpha = 0.0
         pl_module.beta = 0.0
+        if hasattr(pl_module, "identity_weight"):
+            pl_module.identity_weight = 0.0
         pl_module.alpha_adv = 0.0
         pl_module.lam_adv = 0.0
 
@@ -304,18 +323,20 @@ class PhaseSchedulerCallback(L.Callback):
         trainer.fit_loop._combined_loader = None
         trainer.fit_loop.setup_data()
 
-        # (2) absolute freeze: brake the entire identity side to LR 0,
-        #     unleash the PAD projector (backbone_phase2 = 0.0,
-        #     identity_head_phase2 = 0.0, pad_head_phase2 = 5.0).
+        # (2) phase-2 LR surgery: absolute-freeze configs brake the whole
+        #     identity side; Level-1 configs keep only early shared texture
+        #     groups on a tiny LR and leave late identity layers frozen.
         if hasattr(pl_module, "apply_phase2_lr_multipliers"):
             pl_module.apply_phase2_lr_multipliers(trainer)
 
+        phase2_mode = "IDENTITY INTEGRATION"
         print(
             f"\n{'='*64}\n"
-            f"  PHASE 2 START (epoch {epoch}) — DYNAMIC TRANSITION\n"
-            f"  reason: {'plateau/armed' if self._pending_phase2 else 'max-epoch cap'}\n"
-            f"  mode: ABSOLUTE FREEZE (identity side LR=0, PAD detached)\n"
-            f"  alpha->{self.alpha_target}, beta->{self.beta_target}, "
+            f"  PHASE 2 START (epoch {epoch}) — IDENTITY INTEGRATION\n"
+            f"  reason: {'plateau/armed' if self._pending_phase2 else 'fixed phase1 cap'}\n"
+            f"  mode: {phase2_mode}\n"
+            f"  alpha={self.alpha_target}, gamma->{self.gamma_target}, "
+            f"beta->{self.beta_target}, "
             f"phase2 length={self.phase2_epochs} ep\n"
             f"{'='*64}\n"
         )

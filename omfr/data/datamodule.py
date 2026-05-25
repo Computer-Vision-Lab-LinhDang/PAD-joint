@@ -3,7 +3,8 @@ datamodule.py — OMFR Lightning DataModule
 
 Manages three datasets and switches DataLoader strategy per training phase:
 
-    Phase 1: Identity dataset only (PKSampler — P=32 identities × K=4 samples)
+    Phase 1: Identity dataset only by default, or PAD-only when
+             phases.phase1_task=pad (BalancedPADSampler)
     Phase 2: CombinedLoader — {"identity": ..., "pad": ...}  (interleaved steps)
     Phase 3: CombinedLoader — {"identity": ..., "pad": ..., "joint": ...}
 
@@ -156,6 +157,24 @@ class OMFRDataModule(L.LightningDataModule):
         K           = int(self._cfg_get("pk_K", "data.pk_k", default=4))
         pad_bs      = int(self._cfg_get("pad_batch_size", "data.pad_batch_size", default=128))
         pin_memory  = bool(self._cfg_get("pin_memory", "data.pin_memory", default=True))
+
+        phase1_task = str(self._cfg_get(
+            "phase1_task", "phases.phase1_task", default="identity",
+        )).lower()
+
+        if phase == 1 and phase1_task in {"pad", "pad_foundation"}:
+            assert self.pad_ds is not None, \
+                "pad_ds not loaded — check pad_root/pad_datasets in config"
+            sampler = BalancedPADSampler(
+                liveness_labels=self.pad_ds.get_liveness_labels(),
+                batch_size=pad_bs,
+            )
+            return DataLoader(
+                self.pad_ds,
+                batch_sampler=sampler,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+            )
 
         if phase == 1:
             assert self.identity_ds is not None, \

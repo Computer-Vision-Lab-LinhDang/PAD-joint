@@ -1,16 +1,14 @@
-# configs/grand_fusion_sa24_dynamic.yaml
+# configs/grand_fusion_sa24_padft.yaml
 # ════════════════════════════════════════════════════════════════════
-# OMFR — FastViT-SA24 | DYNAMIC 2-phase multi-task
+# OMFR — FastViT-SA24 | PAD-first 2-phase multi-task
 #
-#   Phase 1  Identity foundation. Runs until `val/cascaded_IM` plateaus
-#            (patience=5) OR phase1_max_epochs (80). Never stops.
-#   Phase 2  Split-branch PAD adaptation — identity is a frozen teacher/guard,
-#            while PAD uses its own Gabor/PADStem/PADHead path. Shared FastViT
-#            is context only by default; open early unfreeze later if PAD is
-#            stable.
+#   Phase 1  PAD foundation for 15 epochs:
+#            Balanced PAD batches, MS-TAH + full shared backbone, SupCon+BCE.
+#   Phase 2  Identity integration for 25 epochs:
+#            Alternating identity/PAD batches, identity loss ramps in, orth ramps in.
 #
-#   On the dynamic transition: loader swap -> LR surgery
-#   (identity side x0.0, shared trunk x0.0, PAD head x2.0).
+#   On transition: loader swap -> LR surgery
+#   (identity head/ArcFace from x0.0 to x2.0, backbone stays trainable).
 #
 #   Checkpoints: best_phase1.ckpt (Phase-1 anchor / resume point) and
 #   best_phase2.ckpt (deployable) are tracked SEPARATELY per phase.
@@ -42,20 +40,25 @@ identity_head:
 pad_head:
   stage1_dim: 64
   stage2_dim: 128
+  align_ch: 128
+  fusion_ch: 192
+  embedding_dim: 64
+  stage1_dw_kernel: 9
+  stage2_dw_kernel: 5
   dropout: 0.1
   proj_dropout: 0.2              # dropout inside the MLP projector
   num_classes: 1
-  pad_features_dim: 128
-  pad_embedding_dim: 32
+  pad_features_dim: 192
+  pad_embedding_dim: 64
 
-# Stage-2 PAD split-branch adaptation:
+# Stage-2 PAD split-branch adaptation placeholder:
 #   identity path -> identity_gabor -> shared FastViT -> identity_embedding
-#   PAD path      -> pad_gabor/PADStem + frozen FastViT context -> pad_embedding/logit
-# Validation/eval must use this same PAD policy.
+#   PAD path      -> MS-TAH on stage1/stage2 spatial texture features
+# Scheduler wiring for this block is handled in the next training change.
 pad_stage2:
-  backbone_grad: false
+  backbone_grad: true
   backbone_input: pad_gabor
-  detach_backbone_features: true
+  detach_backbone_features: false
   detach_routing_stats: true
 
 # Sensor id 8 is the dataset fallback "Unknown". It is kept in the label
@@ -83,15 +86,17 @@ losses:
   balancing_loss_weight: 0.005
   phase2_identity_loss_weight: 0.0
   phase2_balance_loss_weight: 0.0
-  pad_bce_weight: 0.5
+  pad_bce_weight: 1.0
+  pad_bce_phase_weight: 1.0
+  pad_supcon_weight: 1.0
   pad_focal_alpha: 0.5
-  pad_focal_gamma: 1.0
-  pad_focal_weight: 1.0
+  pad_focal_gamma: 2.0
+  pad_focal_weight: 0.0
   pad_hard_spoof_sensor_ids: [6]  # Swipe only; Unknown(8) intentionally excluded
   pad_hard_spoof_material_ids: [4, 6, 7]
-  pad_hard_spoof_weight: 2.0
-  pad_ohem_fraction: 0.25
-  pad_ohem_weight: 1.5
+  pad_hard_spoof_weight: 1.0
+  pad_ohem_fraction: 0.0
+  pad_ohem_weight: 1.0
   identity_supcon_weight: 0.9
   identity_arcface_weight: 0.1
   identity_label_smoothing: 0.1
@@ -108,24 +113,29 @@ optimizer:
   lr_multipliers:
     # Phase-1 effective multipliers
     gabor: 0.1
-    gabor_pad: 1.0
+    gabor_pad: 0.0
     backbone_embed: 1.0
     backbone_early: 1.0
     backbone_late: 1.0
     moe_experts: 2.0
-    identity_head: 1.0
-    arcface: 0.1
-    sensor_adv_head: 1.0
-    # Phase-2 surgery targets (relative to base lr) — split PAD branch.
-    gabor_phase2: 0.0            # identity input path frozen
-    gabor_pad_phase2: 1.0        # PAD input path trainable
-    backbone_phase2: 0.0         # default for unspecified shared groups
-    backbone_embed_phase2: 0.0
-    backbone_early_phase2: 0.0   # keep shared FastViT frozen in split mode
-    backbone_late_phase2: 0.0    # identity-relevant late stages frozen
-    moe_experts_phase2: 0.0      # shared MoE/router frozen in Level-1
-    identity_head_phase2: 0.0    # identity representation head frozen
-    pad_head_phase2: 2.0         # PADStem/PADHead learn, but avoid logit collapse
+    identity_head: 0.0           # inactive during PAD foundation
+    arcface: 0.0                 # inactive during PAD foundation
+    pad_stem: 0.0                # MS-TAH no longer consumes PADStem
+    pad_head: 1.0
+    sensor_adv_head: 0.0
+    # Phase-2 surgery targets (relative to base lr) — identity integration.
+    gabor_phase2: 0.1
+    gabor_pad_phase2: 0.0
+    backbone_phase2: 1.0
+    backbone_embed_phase2: 1.0
+    backbone_early_phase2: 1.0
+    backbone_late_phase2: 1.0
+    moe_experts_phase2: 1.0
+    identity_head_phase2: 2.0
+    arcface_phase2: 2.0
+    pad_stem_phase2: 0.0
+    pad_head_phase2: 1.0
+    sensor_adv_head_phase2: 0.0
 
 scheduler:
   name: CosineAnnealingLR
@@ -133,31 +143,35 @@ scheduler:
   eta_min: 1.0e-06
 
 # ─────────────────────────────────────────────────────────────────
-# DYNAMIC phases (no fixed Phase-1 length, no Phase 3)
+# PAD-first phases
 # ─────────────────────────────────────────────────────────────────
 phases:
-  phase1_max_epochs: 100          # hard cap on Phase 1
-  phase2_epochs: 40              # Phase 2 length once triggered
-  total_epochs: 140              # = max possible (100 + 40); cosine T_max
-  patience: 5                    # plateau patience on val/cascaded_IM
+  phase1_task: pad
+  phase1_max_epochs: 15
+  phase2_epochs: 25
+  total_epochs: 40
+  transition_on_plateau: false
+  phase2_freeze_identity: false
+  patience: 5
   phase1_warmup_delay: 5
   phase1_warmup_epochs: 10
   arcface_scale_init: 1.0
   arcface_margin_init: 0.0
   arcface_margin_target: 0.5
-  warmup_epochs: 0               # Phase-2 PAD starts as the only optimized task
+  warmup_epochs: 5
   alpha_target: 1.0
-  beta_target: 0.0
+  gamma_target: 1.0
+  beta_target: 0.1
   alpha_adv_target: 0.0
   arcface_scale_start: 32.0
-  arcface_scale_end: 48.0
+  arcface_scale_end: 64.0
   moe_temp_phase1: 2.0
   moe_temp_phase2_end: 1.0
 
 callbacks:
   dynamic_phase:
-    monitor: val/cascaded_IM
-    mode: max
+    monitor: val/acer
+    mode: min
     patience: 5
     min_delta: 1.0e-4
   early_stopping:
@@ -183,7 +197,7 @@ data:
   identity_fvc_ratio: 0.5        # 50/50 FVC:NIST classes per batch
   pk_p: 16
   pk_k: 2
-  pad_batch_size: 32             # safe on 11GiB (PAD backbone is no-grad now; can raise)
+  pad_batch_size: 128
   identity_num_views: 2
   identity_preset: fingerprint_hard
   num_workers: 8
@@ -194,22 +208,22 @@ trainer:
   accelerator: gpu
   devices: 1
   precision: 16-mixed
-  max_epochs: 120
+  max_epochs: 40
   gradient_clip_val: 0.5
-  accumulate_grad_batches: 4     # effective batch ~ 256
+  accumulate_grad_batches: 1
   log_every_n_steps: 10
   check_val_every_n_epoch: 1
   enable_progress_bar: true
   deterministic: false
 
 checkpoint:
-  dirpath: checkpoints_sa24_stage2_split/
-  monitor: val/cascaded_IM
-  mode: max
+  dirpath: checkpoints_sa24_stage2_padft/
+  monitor: val/acer
+  mode: min
   phase2_monitor: val/acer
   phase2_mode: min
   identity_guard:
-    enabled: true
+    enabled: false
     min_phase: 2
     require_metrics: true
     baseline_rank1: null         # optional override when starting directly from a Phase-1 ckpt
@@ -222,13 +236,13 @@ checkpoint:
     max_tar_drop: 0.05
 
 logging:
-  name: omfr_sa24_dynamic
+  name: omfr_sa24_padft
   save_dir: logs/
   version: null
   wandb:
     enabled: true
     project: omfr
-    name: sa24_dynamic
+    name: sa24_padfirst_mstah
     log_model: false
 
 evaluation:

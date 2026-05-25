@@ -26,11 +26,14 @@ Thumbs.db
 
 # Training artifacts
 checkpoints/
+checkpoints_*/
 logs/
+outputs/
 exports/
 wandb/
 checkpoints_distill/
 checkpoints_sa24_dynamic/
+*.ckpt
 
 # Data (large, downloaded separately)
 data/raw/
@@ -46,6 +49,10 @@ data/processed/
 
 # OMC internal state
 .omc/
+
+# Local Codex / research artifacts
+.codex/
+pad_branch_research/
 
 # Secrets
 .env

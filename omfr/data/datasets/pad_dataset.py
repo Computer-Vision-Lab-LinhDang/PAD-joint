@@ -33,6 +33,10 @@ def make_pad_train_transform(image_size: int = 224) -> T.Compose:
     (sensor noise, brightness/contrast drift, mild geometric jitter) so
     the head cannot memorise per-image pixel statistics. Operates on
     1-channel tensors already loaded by PADDataset._load_image.
+
+    Keep output on the same [0, 1] scale used by validation/evaluation and
+    the identity path. A train-only Normalize here creates a PAD train/test
+    distribution shift because eval PADDataset instances do not transform.
     """
     return T.Compose([
         T.RandomHorizontalFlip(p=0.5),
@@ -52,7 +56,6 @@ def make_pad_train_transform(image_size: int = 224) -> T.Compose:
         T.RandomErasing(
             p=0.25, scale=(0.02, 0.15), ratio=(0.3, 3.3), value=0.0,
         ),
-        T.Normalize(mean=[0.5], std=[0.5]),
     ])
 
 

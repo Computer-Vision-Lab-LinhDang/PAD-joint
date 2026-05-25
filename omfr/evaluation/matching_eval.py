@@ -82,17 +82,25 @@ def compute_tar_at_far(
     genuine_arr = np.array(genuine_scores, dtype=np.float32)
     impostor_arr = np.array(impostor_scores, dtype=np.float32)
 
-    # Sweep thresholds from high to low; find where FAR ≤ target
-    thresholds = np.sort(impostor_arr)[::-1]  # descending
+    # Pick the least-strict threshold whose empirical FAR does not exceed
+    # the target. The old high-to-low sweep stopped at the maximum impostor
+    # score, so every FAR target used the same overly strict threshold.
+    n_impostor = impostor_arr.size
+    allowed_false_accepts = int(np.floor(float(far) * n_impostor))
+    impostor_desc = np.sort(impostor_arr)[::-1]
 
-    best_tar = 0.0
-    for t in thresholds:
-        current_far = float((impostor_arr >= t).mean())
-        if current_far <= far:
-            best_tar = float((genuine_arr >= t).mean())
-            break
+    if allowed_false_accepts <= 0:
+        # Zero-FAR operating point: threshold just above the max impostor.
+        threshold = np.nextafter(impostor_desc[0], np.inf)
+    elif allowed_false_accepts >= n_impostor:
+        threshold = -np.inf
+    else:
+        # Exclude the boundary score to handle ties conservatively. With no
+        # ties, this accepts exactly `allowed_false_accepts` impostor pairs.
+        boundary = impostor_desc[allowed_false_accepts]
+        threshold = np.nextafter(boundary, np.inf)
 
-    return best_tar
+    return float((genuine_arr >= threshold).mean())
 
 
 def compute_cmc_curve(

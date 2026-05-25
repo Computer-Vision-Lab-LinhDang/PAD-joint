@@ -31,7 +31,7 @@ from lightning.pytorch.callbacks import (
     RichProgressBar,
     StochasticWeightAveraging,
 )
-from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
+from lightning.pytorch.loggers import CSVLogger, TensorBoardLogger, WandbLogger
 
 from omfr.models.omfr import OMFRModule
 from omfr.data.datamodule import OMFRDataModule
@@ -64,9 +64,15 @@ class PhaseGatedModelCheckpoint(ModelCheckpoint):
     deployable joint model) — each best-tracked only within its phase.
     """
 
-    def __init__(self, phase_tag: int, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        phase_tag: int,
+        identity_guard: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(**kwargs)
         self.omfr_phase_tag = int(phase_tag)
+        self.identity_guard = identity_guard or {}
         # Not persisted in state_dict — guarantees a one-time reset the
         # first time THIS process sees its phase active, even if state
         # was restored from a prior run's checkpoint.
@@ -89,10 +95,73 @@ class PhaseGatedModelCheckpoint(ModelCheckpoint):
         pl = getattr(trainer, "lightning_module", None)
         return int(getattr(pl, "current_phase", 1)) == self.omfr_phase_tag
 
+    @staticmethod
+    def _metric_float(trainer: L.Trainer, name: str) -> Optional[float]:
+        value = trainer.callback_metrics.get(name)
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                return None
+            return float(value.detach().cpu())
+        return float(value)
+
+    def _passes_identity_guard(self, trainer: L.Trainer, pl_module: Any) -> bool:
+        guard = self.identity_guard
+        if not guard.get("enabled", False):
+            return True
+        if self.omfr_phase_tag < int(guard.get("min_phase", 2)):
+            return True
+
+        failures = []
+        checks = (
+            ("val/identity_rank1", "min_rank1", "max_rank1_drop"),
+            ("val/tar_at_far", "min_tar_at_far", "max_tar_drop"),
+        )
+        baseline = dict(getattr(pl_module, "_identity_guard_baseline", {}) or {})
+        if guard.get("baseline_rank1") is not None:
+            baseline["val/identity_rank1"] = float(guard["baseline_rank1"])
+        if guard.get("baseline_tar_at_far") is not None:
+            baseline["val/tar_at_far"] = float(guard["baseline_tar_at_far"])
+
+        for metric_name, min_key, drop_key in checks:
+            current = self._metric_float(trainer, metric_name)
+            if current is None:
+                if guard.get("require_metrics", True):
+                    failures.append(f"{metric_name}=missing")
+                continue
+
+            min_value = guard.get(min_key)
+            if min_value is not None and current < float(min_value):
+                failures.append(f"{metric_name}={current:.4f} < {float(min_value):.4f}")
+
+            max_drop = guard.get(drop_key)
+            base_value = baseline.get(metric_name)
+            if max_drop is not None and base_value is not None:
+                floor = float(base_value) - float(max_drop)
+                if current < floor:
+                    failures.append(
+                        f"{metric_name}={current:.4f} < baseline-drop {floor:.4f}"
+                    )
+
+        passed = not failures
+        trainer.logger.log_metrics(
+            {"checkpoint/identity_guard_pass": 1.0 if passed else 0.0},
+            step=trainer.global_step,
+        )
+        if not passed:
+            print(
+                "[identity-guard] reject checkpoint: "
+                + " | ".join(failures)
+            )
+        return passed
+
     def on_validation_end(self, trainer: L.Trainer, pl_module: Any) -> None:
         # Skip entirely (incl. monitor/best bookkeeping) outside the
         # target phase, so best is chosen only among in-phase epochs.
         if not self._in_phase(trainer):
+            return
+        if not self._passes_identity_guard(trainer, pl_module):
             return
         if not self._reset_done_this_run:
             # First time this RUN enters our phase. Drop any best_score
@@ -221,6 +290,20 @@ def _prepare_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "balancing_loss_weight",
         config.get("balancing_loss_weight", runtime["gamma"]),
     )
+    runtime["phase2_identity_loss_weight"] = losses_cfg.get(
+        "phase2_identity_loss_weight",
+        config.get("phase2_identity_loss_weight", 0.0),
+    )
+    runtime["phase2_balance_loss_weight"] = losses_cfg.get(
+        "phase2_balance_loss_weight",
+        config.get("phase2_balance_loss_weight", 0.0),
+    )
+    runtime["pad_supcon_weight"] = losses_cfg.get(
+        "pad_supcon_weight", config.get("pad_supcon_weight", 1.0)
+    )
+    runtime["pad_bce_phase_weight"] = losses_cfg.get(
+        "pad_bce_phase_weight", config.get("pad_bce_phase_weight", 1.0)
+    )
     runtime["identity_supcon_weight"] = losses_cfg.get(
         "identity_supcon_weight", config.get("identity_supcon_weight", 0.7)
     )
@@ -228,6 +311,10 @@ def _prepare_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "identity_arcface_weight", config.get("identity_arcface_weight", 0.1)
     )
     runtime["warmup_epochs"] = phases_cfg.get("warmup_epochs", 5)
+    runtime["phase2_freeze_identity"] = phases_cfg.get(
+        "phase2_freeze_identity",
+        config.get("phase2_freeze_identity", True),
+    )
     backbone_cfg = config.get("backbone", {})
     runtime["pretrained"] = backbone_cfg.get("pretrained", True)
     runtime["grad_checkpoint"] = backbone_cfg.get(
@@ -282,6 +369,7 @@ def build_callbacks(config: Dict[str, Any]) -> list:
         phase1_warmup_delay=phase_cfg.get("phase1_warmup_delay", 5),
         alpha_target=phase_cfg.get("alpha_target", 1.0),
         beta_target=phase_cfg.get("beta_target", 0.02),
+        gamma_target=phase_cfg.get("gamma_target", 1.0),
         alpha_adv_target=phase_cfg.get("alpha_adv_target", 0.0),
         arcface_scale_init=phase_cfg.get("arcface_scale_init", 1.0),
         arcface_scale_start=phase_cfg.get("arcface_scale_start", 32.0),
@@ -290,6 +378,8 @@ def build_callbacks(config: Dict[str, Any]) -> list:
         arcface_margin_target=phase_cfg.get("arcface_margin_target", 0.5),
         moe_temp_phase1=phase_cfg.get("moe_temp_phase1", 2.0),
         moe_temp_phase2_end=phase_cfg.get("moe_temp_phase2_end", 1.0),
+        phase1_task=phase_cfg.get("phase1_task", "identity"),
+        transition_on_plateau=phase_cfg.get("transition_on_plateau", True),
     )
 
     gradient_monitor = GradientMonitor(log_every_n_steps=50)
@@ -334,6 +424,7 @@ def build_callbacks(config: Dict[str, Any]) -> list:
         # Phase-2 best — the deployable joint model (PAD trained).
         ckpt_phase2 = PhaseGatedModelCheckpoint(
             phase_tag=2,
+            identity_guard=ckpt_cfg.get("identity_guard", {}),
             dirpath=dirpath,
             filename="best_phase2",
             monitor=phase2_monitor,
@@ -367,21 +458,32 @@ def build_logger(config: Dict[str, Any]) -> list:
     log_cfg = config.get("logging", {})
     loggers = []
 
-    loggers.append(TensorBoardLogger(
-        save_dir=log_cfg.get("save_dir", "logs/"),
-        name=log_cfg.get("name", "omfr"),
-        version=log_cfg.get("version", None),
-    ))
+    try:
+        loggers.append(TensorBoardLogger(
+            save_dir=log_cfg.get("save_dir", "logs/"),
+            name=log_cfg.get("name", "omfr"),
+            version=log_cfg.get("version", None),
+        ))
+    except ModuleNotFoundError as exc:
+        print(f"[logger] TensorBoard unavailable ({exc}); using CSVLogger.")
+        loggers.append(CSVLogger(
+            save_dir=log_cfg.get("save_dir", "logs/"),
+            name=log_cfg.get("name", "omfr"),
+            version=log_cfg.get("version", None),
+        ))
 
     wandb_cfg = log_cfg.get("wandb", {})
     if wandb_cfg.get("enabled", True):
-        loggers.append(WandbLogger(
-            project=wandb_cfg.get("project", "omfr"),
-            name=wandb_cfg.get("name", None),
-            save_dir=log_cfg.get("save_dir", "logs/"),
-            log_model=wandb_cfg.get("log_model", False),
-            config=config,
-        ))
+        try:
+            loggers.append(WandbLogger(
+                project=wandb_cfg.get("project", "omfr"),
+                name=wandb_cfg.get("name", None),
+                save_dir=log_cfg.get("save_dir", "logs/"),
+                log_model=wandb_cfg.get("log_model", False),
+                config=config,
+            ))
+        except ModuleNotFoundError as exc:
+            print(f"[logger] W&B unavailable ({exc}); continuing without W&B.")
 
     return loggers
 
@@ -419,6 +521,54 @@ def build_trainer(
     return L.Trainer(**trainer_kwargs)
 
 
+def load_init_weights(
+    model: OMFRModule,
+    checkpoint_path: str,
+    skip_prefixes: Optional[list[str]] = None,
+) -> None:
+    """Initialize model weights from a checkpoint without optimizer state.
+
+    This is intentionally different from ``--resume``. It loads only matching
+    tensors from the checkpoint state_dict, so a Phase-1 teacher trained with
+    a different identity class count can still initialize the shared trunk and
+    heads while ArcFace classifier weights are skipped.
+    """
+    skip_prefixes = skip_prefixes or []
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    state_dict = ckpt.get("state_dict", ckpt)
+    own_state = model.state_dict()
+
+    loaded: Dict[str, torch.Tensor] = {}
+    skipped: list[str] = []
+    for key, value in state_dict.items():
+        if any(key.startswith(prefix) for prefix in skip_prefixes):
+            skipped.append(f"{key}: skipped by prefix")
+            continue
+        if key not in own_state:
+            skipped.append(f"{key}: missing in target")
+            continue
+        if tuple(value.shape) != tuple(own_state[key].shape):
+            skipped.append(
+                f"{key}: shape {tuple(value.shape)} != {tuple(own_state[key].shape)}"
+            )
+            continue
+        loaded[key] = value
+
+    missing, unexpected = model.load_state_dict(loaded, strict=False)
+    print(
+        f"[init-from] loaded {len(loaded)} tensors from {checkpoint_path}; "
+        f"skipped {len(skipped)} tensors; missing {len(missing)}; "
+        f"unexpected {len(unexpected)}"
+    )
+    preview = skipped[:20]
+    if preview:
+        print("[init-from] skipped preview:")
+        for item in preview:
+            print(f"  - {item}")
+    if len(skipped) > len(preview):
+        print(f"[init-from] ... {len(skipped) - len(preview)} more skipped")
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -438,6 +588,24 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Path to a checkpoint to resume training from.",
+    )
+    parser.add_argument(
+        "--init-from",
+        type=str,
+        default=None,
+        help=(
+            "Initialize model weights from a checkpoint without restoring "
+            "optimizer/callback state. Shape-mismatched tensors are skipped."
+        ),
+    )
+    parser.add_argument(
+        "--init-skip-prefix",
+        action="append",
+        default=["arcface_losses."],
+        help=(
+            "State-dict prefix to skip when using --init-from. Can be passed "
+            "multiple times. Defaults to skipping ArcFace classifiers."
+        ),
     )
     parser.add_argument(
         "--seed",
@@ -474,6 +642,8 @@ def _parse_overrides(override_list: list[str]) -> Dict[str, Any]:
 
 def main() -> None:
     args = parse_args()
+    if args.resume and args.init_from:
+        raise ValueError("Use either --resume or --init-from, not both.")
 
     L.seed_everything(args.seed, workers=True)
 
@@ -493,6 +663,12 @@ def main() -> None:
         config.setdefault("identity_head", {})["num_classes"] = inferred_num_classes
 
     model      = build_module(runtime_config)
+    if args.init_from:
+        load_init_weights(
+            model,
+            checkpoint_path=args.init_from,
+            skip_prefixes=args.init_skip_prefix,
+        )
     callbacks  = build_callbacks(config)
     logger     = build_logger(config)
     trainer    = build_trainer(config, callbacks, logger)
