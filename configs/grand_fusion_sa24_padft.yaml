@@ -88,6 +88,11 @@ losses:
   phase2_balance_loss_weight: 0.0
   pad_bce_weight: 1.0
   pad_bce_phase_weight: 1.0
+  # Identity-domain samples are live-only. Keep this small so it calibrates
+  # PAD acceptance on FVC/NIST live prints without turning PAD into a dataset
+  # shortcut.
+  pad_identity_live_weight: 0.1
+  pad_detach_identity_orth_on_pad: true
   pad_supcon_weight: 1.0
   pad_focal_alpha: 0.5
   pad_focal_gamma: 2.0
@@ -97,8 +102,8 @@ losses:
   pad_hard_spoof_weight: 1.0
   pad_ohem_fraction: 0.0
   pad_ohem_weight: 1.0
-  identity_supcon_weight: 0.9
-  identity_arcface_weight: 0.1
+  identity_supcon_weight: 0.0
+  identity_arcface_weight: 1.0
   identity_label_smoothing: 0.1
 
 # ─────────────────────────────────────────────────────────────────
@@ -131,8 +136,8 @@ optimizer:
     backbone_early_phase2: 1.0
     backbone_late_phase2: 1.0
     moe_experts_phase2: 1.0
-    identity_head_phase2: 2.0
-    arcface_phase2: 2.0
+    identity_head_phase2: 1.0
+    arcface_phase2: 1.0
     pad_stem_phase2: 0.0
     pad_head_phase2: 1.0
     sensor_adv_head_phase2: 0.0
@@ -158,10 +163,10 @@ phases:
   arcface_scale_init: 1.0
   arcface_margin_init: 0.0
   arcface_margin_target: 0.5
-  warmup_epochs: 5
+  warmup_epochs: 10
   alpha_target: 1.0
   gamma_target: 1.0
-  beta_target: 0.1
+  beta_target: 0.02
   alpha_adv_target: 0.0
   arcface_scale_start: 32.0
   arcface_scale_end: 64.0
@@ -217,7 +222,7 @@ trainer:
   deterministic: false
 
 checkpoint:
-  dirpath: checkpoints_sa24_stage2_padft/
+  dirpath: checkpoints_sa24_padfirst_arcface_livecal/
   monitor: val/acer
   mode: min
   phase2_monitor: val/acer
@@ -236,17 +241,18 @@ checkpoint:
     max_tar_drop: 0.05
 
 logging:
-  name: omfr_sa24_padft
+  name: omfr_sa24_padfirst_arcface_livecal
   save_dir: logs/
-  version: null
+  version: 0
   wandb:
     enabled: true
     project: omfr
-    name: sa24_padfirst_mstah
+    name: sa24_padfirst_arcface_livecal
     log_model: false
 
 evaluation:
   pad_threshold: 0.5
+  cascade_pad_threshold: 0.35
   far: 1.0e-4
   cmc_max_rank: 10
   mrl_eval_dims: [64, 128, 256]

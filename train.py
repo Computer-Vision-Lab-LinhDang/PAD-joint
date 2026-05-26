@@ -304,6 +304,13 @@ def _prepare_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
     runtime["pad_bce_phase_weight"] = losses_cfg.get(
         "pad_bce_phase_weight", config.get("pad_bce_phase_weight", 1.0)
     )
+    runtime["pad_identity_live_weight"] = losses_cfg.get(
+        "pad_identity_live_weight", config.get("pad_identity_live_weight", 0.0)
+    )
+    runtime["pad_detach_identity_orth_on_pad"] = losses_cfg.get(
+        "pad_detach_identity_orth_on_pad",
+        config.get("pad_detach_identity_orth_on_pad", True),
+    )
     runtime["identity_supcon_weight"] = losses_cfg.get(
         "identity_supcon_weight", config.get("identity_supcon_weight", 0.7)
     )

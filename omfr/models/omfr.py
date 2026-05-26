@@ -222,6 +222,17 @@ class OMFRModule(L.LightningModule):
         self.pad_bce_phase_weight: float = float(
             config.get("pad_bce_phase_weight", 1.0)
         )
+        self.pad_identity_live_weight: float = float(
+            config.get("pad_identity_live_weight", 0.0)
+        )
+        self.pad_detach_identity_orth_on_pad: bool = bool(
+            config.get("pad_detach_identity_orth_on_pad", True)
+        )
+        eval_cfg = config.get("evaluation", {}) or {}
+        self.pad_threshold: float = float(eval_cfg.get("pad_threshold", 0.5))
+        self.cascade_pad_threshold: float = float(
+            eval_cfg.get("cascade_pad_threshold", self.pad_threshold)
+        )
         self.phase2_freeze_identity: bool = bool(
             config.get(
                 "phase2_freeze_identity",
@@ -578,6 +589,13 @@ class OMFRModule(L.LightningModule):
         )
         return l_sensor
 
+    @staticmethod
+    def _pad_identity_live_loss(pad_logit: torch.Tensor) -> torch.Tensor:
+        """Small live-only PAD calibration loss on identity-domain samples."""
+        logits = pad_logit.squeeze(-1).reshape(-1)
+        targets = torch.ones_like(logits)
+        return F.binary_cross_entropy_with_logits(logits, targets)
+
     def _log_pad_loss_parts(self, pad_parts: Dict[str, torch.Tensor]) -> None:
         self.log("train/pad_focal_loss", pad_parts["focal"], sync_dist=True)
         self.log("train/pad_bce_loss",   pad_parts["bce"],   sync_dist=True)
@@ -664,15 +682,29 @@ class OMFRModule(L.LightningModule):
 
         backbone_out = self._run_backbone(images)
         id_out       = self._run_identity(backbone_out)
-        pad_out      = self._run_pad(backbone_out, detach_backbone_features=False)
+        # Identity-domain samples are all live. Use them only as a light PAD
+        # calibration signal, with backbone tensors detached so this cannot
+        # turn PAD into an identity-domain shortcut.
+        pad_out      = self._run_pad(backbone_out, detach_backbone_features=True)
 
         id_parts  = self._identity_loss(id_out["mrl_embeddings"], identity_labels)
         l_orth    = self.orth_loss(pad_out["pad_embedding"], id_out["identity_embedding"])
-        loss      = self.identity_weight * id_parts["total"] + self.beta * l_orth
+        l_pad_live = self._pad_identity_live_loss(pad_out["pad_logit"])
+        loss      = (
+            self.identity_weight * id_parts["total"]
+            + self.beta * l_orth
+            + self.alpha * self.pad_identity_live_weight * l_pad_live
+        )
 
         self.log("train/identity_loss", id_parts["total"], prog_bar=True, sync_dist=True)
         self.log("train/id_arcface",    id_parts["arcface"],                sync_dist=True)
         self.log("train/id_supcon",     id_parts["supcon"],                 sync_dist=True)
+        self.log("train/pad_identity_live_loss", l_pad_live, sync_dist=True)
+        self.log(
+            "train/pad_identity_live_weight",
+            self.pad_identity_live_weight,
+            sync_dist=True,
+        )
         self.log("train/orth_loss",     l_orth,            sync_dist=True)
         self.log("train/identity_weight", self.identity_weight, sync_dist=True)
         self.log("train/beta", self.beta, sync_dist=True)
@@ -692,10 +724,19 @@ class OMFRModule(L.LightningModule):
         backbone_out = self._run_backbone(images)
         pad_out      = self._run_pad(backbone_out, detach_backbone_features=False)
 
-        id_out = self.identity_head({
-            "stage3_feat": backbone_out["stage3_feat"],
-            "stage4_feat": backbone_out["stage4_feat"],
-        })
+        if self.pad_detach_identity_orth_on_pad:
+            with torch.no_grad():
+                id_out = self.identity_head({
+                    "stage3_feat": backbone_out["stage3_feat"],
+                    "stage4_feat": backbone_out["stage4_feat"],
+                })
+            id_embedding_for_orth = id_out["identity_embedding"].detach()
+        else:
+            id_out = self.identity_head({
+                "stage3_feat": backbone_out["stage3_feat"],
+                "stage4_feat": backbone_out["stage4_feat"],
+            })
+            id_embedding_for_orth = id_out["identity_embedding"]
 
         pad_parts = self._pad_foundation_loss(
             pad_out,
@@ -711,7 +752,7 @@ class OMFRModule(L.LightningModule):
                 )
         else:
             l_sensor = images.new_zeros(())
-        l_orth    = self.orth_loss(pad_out["pad_embedding"], id_out["identity_embedding"])
+        l_orth    = self.orth_loss(pad_out["pad_embedding"], id_embedding_for_orth)
 
         loss = (self.alpha * pad_parts["foundation_total"]
                 + self.alpha_adv * l_sensor
@@ -720,6 +761,11 @@ class OMFRModule(L.LightningModule):
         self._log_pad_loss_parts(pad_parts)
         self.log("train/pad_sensor_adv", l_sensor,  sync_dist=True)
         self.log("train/orth_loss",      l_orth,    sync_dist=True)
+        self.log(
+            "train/pad_detach_identity_orth",
+            float(self.pad_detach_identity_orth_on_pad),
+            sync_dist=True,
+        )
         self.log("train/alpha", self.alpha, sync_dist=True)
         self.log("train/beta", self.beta, sync_dist=True)
         self.log("train/total_loss",     loss, prog_bar=True, sync_dist=True)
@@ -1096,9 +1142,11 @@ class OMFRModule(L.LightningModule):
         if self._val_pad_logits and self._val_liveness_labels:
             logits = torch.cat(self._val_pad_logits,      dim=0).squeeze(-1)
             labels = torch.cat(self._val_liveness_labels, dim=0).float()
-            preds  = (torch.sigmoid(logits) > 0.5).float()
+            scores = torch.sigmoid(logits)
+            preds  = (scores > self.pad_threshold).float()
             pad_acc = (preds == labels).float().mean()
             self.log("val/pad_accuracy", pad_acc, sync_dist=True, prog_bar=True)
+            self.log("val/pad_threshold", self.pad_threshold, sync_dist=True)
 
             # Detailed PAD metrics
             live_mask  = labels == 1
@@ -1132,7 +1180,8 @@ class OMFRModule(L.LightningModule):
             cascaded_im = rank1_acc
             if self.current_phase >= 2 and self._val_id_pad_logits:
                 id_pad_logits = torch.cat(self._val_id_pad_logits, dim=0).squeeze(-1)
-                live_mask = torch.sigmoid(id_pad_logits) > 0.5
+                id_pad_scores = torch.sigmoid(id_pad_logits)
+                live_mask = id_pad_scores > self.cascade_pad_threshold
                 if live_mask.sum() > 1:
                     live_embs   = embs_n[live_mask]
                     live_labels = labels[live_mask]
@@ -1142,6 +1191,16 @@ class OMFRModule(L.LightningModule):
                 # Log PAD acceptance rate on identity samples (should be ~100% for live prints)
                 accept_rate = live_mask.float().mean()
                 self.log("val/pad_accept_rate", accept_rate, sync_dist=True)
+                self.log(
+                    "val/cascade_pad_threshold",
+                    self.cascade_pad_threshold,
+                    sync_dist=True,
+                )
+                self.log(
+                    "val/pad_accept_rate_at_0_5",
+                    (id_pad_scores > 0.5).float().mean(),
+                    sync_dist=True,
+                )
 
         self.log("val/cascaded_IM", cascaded_im, prog_bar=True, sync_dist=True)
 
