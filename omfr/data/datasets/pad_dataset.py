@@ -94,28 +94,39 @@ class PADDataset(Dataset):
 
     # Ordered sensor list — index in this tuple is the sensor_id integer
     # used by the adversarial head (TASK_03). Append to the END only so
-    # indices stay stable across runs.
+    # indices stay stable across runs. ``Unknown`` is fixed at index 8
+    # (referenced by ``unknown_sensor_id`` in configs); new sensors go
+    # AFTER it.
     SENSOR_NAMES = (
-        'Biometrika',
-        'CrossMatch',
-        'DigitalPersona',
-        'GreenBit',
-        'HiScan',
-        'Italdata',
-        'Swipe',
-        'Orcanthus',
-        'Unknown',
+        'Biometrika',       # 0
+        'CrossMatch',       # 1
+        'DigitalPersona',   # 2
+        'GreenBit',         # 3
+        'HiScan',           # 4
+        'Italdata',         # 5
+        'Swipe',            # 6
+        'Orcanthus',        # 7
+        'Unknown',          # 8  ← unknown_sensor_id stays here
+        # Extensions for LivDet2011 (Digital, Sagem) and LivDet2015
+        # (Time_Series — a multi-frame protocol kept as its own sensor
+        # tag because the imaging characteristics differ from the
+        # single-frame sensors above).
+        'Digital',          # 9   LivDet2011/DigitalTrain
+        'Sagem',            # 10  LivDet2011/SagemTrain
+        'TimeSeries',       # 11  LivDet2015/Time_Series
     )
     MATERIAL_NAMES = (
-        'Live',
-        'BodyDouble',
-        'Ecoflex',
-        'Gelatin',
-        'Latex',
-        'Modasil',
-        'PlayDoh',
-        'WoodGlue',
-        'Unknown',
+        'Live',             # 0
+        'BodyDouble',       # 1
+        'Ecoflex',          # 2
+        'Gelatin',          # 3
+        'Latex',            # 4
+        'Modasil',          # 5
+        'PlayDoh',          # 6
+        'WoodGlue',         # 7
+        'Unknown',          # 8
+        'Silgum',           # 9   LivDet2011 spoof material
+        'Silicone',         # 10  LivDet2011 Sagem/Digital spoof
     )
 
     LABEL_LIVE  = 1
@@ -315,6 +326,8 @@ class PADDataset(Dataset):
             'playdoh': 'playdoh',
             'playdough': 'playdoh',
             'woodglue': 'woodglue',
+            # LivDet2015 variant: "Ecoflex 00-50" -> ecoflex0050 -> ecoflex
+            'ecoflex0050': 'ecoflex',
         }
         return aliases.get(cleaned, cleaned)
 

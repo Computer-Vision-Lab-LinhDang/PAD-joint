@@ -1,17 +1,22 @@
 # configs/grand_fusion_sa24_padft.yaml
 # ════════════════════════════════════════════════════════════════════
-# OMFR — FastViT-SA24 | PAD-first 2-phase multi-task
+# OMFR — FastViT-SA24 | IDENTITY-first 2-phase multi-task
 #
-#   Phase 1  PAD foundation for 15 epochs:
-#            Balanced PAD batches, MS-TAH + full shared backbone, SupCon+BCE.
-#   Phase 2  Identity integration for 25 epochs:
-#            Alternating identity/PAD batches, identity loss ramps in, orth ramps in.
+#   Phase 1  Identity foundation for 20 epochs:
+#            FVC+NIST300 PK batches, hybrid SupCon (0.7) + MRL-ArcFace (0.3),
+#            backbone + identity head + ArcFace trainable; PAD branch frozen.
+#   Phase 2  PAD integration for 20 epochs:
+#            Alternating identity/PAD batches, PAD loss ramps in, orth ramps in.
+#            Identity head stays trainable (LR=1.0); PAD head LR x2 to catch up.
 #
 #   On transition: loader swap -> LR surgery
-#   (identity head/ArcFace from x0.0 to x2.0, backbone stays trainable).
+#   (pad_head from x0.0 to x2.0, others stay live).
 #
-#   Checkpoints: best_phase1.ckpt (Phase-1 anchor / resume point) and
-#   best_phase2.ckpt (deployable) are tracked SEPARATELY per phase.
+#   Checkpoints: best_phase1.ckpt (identity foundation peak) and
+#   best_phase2.ckpt (deployable joint model) tracked separately per phase.
+#
+#   File name kept (`padft`) to avoid churn vs PAD-first runs; the *content*
+#   below is the identity-first schedule.
 # ════════════════════════════════════════════════════════════════════
 
 backbone:
@@ -20,7 +25,17 @@ backbone:
   in_chans: 8
   num_experts: 4
   top_k: 2
-  grad_checkpoint: true          # mandatory: 2 backbone graphs in Phase 2
+  # Disabled: smoke test showed only ~5 GB used with grad_checkpoint, so we
+  # have headroom on a 24 GB 3090. Dropping it saves ~30% wall time. If
+  # OOM after batch bumps, flip back to true.
+  grad_checkpoint: false
+  # torch.compile disabled by default for the identity-first run: the
+  # FastViT trunk handles a different gradient profile here (heavy ArcFace
+  # softmax + SupCon path), and we want clean baseline numbers before
+  # adding the +15-30% compile speedup back. Flip to true once results
+  # look good.
+  compile: false
+  compile_mode: default
 
 gabor:
   n_orientations: 8
@@ -61,10 +76,12 @@ pad_stage2:
   detach_backbone_features: false
   detach_routing_stats: true
 
-# Sensor id 8 is the dataset fallback "Unknown". It is kept in the label
-# space for backward-compatible checkpoints, but masked out of sensor-
-# adversarial loss and not used for hard-spoof weighting.
-num_sensors: 9
+# Sensor id 8 is the dataset fallback "Unknown" — masked out of sensor-
+# adversarial loss and excluded from hard-spoof weighting. After the
+# LivDet2011 (Digital, Sagem) + LivDet2015 (TimeSeries) sensor patch
+# the label space is 12 entries; Unknown's index 8 is preserved so
+# older checkpoints map sensor weights correctly.
+num_sensors: 12
 unknown_sensor_id: 8
 
 losses:
@@ -102,8 +119,13 @@ losses:
   pad_hard_spoof_weight: 1.0
   pad_ohem_fraction: 0.0
   pad_ohem_weight: 1.0
-  identity_supcon_weight: 0.0
-  identity_arcface_weight: 1.0
+  # Hybrid identity loss: SupCon dominant for open-set generalization to
+  # unseen FVC identities (we hold 2% of classes for val open-set sanity);
+  # ArcFace provides discriminative geometry. 0.7/0.3 mirrors the CLAUDE.md
+  # PAD-first design but with weights chosen to make ArcFace meaningful on
+  # 9.7k classes without dominating the contrastive signal.
+  identity_supcon_weight: 0.7
+  identity_arcface_weight: 0.3
   identity_label_smoothing: 0.1
 
 # ─────────────────────────────────────────────────────────────────
@@ -116,19 +138,21 @@ optimizer:
   weight_decay: 0.05
   betas: [0.9, 0.999]
   lr_multipliers:
-    # Phase-1 effective multipliers
-    gabor: 0.1
-    gabor_pad: 0.0
+    # Phase-1 effective multipliers — IDENTITY foundation
+    gabor: 0.1                   # identity Gabor (16 params, low LR keeps filters stable)
+    gabor_pad: 0.0               # PAD Gabor unused (MS-TAH ignores pad_stem path)
     backbone_embed: 1.0
     backbone_early: 1.0
     backbone_late: 1.0
-    moe_experts: 2.0
-    identity_head: 0.0           # inactive during PAD foundation
-    arcface: 0.0                 # inactive during PAD foundation
-    pad_stem: 0.0                # MS-TAH no longer consumes PADStem
-    pad_head: 1.0
+    moe_experts: 2.0             # new params; let them catch up
+    identity_head: 1.0           # ACTIVE: structural attn + attentive pooling + MRL
+    arcface: 1.0                 # ACTIVE: 256 -> 9702 classifier learns from scratch
+    pad_stem: 0.0
+    pad_head: 0.0                # PAD branch frozen during identity foundation
     sensor_adv_head: 0.0
-    # Phase-2 surgery targets (relative to base lr) — identity integration.
+    # Phase-2 surgery targets — PAD INTEGRATION
+    # Keep identity side trainable so it doesn't decay when PAD gradient
+    # joins; PAD head x2 so it catches up in ~10 epochs.
     gabor_phase2: 0.1
     gabor_pad_phase2: 0.0
     backbone_phase2: 1.0
@@ -139,7 +163,7 @@ optimizer:
     identity_head_phase2: 1.0
     arcface_phase2: 1.0
     pad_stem_phase2: 0.0
-    pad_head_phase2: 1.0
+    pad_head_phase2: 2.0         # catch-up: PAD head wakes up at Phase-2 boundary
     sensor_adv_head_phase2: 0.0
 
 scheduler:
@@ -148,35 +172,44 @@ scheduler:
   eta_min: 1.0e-06
 
 # ─────────────────────────────────────────────────────────────────
-# PAD-first phases
+# Identity-first phases
 # ─────────────────────────────────────────────────────────────────
 phases:
-  phase1_task: pad
-  phase1_max_epochs: 15
-  phase2_epochs: 25
+  phase1_task: identity          # ID foundation; PAD branch frozen until P2
+  phase1_max_epochs: 20
+  phase2_epochs: 20
   total_epochs: 40
   transition_on_plateau: false
-  phase2_freeze_identity: false
+  phase2_freeze_identity: false  # identity side stays trainable in P2 to resist PAD-pull
   patience: 5
+  # Phase-1 ArcFace warm-up so the 9.7k-class classifier doesn't explode.
+  # First `phase1_warmup_delay` epochs hold s=1, m=0 (let backbone settle
+  # under SupCon), then ramp s 1->arcface_scale_start over the next
+  # `phase1_warmup_epochs`.
   phase1_warmup_delay: 5
-  phase1_warmup_epochs: 10
+  phase1_warmup_epochs: 5
   arcface_scale_init: 1.0
   arcface_margin_init: 0.0
   arcface_margin_target: 0.5
-  warmup_epochs: 10
-  alpha_target: 1.0
-  gamma_target: 1.0
-  beta_target: 0.02
-  alpha_adv_target: 0.0
+  # Phase-2 ramp length (5 of 20 epochs) for alpha/beta/arcface_scale.
+  warmup_epochs: 5
+  alpha_target: 1.0              # PAD weight ramps 0 -> 1.0 over P2 warmup
+  gamma_target: 1.0              # identity_weight steady at 1.0 entering P2
+  beta_target: 0.02              # orthogonality
+  alpha_adv_target: 0.0          # DANN disabled
   arcface_scale_start: 32.0
-  arcface_scale_end: 64.0
+  arcface_scale_end: 48.0        # gentler than PAD-first 64 to keep 9.7k cls stable
   moe_temp_phase1: 2.0
   moe_temp_phase2_end: 1.0
 
 callbacks:
   dynamic_phase:
-    monitor: val/acer
-    mode: min
+    # Identity foundation: cascaded_IM = PAD-filtered rank-1 on val_id_ds.
+    # Phase 1 PAD logits are random (head LR=0) so cascade collapses to
+    # raw rank-1. Phase 2 starts PAD training; the same metric then
+    # weighs both, which is what we want.
+    monitor: val/cascaded_IM
+    mode: max
     patience: 5
     min_delta: 1.0e-4
   early_stopping:
@@ -185,34 +218,63 @@ callbacks:
     enabled: false
 
 data:
-  # ── DATA CHUẨN: FVC + NIST (required root) ──
-  identity_data_root: /home/aiserver/works/fingerprint/PAD-joint/data/processed/identity_stage2_nist302a
-  pad_data_root: /home/aiserver/works/fingerprint/dataset
+  # ── Identity sources: FVC Set A (finger-level) + NIST-300-ds (finger-level) ──
+  # FVC: each (year, db, subject_local_id) = one class. ~1,200 cls × 8 imp.
+  # NIST-300-ds: each `subj_XXXX_frgp_NN` folder = one finger (subject ×
+  # finger-region pair), giving finger-level class semantics consistent
+  # with FVC. ~8,700 cls × ~2.9 imp. Class names are tag-qualified so
+  # cross-source collisions are impossible.
+  # Totals: ~9,900 classes / ~34,600 images.
+  identity_sources:
+    - type: fvc
+      root: /home/admin_mcn/fg/FVC2000
+      dbs_glob: "Db*_a"
+      tag: fvc2000
+    - type: fvc
+      root: /home/admin_mcn/fg/FVC2002
+      dbs_glob: "Db*_a"
+      tag: fvc2002
+    - type: fvc
+      root: /home/admin_mcn/fg/FVC2004
+      dbs_glob: "DB*_A"          # FVC2004 uses uppercase
+      tag: fvc2004
+    - type: dir_per_class
+      root: /home/admin_mcn/fg/NIST-300-ds/nist_300a_302_combined/train
+      tag: nist300
+      group: nist                # share the 'nist' group tag with sampler
+  pad_data_root: /home/admin_mcn/fg
   joint_data_root: ""
-  identity_datasets: [nist_sd302a]
   pad_datasets: [LivDet2011, LivDet2013, LivDet2015]
   joint_datasets: []
   image_size: 224
   grayscale: true
-  group_by_subject: true
   # Data-centric ID rebalance: force every identity batch to be
-  # FVC/NIST class-balanced (NIST has ~70× more classes than FVC, so a
-  # plain PKSampler made the 24M net overfit NIST and ignore FVC).
+  # FVC/NIST class-balanced (FVC has ~6× more classes than NIST in
+  # this mix; without rebalance NIST identities barely show up).
   balanced_identity_groups: true
   identity_fvc_ratio: 0.5        # 50/50 FVC:NIST classes per batch
-  pk_p: 16
+  pk_p: 32                       # 32 ids × K=2 × V=2 = 128 identity samples/batch
   pk_k: 2
-  pad_batch_size: 128
+  pad_batch_size: 192            # 96 live + 96 spoof
   identity_num_views: 2
   identity_preset: fingerprint_hard
-  num_workers: 8
+  # Open-set identity validation: 2% of classes per group go to val,
+  # disjoint from train. ArcFace classifier sees only train classes.
+  # Deterministic per (val_seed, group); same seed -> same partition.
+  val_class_fraction: 0.02
+  val_seed: 42
+  num_workers: 16                # 64-thread CPU -> ~8 workers/sub-loader in Phase 2
+  persistent_workers: true       # keep workers alive across epochs (saves respawn)
+  prefetch_factor: 4             # each worker buffers 4 batches ahead
   pin_memory: true
   val_split: 0.1
 
 trainer:
   accelerator: gpu
   devices: 1
-  precision: 16-mixed
+  # bf16-mixed: Ampere-native (no GradScaler tax), more numerically stable
+  # than fp16 for ArcFace large-class softmax + FrequencyGate fp32 paths.
+  precision: bf16-mixed
   max_epochs: 40
   gradient_clip_val: 0.5
   accumulate_grad_batches: 1
@@ -220,13 +282,22 @@ trainer:
   check_val_every_n_epoch: 1
   enable_progress_bar: true
   deterministic: false
+  # cudnn autotuner picks fastest conv kernel for the input shapes we
+  # actually use (set in train.py alongside TF32 matmul precision).
+  benchmark: true
 
 checkpoint:
-  dirpath: checkpoints_sa24_padfirst_arcface_livecal/
-  monitor: val/acer
-  mode: min
-  phase2_monitor: val/acer
-  phase2_mode: min
+  # New dir to keep identity-first runs separate from prior PAD-first.
+  dirpath: checkpoints_sa24_idfirst/
+  # Phase 1 best: pure identity quality. cascaded_IM = rank-1 in Phase 1
+  # because PAD logits are still random (head LR=0), so the metric just
+  # measures open-set identity retrieval.
+  monitor: val/cascaded_IM
+  mode: max
+  # Phase 2 best: deployable joint model. cascaded_IM combines rank-1 and
+  # PAD acceptance — picking the epoch where BOTH are best.
+  phase2_monitor: val/cascaded_IM
+  phase2_mode: max
   identity_guard:
     enabled: false
     min_phase: 2
@@ -241,13 +312,13 @@ checkpoint:
     max_tar_drop: 0.05
 
 logging:
-  name: omfr_sa24_padfirst_arcface_livecal
+  name: omfr_sa24_idfirst
   save_dir: logs/
-  version: 0
+  version: null                  # auto-increment so runs don't collide
   wandb:
     enabled: true
     project: omfr
-    name: sa24_padfirst_arcface_livecal
+    name: sa24_idfirst
     log_model: false
 
 evaluation:

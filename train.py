@@ -249,6 +249,13 @@ def _prepare_runtime_config(config: Dict[str, Any]) -> Dict[str, Any]:
     runtime["identity_root"] = data_cfg.get(
         "identity_data_root", config.get("identity_root", "")
     )
+    runtime["identity_sources"] = data_cfg.get(
+        "identity_sources", config.get("identity_sources", None)
+    )
+    runtime["val_class_fraction"] = data_cfg.get(
+        "val_class_fraction", config.get("val_class_fraction", 0.0)
+    )
+    runtime["val_seed"] = data_cfg.get("val_seed", config.get("val_seed", 42))
     runtime["pad_root"] = data_cfg.get(
         "pad_data_root", config.get("pad_root", "")
     )
@@ -521,6 +528,7 @@ def build_trainer(
         "limit_val_batches",
         "num_sanity_val_steps",
         "enable_checkpointing",
+        "benchmark",
     )
     for key in optional_keys:
         if key in tr_cfg:
@@ -647,12 +655,31 @@ def _parse_overrides(override_list: list[str]) -> Dict[str, Any]:
 # Main
 # ---------------------------------------------------------------------------
 
+def _enable_fast_matmul() -> None:
+    """Ampere+ speedups that don't change loss numerics meaningfully.
+
+    - TF32 matmul: ~1.8x faster than fp32 on Ampere, accuracy effectively
+      identical for transformer/conv workloads.
+    - cudnn.benchmark: lets cuDNN pick the fastest conv algo per input
+      shape. Our shapes are fixed (224x224 grayscale, fixed batch),
+      so the autotuner converges in 1-2 steps and stays cached.
+    """
+    try:
+        torch.set_float32_matmul_precision("high")
+    except AttributeError:
+        pass
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+
+
 def main() -> None:
     args = parse_args()
     if args.resume and args.init_from:
         raise ValueError("Use either --resume or --init-from, not both.")
 
     L.seed_everything(args.seed, workers=True)
+    _enable_fast_matmul()
 
     # ── Load config ──
     config = _load_config(args.config)
@@ -676,6 +703,41 @@ def main() -> None:
             checkpoint_path=args.init_from,
             skip_prefixes=args.init_skip_prefix,
         )
+
+    # torch.compile the backbone if requested. Compiling only the trunk
+    # (not heads / Gabor / pad_stem) avoids recompiles when modules toggle
+    # train/eval mode (Phase 2 freeze) and skips the FFT path in
+    # FrequencyGate which already runs in fp32 outside autocast.
+    #
+    # Two pitfalls we account for:
+    #   1. ``reduce-overhead`` tries to capture CUDA graphs and bails on
+    #      FFT/complex paths ("CUDA Graph is empty"). Plain ``default``
+    #      keeps inductor compile gains without the graph attempt, so it
+    #      composes cleanly with FrequencyGate.
+    #   2. dynamo recompiles when ``grad_mode`` flips between train and
+    #      validation. With the stock cache limit of 8 the backbone is
+    #      pushed back to eager after a few epochs. Bump the limit so
+    #      train/eval and any Phase-2 freeze toggles all stay compiled.
+    compile_flag = config.get("backbone", {}).get("compile", False)
+    if compile_flag:
+        try:
+            import torch._dynamo as _dynamo
+            _dynamo.config.cache_size_limit = max(
+                int(getattr(_dynamo.config, "cache_size_limit", 8)), 64,
+            )
+            compile_mode = str(
+                config.get("backbone", {}).get("compile_mode", "default")
+            )
+            model.backbone = torch.compile(
+                model.backbone, mode=compile_mode, dynamic=False,
+            )
+            print(
+                f"[compile] torch.compile applied to backbone "
+                f"(mode={compile_mode}, dynamo cache_size_limit="
+                f"{_dynamo.config.cache_size_limit})"
+            )
+        except Exception as exc:
+            print(f"[compile] failed: {exc}; continuing without compile")
     callbacks  = build_callbacks(config)
     logger     = build_logger(config)
     trainer    = build_trainer(config, callbacks, logger)
