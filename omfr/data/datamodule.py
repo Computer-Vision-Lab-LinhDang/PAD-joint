@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import lightning as L
+from lightning.pytorch.utilities import CombinedLoader
 from torch.utils.data import DataLoader
 
 from omfr.data.samplers.pk_sampler import PKSampler
@@ -55,6 +56,7 @@ class OMFRDataModule(L.LightningDataModule):
         self.pad_ds      = None
         self.joint_ds    = None
         self.val_ds      = None
+        self.val_id_ds   = None     # open-set held-out identity classes
         self.val_pad_ds  = None
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -75,6 +77,9 @@ class OMFRDataModule(L.LightningDataModule):
         from omfr.data.transforms import get_transforms
 
         identity_root = self._cfg_get("identity_root", "data.identity_data_root", default="")
+        identity_sources = self._cfg_get(
+            "identity_sources", "data.identity_sources", default=None,
+        )
         pad_root      = self._cfg_get("pad_root", "data.pad_data_root", default="")
         joint_root    = self._cfg_get("joint_root", "data.joint_data_root", default="")
         pad_datasets  = self._cfg_get("pad_datasets", "data.pad_datasets", default=[])
@@ -95,8 +100,29 @@ class OMFRDataModule(L.LightningDataModule):
             "image_size", "data.image_size", default=224,
         ))
 
+        val_class_fraction = float(self._cfg_get(
+            "val_class_fraction", "data.val_class_fraction", default=0.0,
+        ))
+        val_seed = int(self._cfg_get(
+            "val_seed", "data.val_seed", default=42,
+        ))
+
         if stage in ("fit", None):
-            if identity_root:
+            if identity_sources:
+                # Multi-source mode wins when present. Legacy identity_root
+                # is ignored — sources own the path list end-to-end.
+                self.identity_ds = IdentityDataset(
+                    sources=identity_sources,
+                    split="train",
+                    num_views=identity_num_views,
+                    transform=get_transforms(
+                        'train', output_size=image_size, preset=identity_preset,
+                    ),
+                    image_size=image_size,
+                    val_class_fraction=val_class_fraction,
+                    val_seed=val_seed,
+                )
+            elif identity_root:
                 self.identity_ds = IdentityDataset(
                     root=identity_root, split="train",
                     group_by_subject=group_by_subject,
@@ -129,6 +155,22 @@ class OMFRDataModule(L.LightningDataModule):
                     group_by_subject=group_by_subject,
                 )
 
+            # Open-set identity validation when sources + val_class_fraction>0.
+            # Disjoint class set from training; same source list, same seed,
+            # split='val' picks the held-out partition.
+            if identity_sources and val_class_fraction > 0.0:
+                self.val_id_ds = IdentityDataset(
+                    sources=identity_sources,
+                    split="val",
+                    num_views=1,
+                    transform=get_transforms(
+                        'val', output_size=image_size, preset=identity_preset,
+                    ),
+                    image_size=image_size,
+                    val_class_fraction=val_class_fraction,
+                    val_seed=val_seed,
+                )
+
             # PAD validation — needed when val_ds lacks liveness labels
             if not joint_root and pad_roots:
                 try:
@@ -142,6 +184,26 @@ class OMFRDataModule(L.LightningDataModule):
     # ─────────────────────────────────────────────────────────────────────────
     # DataLoaders
     # ─────────────────────────────────────────────────────────────────────────
+
+    def _worker_kwargs(self, n_workers: int) -> Dict[str, Any]:
+        """DataLoader kwargs that depend on worker count.
+
+        ``prefetch_factor`` and ``persistent_workers`` are only valid when
+        ``num_workers > 0``; passing them with 0 workers raises in newer
+        torch versions. ``persistent_workers`` keeps the worker pool alive
+        between epochs — important here because each epoch loads ~700
+        batches and worker spawn takes seconds.
+        """
+        if n_workers <= 0:
+            return {}
+        return {
+            "prefetch_factor": int(self._cfg_get(
+                "prefetch_factor", "data.prefetch_factor", default=2,
+            )),
+            "persistent_workers": bool(self._cfg_get(
+                "persistent_workers", "data.persistent_workers", default=False,
+            )),
+        }
 
     def train_dataloader(self) -> Any:
         """
@@ -174,6 +236,39 @@ class OMFRDataModule(L.LightningDataModule):
                 batch_sampler=sampler,
                 num_workers=num_workers,
                 pin_memory=pin_memory,
+                **self._worker_kwargs(num_workers),
+            )
+
+        if phase == 1 and phase1_task == "hybrid":
+            # Co-training: same CombinedLoader as Phase 2 (max_size_cycle)
+            # but available from epoch 0. training_step pulls both id and
+            # pad sub-batches and runs `_phase1_hybrid_step` in a single
+            # optimizer step.
+            assert self.identity_ds is not None and self.pad_ds is not None, \
+                "identity_ds and pad_ds required for hybrid"
+            workers_each = 0 if num_workers == 0 else max(num_workers // 2, 1)
+            id_sampler  = self._make_identity_sampler(P, K)
+            pad_sampler = BalancedPADSampler(
+                liveness_labels=self.pad_ds.get_liveness_labels(),
+                batch_size=pad_bs,
+            )
+            id_loader  = DataLoader(
+                self.identity_ds,
+                batch_sampler=id_sampler,
+                num_workers=workers_each,
+                pin_memory=pin_memory,
+                **self._worker_kwargs(workers_each),
+            )
+            pad_loader = DataLoader(
+                self.pad_ds,
+                batch_sampler=pad_sampler,
+                num_workers=workers_each,
+                pin_memory=pin_memory,
+                **self._worker_kwargs(workers_each),
+            )
+            return CombinedLoader(
+                {"identity": id_loader, "pad": pad_loader},
+                mode="max_size_cycle",
             )
 
         if phase == 1:
@@ -185,6 +280,7 @@ class OMFRDataModule(L.LightningDataModule):
                 batch_sampler=sampler,
                 num_workers=num_workers,
                 pin_memory=pin_memory,
+                **self._worker_kwargs(num_workers),
             )
 
         elif phase == 2:
@@ -201,14 +297,24 @@ class OMFRDataModule(L.LightningDataModule):
                 batch_sampler=id_sampler,
                 num_workers=workers_each,
                 pin_memory=pin_memory,
+                **self._worker_kwargs(workers_each),
             )
             pad_loader = DataLoader(
                 self.pad_ds,
                 batch_sampler=pad_sampler,
                 num_workers=workers_each,
                 pin_memory=pin_memory,
+                **self._worker_kwargs(workers_each),
             )
-            return {"identity": id_loader, "pad": pad_loader}
+            # max_size_cycle: epoch length = longer loader (identity, ~725
+            # batches with the current sources); the shorter PAD loader
+            # cycles back to its start so every step still gets both a
+            # fresh id batch and a fresh pad batch. Avoids the min_size
+            # default which under-samples identity by ~62%.
+            return CombinedLoader(
+                {"identity": id_loader, "pad": pad_loader},
+                mode="max_size_cycle",
+            )
 
         else:  # phase 3
             workers_each = 0 if num_workers == 0 else max(num_workers // 3, 1)
@@ -222,6 +328,7 @@ class OMFRDataModule(L.LightningDataModule):
                     batch_sampler=id_sampler,
                     num_workers=workers_each,
                     pin_memory=pin_memory,
+                    **self._worker_kwargs(workers_each),
                 )
 
             if self.pad_ds is not None:
@@ -234,6 +341,7 @@ class OMFRDataModule(L.LightningDataModule):
                     batch_sampler=pad_sampler,
                     num_workers=workers_each,
                     pin_memory=pin_memory,
+                    **self._worker_kwargs(workers_each),
                 )
 
             if self.joint_ds is not None:
@@ -246,6 +354,7 @@ class OMFRDataModule(L.LightningDataModule):
                     batch_sampler=joint_sampler,
                     num_workers=workers_each,
                     pin_memory=pin_memory,
+                    **self._worker_kwargs(workers_each),
                 )
 
             if not loaders:
@@ -254,21 +363,28 @@ class OMFRDataModule(L.LightningDataModule):
             if len(loaders) == 1:
                 return next(iter(loaders.values()))
 
-            return loaders
+            return CombinedLoader(loaders, mode="max_size_cycle")
 
     def val_dataloader(self):
-        if self.val_ds is None and self.val_pad_ds is None:
+        if (
+            self.val_ds is None
+            and self.val_id_ds is None
+            and self.val_pad_ds is None
+        ):
             return None
 
         bs  = int(self._cfg_get("val_batch_size", "data.val_batch_size", default=64))
         nw  = int(self._cfg_get("num_workers", "data.num_workers", default=8))
         pm  = bool(self._cfg_get("pin_memory", "data.pin_memory", default=True))
         kwargs = dict(batch_size=bs, shuffle=False, num_workers=nw,
-                      pin_memory=pm, drop_last=False)
+                      pin_memory=pm, drop_last=False,
+                      **self._worker_kwargs(nw))
 
         loaders = []
         if self.val_ds is not None:
             loaders.append(DataLoader(self.val_ds, **kwargs))
+        if self.val_id_ds is not None:
+            loaders.append(DataLoader(self.val_id_ds, **kwargs))
         if self.val_pad_ds is not None:
             loaders.append(DataLoader(self.val_pad_ds, **kwargs))
 

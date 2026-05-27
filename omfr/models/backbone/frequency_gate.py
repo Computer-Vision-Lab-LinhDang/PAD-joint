@@ -59,6 +59,7 @@ def _make_band_masks(
     ridge_freq: float,
     low_frac: float = 0.6,
     high_frac: float = 1.6,
+    device: Optional[torch.device] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Build radial frequency-band masks for an (h x w) 2-D FFT spectrum.
@@ -67,9 +68,15 @@ def _make_band_masks(
     per grid. Band edges are scaled to the measured ridge frequency so
     the ridge always falls inside the middle band regardless of grid
     size.
+
+    The ``device`` arg controls where the masks materialize. Passing the
+    target CUDA device avoids a CPU->GPU copy inside the forward graph;
+    this matters for ``torch.compile(mode='reduce-overhead')`` which
+    otherwise falls back from CUDA graphs ("skipping cudagraphs due to
+    cpu device (fft_fftfreq)").
     """
-    fy = torch.fft.fftfreq(h) * h
-    fx = torch.fft.fftfreq(w) * w
+    fy = torch.fft.fftfreq(h, device=device) * h
+    fx = torch.fft.fftfreq(w, device=device) * w
     dist = (fy[:, None] ** 2 + fx[None, :] ** 2).sqrt()
 
     low_thresh = low_frac * ridge_freq
@@ -117,6 +124,25 @@ class FrequencyGate(nn.Module):
         self.high_frac = float(high_frac)
 
         self.norm = nn.LayerNorm(3)
+
+        # Pre-bake masks for the FastViT grid sizes used by the MoE
+        # blocks (s2 = 28x28 tokens, s3 = 14x14 tokens). Registering them
+        # as buffers means they follow `.to(device)` automatically and
+        # appear as constants inside the compiled graph — no dynamic
+        # `torch.fft.fftfreq(...)` call in forward, which is the op that
+        # makes torch.compile(reduce-overhead) fall back from CUDA graphs.
+        for g in self.ridge_freq.keys():
+            lo, mid, hi = _make_band_masks(
+                g, g, self.ridge_freq[g], self.low_frac, self.high_frac,
+            )
+            self.register_buffer(f"_mask_lo_{g}",  lo,  persistent=False)
+            self.register_buffer(f"_mask_mid_{g}", mid, persistent=False)
+            self.register_buffer(f"_mask_hi_{g}",  hi,  persistent=False)
+        self._known_grids = tuple(sorted(self.ridge_freq.keys()))
+
+        # Fallback cache for grids not seen at construction time (e.g. an
+        # unusual eval-time resolution). Still device-aware to keep graph
+        # clean if compile is on.
         self._mask_cache: Dict[Tuple[int, int, torch.device], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
     def _resolve_ridge_freq(self, h: int, w: int) -> float:
@@ -135,11 +161,25 @@ class FrequencyGate(nn.Module):
     def _get_masks(
         self, h: int, w: int, device: torch.device,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Fast path: square grids whose masks were pre-baked as buffers.
+        # No dict lookup, no allocation, no device crossing — buffers
+        # auto-followed `.to(device)` at module-move time.
+        if h == w and h in self._known_grids:
+            lo  = getattr(self, f"_mask_lo_{h}")
+            mid = getattr(self, f"_mask_mid_{h}")
+            hi  = getattr(self, f"_mask_hi_{h}")
+            return lo, mid, hi
+
+        # Slow path: unusual grid size; build on the target device so
+        # the resulting tensors appear native and torch.compile keeps
+        # CUDA graphs valid for this branch too.
         key = (h, w, device)
         if key not in self._mask_cache:
             ridge = self._resolve_ridge_freq(h, w)
-            lo, mid, hi = _make_band_masks(h, w, ridge, self.low_frac, self.high_frac)
-            self._mask_cache[key] = (lo.to(device), mid.to(device), hi.to(device))
+            lo, mid, hi = _make_band_masks(
+                h, w, ridge, self.low_frac, self.high_frac, device=device,
+            )
+            self._mask_cache[key] = (lo, mid, hi)
         return self._mask_cache[key]
 
     def forward(

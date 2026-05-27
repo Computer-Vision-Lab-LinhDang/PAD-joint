@@ -1,0 +1,272 @@
+# configs/grand_fusion_sa24_hybrid.yaml
+# ════════════════════════════════════════════════════════════════════
+# OMFR — FastViT-SA24 | HYBRID co-training (no phase boundary)
+#
+#   Single continuous run, 40 epochs. From epoch 0 the backbone receives
+#   gradient from BOTH identity (ArcFace + SupCon) and PAD (BCE on
+#   MS-TAH) heads in a single .backward() per optimizer step. No hard
+#   Phase 1 -> Phase 2 transition, so Adam never sees a distribution
+#   shift in the gradient direction.
+#
+#   Scheduler ramps (anchored at epoch 0):
+#     • ArcFace scale:  1 -> 32 over ep 5-10  -> 48 over ep 10-15
+#     • Margin:         0 -> 0.5 linear over full 40 ep
+#     • alpha (PAD):    0.1 -> 1.0 cosine over ep 5-10
+#     • beta (orth):    0 -> 0.02 cosine over ep 10-15
+#     • identity_weight: 1.0 throughout
+#     • MoE temperature: 2.0 -> 1.0 linear over full 40 ep
+#
+#   Memory: 2 backbone forwards per step (id + pad both with autograd).
+#   grad_checkpoint enabled to fit a 24 GB 3090; expect ~14 GB peak.
+# ════════════════════════════════════════════════════════════════════
+
+backbone:
+  name: fastvit_sa24
+  pretrained: true
+  in_chans: 8
+  num_experts: 4
+  top_k: 2
+  # Disabled with pad_batch_size lowered to 96 (see data block).
+  # Joint step keeps BOTH backbone activation graphs alive for the single
+  # .backward(), so without checkpoint peak ~ id_act + pad_act + base.
+  # With pk_p=24 + pad_bs=96 that lands at ~20-21 GiB on a 24 GiB 3090.
+  # (pad_bs=128 OOM'd at 23.7 GiB.) Combined with the
+  # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True env recommended in
+  # the run command, peak settles 2-3 GiB below the cap.
+  grad_checkpoint: false
+  compile: false
+  compile_mode: default
+
+gabor:
+  n_orientations: 8
+  kernel_size: 31
+  init_frequency: 0.12
+
+identity_head:
+  embed_dim: 256
+  num_heads: 8
+  grid_size: 14
+  num_queries: 4
+  stage3_dim: 256
+  stage4_dim: 512
+  mrl_dims: [64, 128, 256]
+  num_classes: 5000             # auto-detected at runtime
+
+pad_head:
+  stage1_dim: 64
+  stage2_dim: 128
+  align_ch: 128
+  fusion_ch: 192
+  embedding_dim: 64
+  stage1_dw_kernel: 9
+  stage2_dw_kernel: 5
+  dropout: 0.1
+  proj_dropout: 0.2
+  num_classes: 1
+  pad_features_dim: 192
+  pad_embedding_dim: 64
+
+pad_stage2:
+  backbone_grad: true
+  backbone_input: pad_gabor
+  detach_backbone_features: false
+  detach_routing_stats: true
+
+num_sensors: 12
+unknown_sensor_id: 8
+
+losses:
+  arcface:
+    margin: 0.5
+    scale_phase1: 32.0
+    scale_final: 48.0
+    easy_margin: false
+    label_smoothing: 0.1
+  supcon:
+    temperature: 0.07
+    contrast_mode: all
+    base_temperature: 0.07
+  orthogonality:
+    eps: 1.0e-08
+  alpha: 0.0
+  beta: 0.0
+  gamma: 0.05
+  balancing_loss_weight: 0.005
+  pad_bce_weight: 1.0
+  pad_bce_phase_weight: 1.0
+  # Hybrid joint step uses pad_classification_loss directly (BCE + focal)
+  # on the SAME PAD batch the backbone shapes for, so there is no need
+  # for the live-only identity-domain calibration term used in P2 of
+  # identity-first. Leave it 0 here.
+  pad_identity_live_weight: 0.0
+  pad_detach_identity_orth_on_pad: false
+  pad_supcon_weight: 1.0
+  pad_focal_alpha: 0.5
+  pad_focal_gamma: 2.0
+  pad_focal_weight: 0.0
+  pad_hard_spoof_sensor_ids: [6]
+  pad_hard_spoof_material_ids: [4, 6, 7]
+  pad_hard_spoof_weight: 1.0
+  pad_ohem_fraction: 0.0
+  pad_ohem_weight: 1.0
+  identity_supcon_weight: 0.7
+  identity_arcface_weight: 0.3
+  identity_label_smoothing: 0.1
+
+optimizer:
+  name: AdamW
+  lr: 1.0e-4
+  weight_decay: 0.05
+  betas: [0.9, 0.999]
+  # All heads ACTIVE from epoch 0 — no Phase-2 surgery.
+  lr_multipliers:
+    gabor: 0.1
+    gabor_pad: 0.0
+    backbone_embed: 1.0
+    backbone_early: 1.0
+    backbone_late: 1.0
+    moe_experts: 2.0
+    identity_head: 1.0
+    arcface: 1.0
+    pad_stem: 0.0
+    pad_head: 1.0
+    sensor_adv_head: 0.0
+    # Phase-2 multipliers kept identical to Phase-1 as a safety net in
+    # case `transition_on_plateau` ever triggers (currently disabled).
+    gabor_phase2: 0.1
+    gabor_pad_phase2: 0.0
+    backbone_phase2: 1.0
+    backbone_embed_phase2: 1.0
+    backbone_early_phase2: 1.0
+    backbone_late_phase2: 1.0
+    moe_experts_phase2: 2.0
+    identity_head_phase2: 1.0
+    arcface_phase2: 1.0
+    pad_stem_phase2: 0.0
+    pad_head_phase2: 1.0
+    sensor_adv_head_phase2: 0.0
+
+scheduler:
+  name: CosineAnnealingLR
+  T_max: 120
+  eta_min: 1.0e-06
+
+# ─────────────────────────────────────────────────────────────────
+# Hybrid phases — no transition, single 40-epoch run.
+# `phase1_max_epochs` is set well above `total_epochs` so the dynamic
+# Phase-2 transition cannot fire even if `transition_on_plateau` were
+# accidentally re-enabled.
+# ─────────────────────────────────────────────────────────────────
+phases:
+  phase1_task: hybrid
+  phase1_max_epochs: 100
+  phase2_epochs: 0
+  total_epochs: 40
+  transition_on_plateau: false
+  phase2_freeze_identity: false   # irrelevant in hybrid
+  patience: 5
+  phase1_warmup_delay: 5          # hold ArcFace s=1, alpha=0.1 for first 5 ep
+  phase1_warmup_epochs: 5         # then s 1->32, alpha 0.1->1.0 over ep 5-10
+  arcface_scale_init: 1.0
+  arcface_margin_init: 0.0
+  arcface_margin_target: 0.5
+  warmup_epochs: 5                # s 32->48, beta 0->target over ep 10-15
+  alpha_target: 1.0
+  gamma_target: 1.0
+  beta_target: 0.02
+  alpha_adv_target: 0.0
+  arcface_scale_start: 32.0
+  arcface_scale_end: 48.0
+  moe_temp_phase1: 2.0
+  moe_temp_phase2_end: 1.0
+
+callbacks:
+  dynamic_phase:
+    monitor: val/cascaded_IM
+    mode: max
+    patience: 5
+    min_delta: 1.0e-4
+  early_stopping:
+    enabled: false
+  swa:
+    enabled: false
+
+data:
+  identity_sources:
+    - type: fvc
+      root: /home/admin_mcn/fg/FVC2000
+      dbs_glob: "Db*_a"
+      tag: fvc2000
+    - type: fvc
+      root: /home/admin_mcn/fg/FVC2002
+      dbs_glob: "Db*_a"
+      tag: fvc2002
+    - type: fvc
+      root: /home/admin_mcn/fg/FVC2004
+      dbs_glob: "DB*_A"
+      tag: fvc2004
+    - type: dir_per_class
+      root: /home/admin_mcn/fg/NIST-300-ds/nist_300a_302_combined/train
+      tag: nist300
+      group: nist
+  pad_data_root: /home/admin_mcn/fg
+  joint_data_root: ""
+  pad_datasets: [LivDet2011, LivDet2013, LivDet2015]
+  joint_datasets: []
+  image_size: 224
+  grayscale: true
+  balanced_identity_groups: true
+  identity_fvc_ratio: 0.5
+  # Smaller batches than id-first to fit 2 backbone activation graphs.
+  # pad_bs was 128 but OOM'd without grad_checkpoint; 96 leaves enough
+  # headroom for the joint .backward() to span both forward graphs.
+  pk_p: 24                        # 24 ids × K=2 × V=2 = 96 id samples
+  pk_k: 2
+  pad_batch_size: 96              # 48 live + 48 spoof
+  identity_num_views: 2
+  identity_preset: fingerprint_hard
+  val_class_fraction: 0.02
+  val_seed: 42
+  num_workers: 16
+  persistent_workers: true
+  prefetch_factor: 4
+  pin_memory: true
+
+trainer:
+  accelerator: gpu
+  devices: 1
+  precision: bf16-mixed
+  max_epochs: 40
+  gradient_clip_val: 0.5
+  accumulate_grad_batches: 1
+  log_every_n_steps: 10
+  check_val_every_n_epoch: 1
+  enable_progress_bar: true
+  deterministic: false
+  benchmark: true
+
+checkpoint:
+  dirpath: checkpoints_sa24_hybrid/
+  monitor: val/cascaded_IM
+  mode: max
+  phase2_monitor: val/cascaded_IM
+  phase2_mode: max
+  identity_guard:
+    enabled: false
+
+logging:
+  name: omfr_sa24_hybrid
+  save_dir: logs/
+  version: null
+  wandb:
+    enabled: true
+    project: omfr
+    name: sa24_hybrid
+    log_model: false
+
+evaluation:
+  pad_threshold: 0.5
+  cascade_pad_threshold: 0.35
+  far: 1.0e-4
+  cmc_max_rank: 10
+  mrl_eval_dims: [64, 128, 256]

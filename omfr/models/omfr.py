@@ -260,6 +260,13 @@ class OMFRModule(L.LightningModule):
 
         # -- Phase state --
         self.current_phase: int = 1
+        # Phase-1 objective: which loss the foundation phase optimizes.
+        # 'identity'  -> hybrid SupCon+ArcFace foundation (default).
+        # 'pad'/'pad_foundation' -> PAD MS-TAH foundation.
+        # `training_step` reads this to dispatch the right step body.
+        self._phase1_task: str = str(
+            (config.get("phases", {}) or {}).get("phase1_task", "identity")
+        ).lower()
 
         # -- Validation accumulators --
         self._val_id_embeddings:   List[torch.Tensor] = []
@@ -624,7 +631,13 @@ class OMFRModule(L.LightningModule):
     # -------------------------------------------------------------------------
 
     def _phase1_step(self, batch: Any) -> torch.Tensor:
-        """Phase 1 - PAD foundation: SupCon(PAD features) + BCE."""
+        """Phase 1 - PAD foundation: SupCon(PAD features) + BCE + balance.
+
+        Balance loss is included so the shared MoE experts do not
+        collapse to a single expert while only the PAD objective is
+        active. Without it, every PAD-driven gradient pushes tokens
+        toward whichever expert produced the easier spoof signal.
+        """
         images, liveness_labels = self._unpack_pad_batch(batch)
         sensor_labels = self._unpack_sensor_labels(batch)
         material_labels = self._unpack_material_labels(batch)
@@ -637,11 +650,138 @@ class OMFRModule(L.LightningModule):
             sensor_labels=sensor_labels,
             material_labels=material_labels,
         )
-        loss = self.alpha * pad_parts["foundation_total"]
+        l_balance = sum(backbone_out["balance_losses"])
+        loss = self.alpha * pad_parts["foundation_total"] + self.gamma * l_balance
 
         self._log_pad_loss_parts(pad_parts)
+        self.log("train/balance_loss", l_balance, sync_dist=True)
         self.log("train/alpha", self.alpha, sync_dist=True)
         self.log("train/total_loss", loss, prog_bar=True, sync_dist=True)
+        return loss
+
+    def _phase1_identity_step(self, batch: Any) -> torch.Tensor:
+        """Phase 1 — identity foundation.
+
+        Identity-first schedule entry point. Trains the backbone, identity
+        head, and ArcFace classifier under the hybrid SupCon + ArcFace
+        objective; PAD branch stays frozen (LR=0 per config). MoE balance
+        loss is mixed in at ``gamma`` to prevent expert collapse.
+
+        Notes:
+          * No PAD forward — Phase 1 deliberately ignores liveness so the
+            backbone shapes around ridge geometry, not micro-texture.
+          * No orth loss — identity_embedding has nothing to decorrelate
+            against until pad_embedding starts training in Phase 2.
+          * identity_weight is held at 1.0 by the scheduler in this mode
+            (it is only ramped during the Phase-2 PAD integration when
+            identity-first stays steady).
+        """
+        images, identity_labels = self._unpack_identity_batch(batch)
+
+        backbone_out = self._run_backbone(images)
+        id_out       = self._run_identity(backbone_out)
+        id_parts     = self._identity_loss(id_out["mrl_embeddings"], identity_labels)
+        l_balance    = sum(backbone_out["balance_losses"])
+
+        # identity_weight is scheduler-driven; in P1-identity it is 1.0.
+        loss = (
+            self.identity_weight * id_parts["total"]
+            + self.gamma * l_balance
+        )
+
+        self.log("train/identity_loss", id_parts["total"], prog_bar=True, sync_dist=True)
+        self.log("train/id_arcface",   id_parts["arcface"], sync_dist=True)
+        self.log("train/id_supcon",    id_parts["supcon"],  sync_dist=True)
+        self.log("train/balance_loss", l_balance,           sync_dist=True)
+        self.log("train/identity_weight", self.identity_weight, sync_dist=True)
+        self.log("train/total_loss",   loss, prog_bar=True, sync_dist=True)
+        return loss
+
+    def _phase1_hybrid_step(self, id_batch: Any, pad_batch: Any) -> torch.Tensor:
+        """Phase 1 — co-training hybrid step (joint forward).
+
+        Single optimizer step that runs TWO backbone forwards (one over
+        the identity batch, one over the PAD batch), BOTH retaining
+        autograd. ID gradient and PAD gradient hit the shared backbone
+        in the same .backward(), so Adam's second-moment estimate sees a
+        consistent mixed signal — no train-time distribution shift like
+        the alternating Phase-2 alternation in identity/PAD-first.
+
+        Differences from `_phase2_joint_step`:
+          - PAD backbone forward is NOT wrapped in ``torch.no_grad()``;
+            PAD loss actively shapes backbone (the whole point of hybrid).
+          - PAD branch passes ``detach_backbone_features=False`` so the
+            MS-TAH head also shapes stage1/stage2 features.
+
+        VRAM cost: 2× backbone activation graphs in memory. Enable
+        ``backbone.grad_checkpoint: true`` in the hybrid config to keep
+        peak under 24 GiB at typical batch sizes (pk_P=24, pad_bs=128).
+
+        Composite loss:
+            L = γ * L_identity + α * L_PAD + β * L_orth + ε * L_balance
+        with weights set by ``PhaseSchedulerCallback`` (hybrid branch).
+        """
+        # ── Identity branch (full grad) ──
+        id_images, id_labels = self._unpack_identity_batch(id_batch)
+        id_backbone = self._run_backbone(id_images)
+        id_out      = self._run_identity(id_backbone)
+        id_parts    = self._identity_loss(id_out["mrl_embeddings"], id_labels)
+        l_balance_id = sum(id_backbone["balance_losses"])
+
+        # ── PAD branch (full grad, MS-TAH learns stage feats) ──
+        pad_images, liveness_labels = self._unpack_pad_batch(pad_batch)
+        sensor_labels   = self._unpack_sensor_labels(pad_batch)
+        material_labels = self._unpack_material_labels(pad_batch)
+        pad_backbone = self._run_backbone(pad_images)
+        pad_out      = self._run_pad(pad_backbone, detach_backbone_features=False)
+        pad_parts    = self._pad_classification_loss(
+            pad_out["pad_logit"],
+            liveness_labels,
+            sensor_labels=sensor_labels,
+            material_labels=material_labels,
+        )
+        l_balance_pad = sum(pad_backbone["balance_losses"])
+
+        # ── Orthogonality across the two embedding sets ──
+        Bmin = min(
+            id_out["identity_embedding"].shape[0],
+            pad_out["pad_embedding"].shape[0],
+        )
+        l_orth = self.orth_loss(
+            pad_out["pad_embedding"][:Bmin],
+            id_out["identity_embedding"][:Bmin],
+        )
+
+        # Optional sensor adversarial (DANN). Disabled in default hybrid
+        # config but plumbed so configs can toggle alpha_adv > 0 later.
+        if sensor_labels is not None and self.lam_adv > 0:
+            l_sensor = self._sensor_adversarial_loss(
+                pad_out["pad_features"], sensor_labels,
+            )
+        else:
+            l_sensor = pad_images.new_zeros(())
+
+        l_balance = 0.5 * (l_balance_id + l_balance_pad)
+
+        loss = (
+            self.identity_weight * id_parts["total"]
+            + self.alpha * pad_parts["total"]
+            + self.alpha_adv * l_sensor
+            + self.beta * l_orth
+            + self.gamma * l_balance
+        )
+
+        self.log("train/identity_loss", id_parts["total"], prog_bar=True, sync_dist=True)
+        self.log("train/id_arcface",    id_parts["arcface"], sync_dist=True)
+        self.log("train/id_supcon",     id_parts["supcon"],  sync_dist=True)
+        self._log_pad_loss_parts(pad_parts)
+        self.log("train/pad_sensor_adv", l_sensor, sync_dist=True)
+        self.log("train/orth_loss",     l_orth,    sync_dist=True)
+        self.log("train/balance_loss",  l_balance, sync_dist=True)
+        self.log("train/alpha",          self.alpha,           sync_dist=True)
+        self.log("train/beta",           self.beta,            sync_dist=True)
+        self.log("train/identity_weight", self.identity_weight, sync_dist=True)
+        self.log("train/total_loss",    loss, prog_bar=True, sync_dist=True)
         return loss
 
     def _pad_features_from_images(self, images: torch.Tensor) -> torch.Tensor:
@@ -690,10 +830,12 @@ class OMFRModule(L.LightningModule):
         id_parts  = self._identity_loss(id_out["mrl_embeddings"], identity_labels)
         l_orth    = self.orth_loss(pad_out["pad_embedding"], id_out["identity_embedding"])
         l_pad_live = self._pad_identity_live_loss(pad_out["pad_logit"])
+        l_balance = sum(backbone_out["balance_losses"])
         loss      = (
             self.identity_weight * id_parts["total"]
             + self.beta * l_orth
             + self.alpha * self.pad_identity_live_weight * l_pad_live
+            + self.gamma * l_balance
         )
 
         self.log("train/identity_loss", id_parts["total"], prog_bar=True, sync_dist=True)
@@ -706,6 +848,7 @@ class OMFRModule(L.LightningModule):
             sync_dist=True,
         )
         self.log("train/orth_loss",     l_orth,            sync_dist=True)
+        self.log("train/balance_loss",  l_balance,         sync_dist=True)
         self.log("train/identity_weight", self.identity_weight, sync_dist=True)
         self.log("train/beta", self.beta, sync_dist=True)
         self.log("train/total_loss",    loss,              prog_bar=True, sync_dist=True)
@@ -753,14 +896,17 @@ class OMFRModule(L.LightningModule):
         else:
             l_sensor = images.new_zeros(())
         l_orth    = self.orth_loss(pad_out["pad_embedding"], id_embedding_for_orth)
+        l_balance = sum(backbone_out["balance_losses"])
 
         loss = (self.alpha * pad_parts["foundation_total"]
                 + self.alpha_adv * l_sensor
-                + self.beta * l_orth)
+                + self.beta * l_orth
+                + self.gamma * l_balance)
 
         self._log_pad_loss_parts(pad_parts)
         self.log("train/pad_sensor_adv", l_sensor,  sync_dist=True)
         self.log("train/orth_loss",      l_orth,    sync_dist=True)
+        self.log("train/balance_loss",   l_balance, sync_dist=True)
         self.log(
             "train/pad_detach_identity_orth",
             float(self.pad_detach_identity_orth_on_pad),
@@ -1019,7 +1165,23 @@ class OMFRModule(L.LightningModule):
 
     def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
         if self.current_phase == 1:
-            loss = self._phase1_step(batch)
+            # Dispatch by phase1 objective:
+            #   pad        -> MS-TAH foundation (PAD only)
+            #   hybrid     -> joint forward (id + pad, single .backward)
+            #   identity   -> identity foundation (default)
+            if self._phase1_task in {"pad", "pad_foundation"}:
+                loss = self._phase1_step(batch)
+            elif self._phase1_task == "hybrid":
+                if not (isinstance(batch, dict)
+                        and "identity" in batch and "pad" in batch):
+                    raise RuntimeError(
+                        "phase1_task='hybrid' expects a CombinedLoader batch "
+                        "with both 'identity' and 'pad' keys; got "
+                        f"{type(batch).__name__}."
+                    )
+                loss = self._phase1_hybrid_step(batch["identity"], batch["pad"])
+            else:
+                loss = self._phase1_identity_step(batch)
 
         elif self.current_phase == 2:
             if isinstance(batch, dict) and "identity" in batch and "pad" in batch:
@@ -1113,16 +1275,31 @@ class OMFRModule(L.LightningModule):
     def validation_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0) -> None:
         images = batch["images"] if isinstance(batch, dict) else batch[0]
 
-        if self.current_phase == 1 and (
-            not isinstance(batch, dict) or "liveness_labels" not in batch
-        ):
-            return
+        # Phase-1 val routing depends on what objective the foundation
+        # phase trains:
+        #   pad        -> skip identity batches (id head not trained yet)
+        #   hybrid     -> process BOTH (both heads trained from epoch 0)
+        #   identity   -> skip PAD batches (PAD head not trained yet)
+        if self.current_phase == 1:
+            if self._phase1_task in {"pad", "pad_foundation"}:
+                if not isinstance(batch, dict) or "liveness_labels" not in batch:
+                    return
+            elif self._phase1_task == "hybrid":
+                pass   # accept any batch shape; routing handled below
+            else:  # identity-first
+                if not isinstance(batch, dict) or "identity_labels" not in batch:
+                    return
 
         backbone_out = self._run_backbone(images)
         id_out = None
-        if self.current_phase >= 2 and (
-            isinstance(batch, dict) and "identity_labels" in batch
-        ):
+        # Run the identity head whenever the batch has identity labels and
+        # the schedule trains the id head by now. In Phase 1 PAD-first the
+        # id head is still random, so skip; otherwise run.
+        need_id_head = isinstance(batch, dict) and "identity_labels" in batch and (
+            self.current_phase >= 2
+            or self._phase1_task not in {"pad", "pad_foundation"}
+        )
+        if need_id_head:
             id_out = self._run_identity(backbone_out)
         pad_out = self._run_pad(backbone_out)
 

@@ -347,9 +347,34 @@ def main():
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # Load model
+    # Load model. Checkpoints saved after torch.compile() (training-side
+    # backbone speedup) include a "._orig_mod." prefix on every compiled
+    # submodule, which load_from_checkpoint then rejects against the
+    # eager eval-time module. Patch the state_dict in place before
+    # Lightning's loader sees it.
     print(f"Loading checkpoint: {args.checkpoint}")
-    model = OMFRModule.load_from_checkpoint(args.checkpoint, map_location=device, weights_only=False)
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    state_dict = ckpt.get("state_dict", ckpt)
+    n_stripped = 0
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        nk = k.replace("._orig_mod.", ".")
+        if nk != k:
+            n_stripped += 1
+        new_state_dict[nk] = v
+    if n_stripped:
+        print(f"  stripped '._orig_mod.' from {n_stripped} compiled keys")
+    ckpt["state_dict"] = new_state_dict
+
+    model = OMFRModule(config=ckpt["hyper_parameters"])
+    missing, unexpected = model.load_state_dict(new_state_dict, strict=False)
+    if missing:
+        print(f"  WARN missing keys: {len(missing)} (first: {missing[:3]})")
+    if unexpected:
+        print(f"  WARN unexpected keys: {len(unexpected)} (first: {unexpected[:3]})")
+    # Restore phase-related python attrs (current_phase, alpha, beta, ...)
+    if hasattr(model, "on_load_checkpoint"):
+        model.on_load_checkpoint(ckpt)
     model = model.to(device)
     model.eval()
     print("Model loaded.\n")

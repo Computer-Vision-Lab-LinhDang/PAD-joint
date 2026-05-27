@@ -204,9 +204,59 @@ class PhaseSchedulerCallback(L.Callback):
 
         if pl_module.current_phase == 1:
             if self.phase1_task in {"pad", "pad_foundation"}:
+                # PAD-first: ArcFace held at start scale, identity loss off,
+                # PAD loss on at full weight.
                 scale = self.arcface_scale_start
                 pl_module.alpha = self.alpha_target
+                identity_weight = 0.0
+                pl_module.beta = 0.0
+            elif self.phase1_task == "hybrid":
+                # Hybrid co-training: NO Phase-2 transition. Smooth ramps
+                # for ArcFace scale (2 stages), alpha (PAD) and beta
+                # (orth) all anchored at epoch 0.
+                delay = max(self.phase1_warmup_delay, 0)
+                p1_end = delay + self.phase1_warmup_epochs        # ArcFace stage-1 end
+                p2_end = p1_end + self.warmup_epochs              # ArcFace stage-2 + beta ramp end
+                # ArcFace scale: init -> start over (delay, p1_end), then
+                # start -> end over (p1_end, p2_end).
+                if epoch < delay:
+                    scale = self.arcface_scale_init
+                elif epoch < p1_end:
+                    p = (epoch - delay) / max(self.phase1_warmup_epochs, 1)
+                    scale = self.arcface_scale_init + p * (
+                        self.arcface_scale_start - self.arcface_scale_init
+                    )
+                elif epoch < p2_end:
+                    p = (epoch - p1_end) / max(self.warmup_epochs, 1)
+                    scale = self.arcface_scale_start + p * (
+                        self.arcface_scale_end - self.arcface_scale_start
+                    )
+                else:
+                    scale = self.arcface_scale_end
+                # PAD weight: start at 0.1 (gentle so backbone is
+                # ridge-biased early), ramp to alpha_target over the same
+                # window the ArcFace warmup uses (delay -> p1_end).
+                alpha_min = 0.1
+                if epoch < delay:
+                    pl_module.alpha = alpha_min
+                elif epoch < p1_end:
+                    p = (epoch - delay) / max(self.phase1_warmup_epochs, 1)
+                    ramp = 0.5 * (1.0 - math.cos(math.pi * p))
+                    pl_module.alpha = alpha_min + ramp * (
+                        self.alpha_target - alpha_min
+                    )
+                else:
+                    pl_module.alpha = self.alpha_target
+                # Orthogonality: delayed until after ArcFace stage-1 so
+                # both embeddings have meaningful geometry to decorrelate.
+                pl_module.beta = self._cosine_ramp(
+                    epoch, p1_end, p2_end, self.beta_target, min_frac=0.0,
+                )
+                identity_weight = 1.0
             else:
+                # Identity-first: ArcFace warmup (1 -> scale_start over
+                # warmup_delay + warmup_epochs), PAD loss off, identity
+                # loss ON at full weight.
                 delay = max(self.phase1_warmup_delay, 0)
                 effective_epoch = max(epoch - delay, 0)
                 p1 = min(effective_epoch / max(self.phase1_warmup_epochs, 1), 1.0)
@@ -214,13 +264,14 @@ class PhaseSchedulerCallback(L.Callback):
                     self.arcface_scale_start - self.arcface_scale_init
                 )
                 pl_module.alpha = 0.0
+                identity_weight = 1.0
+                pl_module.beta = 0.0
             for af_loss in pl_module.arcface_losses.values():
                 af_loss.set_scale(scale)
             self._set_arcface_margin(pl_module, arcface_margin)
 
-            pl_module.beta = 0.0
             if hasattr(pl_module, "identity_weight"):
-                pl_module.identity_weight = 0.0
+                pl_module.identity_weight = identity_weight
             pl_module.alpha_adv = 0.0
             pl_module.lam_adv = 0.0
             self._set_moe_temperature(pl_module, self.moe_temp_phase1)
